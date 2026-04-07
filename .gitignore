@@ -1,0 +1,28 @@
+# Build
+bin/
+obj/
+Output/
+*.dll
+*.pdb
+*.cache
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Training artifacts
+models/
+logs/
+
+# IDE
+.vs/
+.idea/
+*.suo
+*.user
+*.sln.docstates
+
+# OS
+.DS_Store
+Thumbs.db

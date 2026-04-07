@@ -46,6 +46,7 @@ class Config:
     # Training
     epochs: int = 2000
     rollout_len: int = 256
+    batch_size: int = 128
     train_iters: int = 4
     anneal_lr: bool = True
     save_every: int = 50

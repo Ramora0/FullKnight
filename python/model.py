@@ -4,8 +4,8 @@ import numpy as np
 from torch.distributions import Categorical
 
 
-class CombatEncoder(nn.Module):
-    """Single-head attention pooling over combat hitboxes, queried by global state."""
+class HitboxEncoder(nn.Module):
+    """Single-head attention pooling over hitboxes, queried by global state."""
 
     def __init__(self, input_dim=5, hidden_dim=64, output_dim=64, query_dim=14):
         super().__init__()
@@ -27,7 +27,7 @@ class CombatEncoder(nn.Module):
     def forward(self, hitboxes, mask, global_state):
         """
         Args:
-            hitboxes: (B, N, input_dim) zero-padded combat hitboxes
+            hitboxes: (B, N, input_dim) zero-padded hitboxes
             mask: (B, N) 1 for real, 0 for padding
             global_state: (B, query_dim)
         Returns:
@@ -35,7 +35,6 @@ class CombatEncoder(nn.Module):
         """
         B = hitboxes.shape[0]
 
-        # If no combat hitboxes at all, return zeros
         if hitboxes.shape[1] == 0 or mask.sum() == 0:
             return torch.zeros(B, self.output_dim, device=hitboxes.device)
 
@@ -45,10 +44,7 @@ class CombatEncoder(nn.Module):
         k = self.W_k(h)                           # (B, N, output_dim)
         v = self.W_v(h)                           # (B, N, output_dim)
 
-        # Scaled dot-product attention
         attn_logits = (q @ k.transpose(-2, -1)) / self.scale  # (B, 1, N)
-
-        # Mask padding positions to -inf
         attn_mask = mask.unsqueeze(1)  # (B, 1, N)
         attn_logits = attn_logits.masked_fill(attn_mask == 0, -1e9)
 
@@ -58,48 +54,22 @@ class CombatEncoder(nn.Module):
         return out
 
 
-class TerrainEncoder(nn.Module):
-    """Sum pooling over terrain hitboxes."""
-
-    def __init__(self, input_dim=5, hidden_dim=64, output_dim=64):
-        super().__init__()
-        self.output_dim = output_dim
-
-        self.phi = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, hitboxes, mask):
-        """
-        Args:
-            hitboxes: (B, N, input_dim) zero-padded terrain hitboxes
-            mask: (B, N) 1 for real, 0 for padding
-        Returns:
-            (B, output_dim)
-        """
-        h = self.phi(hitboxes)           # (B, N, output_dim)
-        h = h * mask.unsqueeze(-1)       # zero out padding
-        return h.sum(dim=1)              # (B, output_dim)
-
-
 class FullKnightActorCritic(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
 
-        self.combat_encoder = CombatEncoder(
+        self.combat_encoder = HitboxEncoder(
             input_dim=config.hitbox_feature_dim,
             hidden_dim=config.combat_hidden,
             output_dim=config.combat_output,
             query_dim=config.global_state_dim,
         )
-        self.terrain_encoder = TerrainEncoder(
+        self.terrain_encoder = HitboxEncoder(
             input_dim=config.hitbox_feature_dim,
             hidden_dim=config.terrain_hidden,
             output_dim=config.terrain_output,
+            query_dim=config.global_state_dim,
         )
 
         trunk_in = config.combat_output + config.terrain_output + config.global_state_dim
@@ -138,7 +108,7 @@ class FullKnightActorCritic(nn.Module):
 
     def _encode(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state):
         combat_emb = self.combat_encoder(combat_hb, combat_mask, global_state)
-        terrain_emb = self.terrain_encoder(terrain_hb, terrain_mask)
+        terrain_emb = self.terrain_encoder(terrain_hb, terrain_mask, global_state)
         combined = torch.cat([combat_emb, terrain_emb, global_state], dim=-1)
         return self.trunk(combined)
 

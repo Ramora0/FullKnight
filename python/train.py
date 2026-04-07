@@ -54,6 +54,8 @@ async def train(config: Config):
         ep_lengths = np.zeros(config.n_envs)
         completed_ep_rewards = []
         completed_ep_lengths = []
+        win_lengths = []
+        loss_lengths = []
 
         for t in range(config.rollout_len):
             actions_np, log_probs, values = agent.collect_action(
@@ -95,6 +97,10 @@ async def train(config: Config):
                 if dones[i]:
                     completed_ep_rewards.append(ep_rewards[i])
                     completed_ep_lengths.append(ep_lengths[i])
+                    if rewards[i] > 0.5:
+                        win_lengths.append(ep_lengths[i])
+                    else:
+                        loss_lengths.append(ep_lengths[i])
                     ep_rewards[i] = 0
                     ep_lengths[i] = 0
 
@@ -144,6 +150,12 @@ async def train(config: Config):
         writer.add_scalar("rollout/avg_ep_reward", np.mean(all_ep_rewards) if all_ep_rewards else 0, total_steps)
         writer.add_scalar("rollout/avg_ep_length", np.mean(all_ep_lengths) if all_ep_lengths else 0, total_steps)
         writer.add_scalar("rollout/completed_episodes", len(completed_ep_rewards), total_steps)
+        n_wins = len(win_lengths)
+        n_losses = len(loss_lengths)
+        n_completed = n_wins + n_losses
+        writer.add_scalar("rollout/win_rate", n_wins / n_completed if n_completed else 0, total_steps)
+        writer.add_scalar("rollout/avg_win_length", np.mean(win_lengths) if win_lengths else 0, total_steps)
+        writer.add_scalar("rollout/avg_loss_length", np.mean(loss_lengths) if loss_lengths else 0, total_steps)
 
         avg_rew = np.mean(all_ep_rewards) if all_ep_rewards else 0
         print(
