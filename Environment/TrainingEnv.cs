@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Collections.Generic;
 using FullKnight.Net;
 using FullKnight.Game;
 using InControl;
@@ -16,6 +17,13 @@ namespace FullKnight.Environment
 		private float _damageLandedInStep;
 		private int _bossMaxHP;
 		private int _knightMaxHP;
+
+		// Eval mode: real damage, real death, episode ends on kill
+		private bool _evalMode;
+		private bool _bossDied;
+		private bool _episodeDone;
+		private string _episodeResult;
+		private HealthManager _bossHM;
 
 		private HitboxObserver _hitboxObserver = new();
 		private InputDeviceShim _inputShim = new();
@@ -64,12 +72,16 @@ namespace FullKnight.Environment
 			_level = data.level ?? _level;
 			_frameSkipCount = data.frames_per_wait ?? _frameSkipCount;
 			_timeScaleValue = data.time_scale ?? _timeScaleValue;
+			_evalMode = data.eval ?? false;
 			_hitsTakenInStep = 0;
 			_damageLandedInStep = 0;
+			_bossDied = false;
+			_episodeDone = false;
+			_episodeResult = null;
 
 			yield return SceneHooks.LoadBossScene(_level);
 
-			_bossMaxHP = GetBossMaxHP();
+			InitBossRefs();
 			_knightMaxHP = PlayerData.instance.maxHealth;
 
 			UnhookDamage();
@@ -91,13 +103,65 @@ namespace FullKnight.Environment
 
 		private IEnumerator Step(MessageData data)
 		{
+			// If episode already ended, keep returning done
+			if (_episodeDone)
+			{
+				data.done = true;
+				data.info = _episodeResult;
+				data.combat_hitboxes = new List<float[]>();
+				data.terrain_hitboxes = new List<float[]>();
+				data.global_state = new float[14];
+				data.damage_landed = 0;
+				data.hits_taken = 0;
+				SendMessage(new Message { type = "step", data = data });
+				yield break;
+			}
+
 			ActionDecoder.ApplyAction(_inputShim, data.action_vec);
 
-			// Restore knight HP to keep fighting indefinitely
-			PlayerData.instance.health = _knightMaxHP;
+			// In training mode, restore knight HP each step for infinite fighting
+			if (!_evalMode)
+				PlayerData.instance.health = _knightMaxHP;
 
 			for (int i = 0; i < _frameSkipCount; i++)
+			{
 				yield return null;
+				// In eval mode, break early on death
+				if (_evalMode && (_bossDied || PlayerData.instance.health <= 0))
+					break;
+			}
+
+			// Check for episode end in eval mode
+			if (_evalMode && !_episodeDone)
+			{
+				if (_bossDied)
+				{
+					_episodeDone = true;
+					_episodeResult = "win";
+				}
+				else if (PlayerData.instance.health <= 0)
+				{
+					_episodeDone = true;
+					_episodeResult = "loss";
+				}
+			}
+
+			// Record reward signals
+			data.damage_landed = _damageLandedInStep;
+			data.hits_taken = _hitsTakenInStep;
+			_hitsTakenInStep = 0;
+			_damageLandedInStep = 0;
+
+			if (_episodeDone)
+			{
+				data.done = true;
+				data.info = _episodeResult;
+				data.combat_hitboxes = new List<float[]>();
+				data.terrain_hitboxes = new List<float[]>();
+				data.global_state = new float[14];
+				SendMessage(new Message { type = "step", data = data });
+				yield break;
+			}
 
 			// Build observation
 			var obs = _hitboxObserver.GetSplitFeatures();
@@ -106,15 +170,9 @@ namespace FullKnight.Environment
 			data.combat_hitboxes = obs.CombatHitboxes;
 			data.terrain_hitboxes = obs.TerrainHitboxes;
 			data.global_state = gs;
-			data.damage_landed = _damageLandedInStep;
-			data.hits_taken = _hitsTakenInStep;
+			data.done = false;
 
 			SendMessage(new Message { type = "step", data = data });
-
-			// Reset per-step counters
-			_hitsTakenInStep = 0;
-			_damageLandedInStep = 0;
-
 			yield break;
 		}
 
@@ -163,11 +221,11 @@ namespace FullKnight.Environment
 			On.HealthManager.TakeDamage -= OnBossDamaged;
 		}
 
-		private int OnKnightDamaged(int damageType, int _)
+		private int OnKnightDamaged(int damageType, int damage)
 		{
 			_hitsTakenInStep++;
-			// Return 1 for knockback/visual feedback; HP is restored next step
-			return 1;
+			// Eval: let real damage through. Training: minimal damage (HP restored next step)
+			return _evalMode ? damage : 1;
 		}
 
 		private const float NailDamage = 21f;
@@ -175,28 +233,41 @@ namespace FullKnight.Environment
 		private void OnBossDamaged(On.HealthManager.orig_TakeDamage orig, HealthManager self, HitInstance hitInstance)
 		{
 			_damageLandedInStep += hitInstance.DamageDealt / NailDamage;
-			// Prevent boss death by ensuring HP stays above zero before orig
-			if (self.hp - hitInstance.DamageDealt <= 0)
+
+			if (!_evalMode)
+			{
+				// Training: prevent boss death, restore HP for infinite fighting
+				if (self.hp - hitInstance.DamageDealt <= 0)
+					self.hp = _bossMaxHP;
+				orig(self, hitInstance);
 				self.hp = _bossMaxHP;
-			orig(self, hitInstance);
-			// Restore boss to full HP after damage applied
-			self.hp = _bossMaxHP;
+			}
+			else
+			{
+				// Eval: let damage through, detect boss death
+				bool wouldDie = _bossHM != null && self == _bossHM
+					&& self.hp - hitInstance.DamageDealt <= 0;
+				orig(self, hitInstance);
+				if (wouldDie)
+					_bossDied = true;
+			}
 		}
 
-		private int GetBossMaxHP()
+		private void InitBossRefs()
 		{
+			_bossHM = null;
+			_bossMaxHP = 1;
 			try
 			{
 				if (BossSceneController.Instance?.bosses != null
 					&& BossSceneController.Instance.bosses.Length > 0)
 				{
-					var bossHM = BossSceneController.Instance.bosses[0]
+					_bossHM = BossSceneController.Instance.bosses[0]
 						.gameObject.GetComponent<HealthManager>();
-					if (bossHM != null) return bossHM.hp;
+					if (_bossHM != null) _bossMaxHP = _bossHM.hp;
 				}
 			}
 			catch { }
-			return 1;
 		}
 	}
 }

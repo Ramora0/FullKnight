@@ -111,6 +111,10 @@ class FullKnightActorCritic(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
                 nn.init.constant_(module.bias, 0.0)
 
+        # Bias action head toward attack (idx 0) at init (~50% vs 25% uniform)
+        with torch.no_grad():
+            self.head_action.bias[0] = 1.0
+
     def _encode(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state):
         combat_emb = self.combat_encoder(combat_hb, combat_mask, global_state)
         terrain_emb = self.terrain_encoder(terrain_hb, terrain_mask, global_state)

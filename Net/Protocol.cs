@@ -30,6 +30,9 @@ namespace FullKnight.Net
 		public float? damage_landed;  // normalized to nail-hit equivalents
 		public int? hits_taken;
 
+		// Mode (Python -> C#, sent during reset)
+		public bool? eval;
+
 		// Action (Python -> C#)
 		public int[] action_vec;
 	}
