@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import os
 import numpy as np
@@ -11,6 +12,10 @@ from instance_manager import InstanceManager
 
 
 async def train(config: Config):
+    vis = None
+    if config.visualize:
+        from visualizer import Visualizer
+        vis = Visualizer()
     # Optionally launch game instances
     mgr = None
     if config.n_envs > 1 and config.hk_path and os.path.exists(config.hk_path):
@@ -107,6 +112,9 @@ async def train(config: Config):
             terrain_hb, terrain_mask = next_thb, next_tm
             global_state = next_gs
 
+            if vis is not None:
+                vis.update(combat_hb, combat_mask, terrain_hb, terrain_mask, global_state)
+
         # Bootstrap final value
         _, _, final_values = agent.collect_action(
             combat_hb, combat_mask, terrain_hb, terrain_mask, global_state
@@ -178,12 +186,19 @@ async def train(config: Config):
     agent.save_checkpoint(f"{config.save_path}_final.pth")
     wandb.finish()
 
+    if vis is not None:
+        vis.close()
+
     if mgr:
         mgr.stop_all()
 
 
 def main():
-    config = Config()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--visualize", action="store_true", help="Live-render model observations")
+    args = parser.parse_args()
+
+    config = Config(visualize=args.visualize)
     asyncio.run(train(config))
 
 
