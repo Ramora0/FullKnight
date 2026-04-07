@@ -42,14 +42,17 @@ class Visualizer:
             )
             ax.add_patch(rect)
 
-        # Combat hitboxes (red = non-trigger, orange = trigger)
+        # Combat hitboxes: green = target (boss), red = hurts knight, yellow = knight's attack
         c_hb = combat_hb[0]
         c_mask = combat_mask[0]
         for i in range(len(c_mask)):
             if c_mask[i] < 0.5:
                 continue
-            rx, ry, w, h, is_trig = c_hb[i]
-            color = "orange" if is_trig > 0.5 else "red"
+            rx, ry, w, h, is_trig, hurts_knight, is_target = c_hb[i]
+            if is_target > 0.5:
+                color = "red" if hurts_knight > 0.5 else "green"
+            else:
+                color = "yellow"
             rect = patches.Rectangle(
                 (rx - w / 2, ry - h / 2), w, h,
                 linewidth=2, edgecolor=color, facecolor=color, alpha=0.3,
