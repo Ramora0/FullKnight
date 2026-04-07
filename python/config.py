@@ -20,7 +20,8 @@ class Config:
     hk_data_dir: str = "hollow_knight_Data"
 
     # Observation dims
-    hitbox_feature_dim: int = 5  # [rel_x, rel_y, w, h, is_trigger]
+    combat_feature_dim: int = 7  # [rel_x, rel_y, w, h, is_trigger, hurts_knight, is_target]
+    terrain_feature_dim: int = 5 # [rel_x, rel_y, w, h, is_trigger]
     global_state_dim: int = 14   # vel, hp, soul, abilities, boss_hp, knight_bounds, 6 validity flags
     n_validity_flags: int = 6
 
@@ -37,12 +38,12 @@ class Config:
     action_n: int = 4     # attack, spell, dash, none
     jump_n: int = 2       # yes, no
 
-    # Adaptive reward scaling
-    D_min: float = 30.0       # floor: face-tanking is net positive
-    D_max: float = 200.0      # ceiling: real boss HP
-    D_initial: float = 30.0   # starting difficulty
+    # Adaptive reward scaling (hit-ratio units)
+    D_min: float = 1.0        # floor: 1 landed per 1 taken
+    D_max: float = 100.0      # ceiling: near-perfect play
+    D_initial: float = 1.5    # starting difficulty
     D_ema: float = 0.8        # smoothing: D moves 20% toward new value each epoch
-    knight_max_hp: int = 9    # for damage_taken normalization
+
 
     # PPO
     lr: float = 2.5e-4

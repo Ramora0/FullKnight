@@ -62,17 +62,17 @@ class VecEnv:
     async def step_all(self, actions):
         """Step all envs in parallel.
         actions: list of N action_vecs, each [movement, direction, action, jump].
-        Returns (combat_hb, combat_mask, terrain_hb, terrain_mask, global_states, damage_dealt, damage_taken).
+        Returns (combat_hb, combat_mask, terrain_hb, terrain_mask, global_states, hits_landed, hits_taken).
         """
         results = await asyncio.gather(*[
             self.envs[i].step(actions[i]) for i in range(self.n_envs)
         ])
-        combat_lists, terrain_lists, gs_list, damage_dealt, damage_taken = zip(*results)
+        combat_lists, terrain_lists, gs_list, hits_landed, hits_taken = zip(*results)
 
         obs_batch = self._batch_observations(list(zip(combat_lists, terrain_lists, gs_list)))
-        damage_dealt = np.array(damage_dealt, dtype=np.float32)
-        damage_taken = np.array(damage_taken, dtype=np.float32)
-        return *obs_batch, damage_dealt, damage_taken
+        hits_landed = np.array(hits_landed, dtype=np.float32)
+        hits_taken = np.array(hits_taken, dtype=np.float32)
+        return *obs_batch, hits_landed, hits_taken
 
     async def pause_all(self):
         await asyncio.gather(*[env.pause() for env in self.envs])
@@ -91,14 +91,13 @@ class VecEnv:
         terrain_lists = [obs[1] for obs in obs_list]
         gs_list = [obs[2] for obs in obs_list]
 
-        feat_dim = self.config.hitbox_feature_dim
         B = len(obs_list)
 
         # Pad combat hitboxes
         max_combat = max((len(c) for c in combat_lists), default=0)
         max_combat = max(max_combat, 1)  # at least 1 to avoid empty tensors
 
-        combat_batch = np.zeros((B, max_combat, feat_dim), dtype=np.float32)
+        combat_batch = np.zeros((B, max_combat, self.config.combat_feature_dim), dtype=np.float32)
         combat_mask = np.zeros((B, max_combat), dtype=np.float32)
         for i, hb_list in enumerate(combat_lists):
             n = len(hb_list)
@@ -110,7 +109,7 @@ class VecEnv:
         max_terrain = max((len(t) for t in terrain_lists), default=0)
         max_terrain = max(max_terrain, 1)
 
-        terrain_batch = np.zeros((B, max_terrain, feat_dim), dtype=np.float32)
+        terrain_batch = np.zeros((B, max_terrain, self.config.terrain_feature_dim), dtype=np.float32)
         terrain_mask = np.zeros((B, max_terrain), dtype=np.float32)
         for i, hb_list in enumerate(terrain_lists):
             n = len(hb_list)

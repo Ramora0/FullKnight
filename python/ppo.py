@@ -130,15 +130,14 @@ class PPO:
         flat_act = {k: actions_arr[k].reshape(-1) for k in actions_arr}
 
         # Flatten observations with global-max padding
-        feat_dim = cfg.hitbox_feature_dim
         max_combat = max(buf_combat_hb[t].shape[1] for t in range(T))
         max_terrain = max(buf_terrain_hb[t].shape[1] for t in range(T))
         max_combat = max(max_combat, 1)
         max_terrain = max(max_terrain, 1)
 
-        flat_chb = np.zeros((total_samples, max_combat, feat_dim), dtype=np.float32)
+        flat_chb = np.zeros((total_samples, max_combat, cfg.combat_feature_dim), dtype=np.float32)
         flat_cm = np.zeros((total_samples, max_combat), dtype=np.float32)
-        flat_thb = np.zeros((total_samples, max_terrain, feat_dim), dtype=np.float32)
+        flat_thb = np.zeros((total_samples, max_terrain, cfg.terrain_feature_dim), dtype=np.float32)
         flat_tm = np.zeros((total_samples, max_terrain), dtype=np.float32)
         flat_gs = np.zeros((total_samples, cfg.global_state_dim), dtype=np.float32)
 

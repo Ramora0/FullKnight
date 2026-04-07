@@ -60,13 +60,13 @@ class FullKnightActorCritic(nn.Module):
         self.config = config
 
         self.combat_encoder = HitboxEncoder(
-            input_dim=config.hitbox_feature_dim,
+            input_dim=config.combat_feature_dim,
             hidden_dim=config.combat_hidden,
             output_dim=config.combat_output,
             query_dim=config.global_state_dim,
         )
         self.terrain_encoder = HitboxEncoder(
-            input_dim=config.hitbox_feature_dim,
+            input_dim=config.terrain_feature_dim,
             hidden_dim=config.terrain_hidden,
             output_dim=config.terrain_output,
             query_dim=config.global_state_dim,

@@ -53,8 +53,8 @@ async def train(config: Config):
         buf_actions = {k: [] for k in ["movement", "direction", "action", "jump"]}
         buf_log_probs = []
         buf_values = []
-        buf_damage_dealt = []
-        buf_damage_taken = []
+        buf_hits_landed = []
+        buf_hits_taken = []
 
         for t in range(config.rollout_len):
             actions_np, log_probs, values = agent.collect_action(
@@ -71,7 +71,7 @@ async def train(config: Config):
                 for i in range(config.n_envs)
             ]
 
-            next_chb, next_cm, next_thb, next_tm, next_gs, dmg_dealt, dmg_taken = \
+            next_chb, next_cm, next_thb, next_tm, next_gs, hits_landed, hits_taken = \
                 await vec_env.step_all(action_vecs)
 
             buf_combat_hb.append(combat_hb)
@@ -83,8 +83,8 @@ async def train(config: Config):
                 buf_actions[k].append(actions_np[k])
             buf_log_probs.append(log_probs)
             buf_values.append(values)
-            buf_damage_dealt.append(dmg_dealt)
-            buf_damage_taken.append(dmg_taken)
+            buf_hits_landed.append(hits_landed)
+            buf_hits_taken.append(hits_taken)
 
             combat_hb, combat_mask = next_chb, next_cm
             terrain_hb, terrain_mask = next_thb, next_tm
@@ -100,22 +100,22 @@ async def train(config: Config):
         buf_values.append(final_values)
 
         # Stack buffers: (T, N)
-        damage_dealt_arr = np.stack(buf_damage_dealt)
-        damage_taken_arr = np.stack(buf_damage_taken)
+        hits_landed_arr = np.stack(buf_hits_landed)
+        hits_taken_arr = np.stack(buf_hits_taken)
         log_probs_arr = np.stack(buf_log_probs)
         values_arr = np.stack(buf_values)
         actions_arr = {k: np.stack(v) for k, v in buf_actions.items()}
 
         # Compute adaptive D from this rollout (EMA-smoothed)
-        total_dealt = damage_dealt_arr.sum()
-        total_taken = damage_taken_arr.sum()
-        if total_taken > 0 and total_dealt > 0:
-            D_raw = total_dealt * config.knight_max_hp / total_taken
+        total_landed = hits_landed_arr.sum()
+        total_taken = hits_taken_arr.sum()
+        if total_taken > 0 and total_landed > 0:
+            D_raw = total_landed / total_taken
             D_raw = np.clip(D_raw, config.D_min, config.D_max)
             D = config.D_ema * D + (1 - config.D_ema) * D_raw
 
-        # Compute rewards retroactively using D
-        rewards_arr = damage_dealt_arr / D - damage_taken_arr / config.knight_max_hp
+        # Compute rewards: +1 per hit landed (scaled by D), -1 per hit taken
+        rewards_arr = hits_landed_arr / D - hits_taken_arr
 
         # Pause game during training
         await vec_env.pause_all()
@@ -141,9 +141,9 @@ async def train(config: Config):
             "metrics/lr": agent.optimizer.param_groups[0]["lr"],
             "curriculum/D": D,
             "rollout/avg_reward": avg_reward,
-            "rollout/total_damage_dealt": total_dealt,
-            "rollout/total_damage_taken": total_taken,
-            "rollout/hit_ratio": total_dealt / max(total_taken, 1),
+            "rollout/total_hits_landed": total_landed,
+            "rollout/total_hits_taken": total_taken,
+            "rollout/hit_ratio": total_landed / max(total_taken, 1),
         }, step=total_steps)
 
         print(
@@ -151,7 +151,7 @@ async def train(config: Config):
             f"steps {total_steps:8d} | "
             f"D {D:7.1f} | "
             f"avg_rew {avg_reward:7.4f} | "
-            f"dealt {total_dealt:5.0f} | "
+            f"landed {total_landed:5.0f} | "
             f"taken {total_taken:5.0f} | "
             f"surr {metrics['surrogate']:7.4f} | "
             f"kl {metrics['kl']:6.4f}"

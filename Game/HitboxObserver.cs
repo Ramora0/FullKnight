@@ -51,7 +51,7 @@ namespace FullKnight.Game
 				{
 					colliders[HitboxType.Enemy].Add(collider2D);
 				}
-				else if (go.layer == (int)PhysLayers.TERRAIN)
+				else if (go.layer == (int)PhysLayers.TERRAIN && !collider2D.isTrigger)
 				{
 					colliders[HitboxType.Terrain].Add(collider2D);
 				}
@@ -146,7 +146,7 @@ namespace FullKnight.Game
 
 		/// <summary>
 		/// Extract hitbox features split by type.
-		/// Combat (Enemy + Attack): [rel_x, rel_y, width, height, is_trigger]
+		/// Combat (Enemy + Attack): [rel_x, rel_y, width, height, is_trigger, hurts_knight, is_target]
 		/// Terrain: [rel_x, rel_y, width, height, is_trigger]
 		/// Knight: bounds only (width, height), folded into global state.
 		/// </summary>
@@ -180,12 +180,16 @@ namespace FullKnight.Game
 					float h = bounds.size.y;
 					float isTrigger = col.isTrigger ? 1f : 0f;
 
-					var feature = new float[] { relX, relY, w, h, isTrigger };
-
 					if (kvp.Key == HitboxType.Enemy || kvp.Key == HitboxType.Attack)
-						combat.Add(feature);
+					{
+						float hurtsKnight = kvp.Key == HitboxType.Enemy ? 1f : 0f;
+						float isTarget = kvp.Key == HitboxType.Enemy ? 1f : 0f;
+						combat.Add(new float[] { relX, relY, w, h, isTrigger, hurtsKnight, isTarget });
+					}
 					else if (kvp.Key == HitboxType.Terrain)
-						terrain.Add(feature);
+					{
+						terrain.Add(new float[] { relX, relY, w, h, isTrigger });
+					}
 				}
 			}
 
