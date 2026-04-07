@@ -39,9 +39,9 @@ class Config:
     jump_n: int = 2       # yes, no
 
     # Adaptive reward scaling (hit-ratio units)
-    D_min: float = 1.0        # floor: 1 landed per 1 taken
+    D_min: float = 0.05       # floor
     D_max: float = 100.0      # ceiling: near-perfect play
-    D_initial: float = 0.5    # starting difficulty
+    D_initial: float = 0.3    # starting difficulty
     D_ema: float = 0.8        # smoothing: D moves 20% toward new value each epoch
 
 
