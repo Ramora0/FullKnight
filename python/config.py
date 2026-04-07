@@ -64,3 +64,6 @@ class Config:
     save_every: int = 50
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
+
+    # Debug
+    visualize: bool = False
