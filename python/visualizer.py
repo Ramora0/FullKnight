@@ -74,8 +74,8 @@ class Visualizer:
             f"Vel: ({vel_x:.1f}, {vel_y:.1f})"
         )
         ax.set_aspect("equal")
-        ax.autoscale()
-        ax.margins(0.1)
+        ax.set_xlim(-100, 100)
+        ax.set_ylim(-50, 50)
         ax.grid(True, alpha=0.3)
         ax.axhline(y=0, color="blue", linewidth=0.5, alpha=0.3)
         ax.axvline(x=0, color="blue", linewidth=0.5, alpha=0.3)
