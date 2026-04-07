@@ -41,7 +41,7 @@ class Config:
     # Adaptive reward scaling (hit-ratio units)
     D_min: float = 1.0        # floor: 1 landed per 1 taken
     D_max: float = 100.0      # ceiling: near-perfect play
-    D_initial: float = 1.5    # starting difficulty
+    D_initial: float = 0.5    # starting difficulty
     D_ema: float = 0.8        # smoothing: D moves 20% toward new value each epoch
 
 
@@ -51,7 +51,7 @@ class Config:
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
     value_coeff: float = 0.25
-    entropy_coeff: float = 0.05
+    entropy_coeff: float = 0.2
     max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
     target_kl: float = 0.03
