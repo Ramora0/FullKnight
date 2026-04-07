@@ -86,8 +86,13 @@ class FullKnightActorCritic(nn.Module):
         self.head_action = nn.Linear(config.hidden_dim, config.action_n)
         self.head_jump = nn.Linear(config.hidden_dim, config.jump_n)
 
-        # Critic
-        self.critic = nn.Sequential(
+        # Decomposed critic: separate heads for attack and defense value
+        self.critic_attack = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, 1),
+        )
+        self.critic_defense = nn.Sequential(
             nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.ReLU(),
             nn.Linear(config.hidden_dim, 1),
@@ -100,7 +105,7 @@ class FullKnightActorCritic(nn.Module):
             if isinstance(module, nn.Linear):
                 if "head_" in name:
                     nn.init.orthogonal_(module.weight, gain=0.01)
-                elif name.endswith(".2") and "critic" in name:
+                elif name.endswith(".2") and "critic_" in name:
                     nn.init.orthogonal_(module.weight, gain=1.0)
                 else:
                     nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
@@ -148,7 +153,7 @@ class FullKnightActorCritic(nn.Module):
 
     def get_value(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state):
         h = self._encode(combat_hb, combat_mask, terrain_hb, terrain_mask, global_state)
-        return self.critic(h).squeeze(-1)
+        return self.critic_attack(h).squeeze(-1), self.critic_defense(h).squeeze(-1)
 
     def get_action_and_value(self, combat_hb, combat_mask, terrain_hb, terrain_mask,
                              global_state, actions=None):
@@ -158,7 +163,7 @@ class FullKnightActorCritic(nn.Module):
 
         actions: dict with keys 'movement', 'direction', 'action', 'jump',
                  each (B,) LongTensor.
-        Returns: actions_dict, log_prob (B,), entropy (B,), value (B,)
+        Returns: actions_dict, log_prob (B,), entropy (B,), value_atk (B,), value_def (B,)
         """
         h = self._encode(combat_hb, combat_mask, terrain_hb, terrain_mask, global_state)
 
@@ -200,7 +205,8 @@ class FullKnightActorCritic(nn.Module):
             + dist_j.entropy()
         )
 
-        value = self.critic(h).squeeze(-1)
+        value_atk = self.critic_attack(h).squeeze(-1)
+        value_def = self.critic_defense(h).squeeze(-1)
 
         actions_dict = {
             "movement": a_m,
@@ -208,4 +214,4 @@ class FullKnightActorCritic(nn.Module):
             "action": a_a,
             "jump": a_j,
         }
-        return actions_dict, log_prob, entropy, value
+        return actions_dict, log_prob, entropy, value_atk, value_def

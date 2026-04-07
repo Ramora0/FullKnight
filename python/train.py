@@ -52,12 +52,13 @@ async def train(config: Config):
         buf_global = []
         buf_actions = {k: [] for k in ["movement", "direction", "action", "jump"]}
         buf_log_probs = []
-        buf_values = []
+        buf_values_atk = []
+        buf_values_def = []
         buf_hits_landed = []
         buf_hits_taken = []
 
         for t in range(config.rollout_len):
-            actions_np, log_probs, values = agent.collect_action(
+            actions_np, log_probs, values_atk, values_def = agent.collect_action(
                 combat_hb, combat_mask, terrain_hb, terrain_mask, global_state
             )
 
@@ -82,7 +83,8 @@ async def train(config: Config):
             for k in buf_actions:
                 buf_actions[k].append(actions_np[k])
             buf_log_probs.append(log_probs)
-            buf_values.append(values)
+            buf_values_atk.append(values_atk)
+            buf_values_def.append(values_def)
             buf_hits_landed.append(hits_landed)
             buf_hits_taken.append(hits_taken)
 
@@ -93,17 +95,19 @@ async def train(config: Config):
             if vis is not None:
                 vis.update(combat_hb, combat_mask, terrain_hb, terrain_mask, global_state)
 
-        # Bootstrap final value
-        _, _, final_values = agent.collect_action(
+        # Bootstrap final values
+        _, _, final_vatk, final_vdef = agent.collect_action(
             combat_hb, combat_mask, terrain_hb, terrain_mask, global_state
         )
-        buf_values.append(final_values)
+        buf_values_atk.append(final_vatk)
+        buf_values_def.append(final_vdef)
 
         # Stack buffers: (T, N)
         hits_landed_arr = np.stack(buf_hits_landed)
         hits_taken_arr = np.stack(buf_hits_taken)
         log_probs_arr = np.stack(buf_log_probs)
-        values_arr = np.stack(buf_values)
+        values_atk_arr = np.stack(buf_values_atk)
+        values_def_arr = np.stack(buf_values_def)
         actions_arr = {k: np.stack(v) for k, v in buf_actions.items()}
 
         # Compute adaptive D from this rollout (EMA-smoothed)
@@ -114,15 +118,14 @@ async def train(config: Config):
             D_raw = np.clip(D_raw, config.D_min, config.D_max)
             D = config.D_ema * D + (1 - config.D_ema) * D_raw
 
-        # Compute rewards: +1 per hit landed (scaled by D), -1 per hit taken
-        rewards_arr = hits_landed_arr / D - hits_taken_arr
-
         # Pause game during training
         await vec_env.pause_all()
 
         metrics = agent.train_on_rollout(
             buf_combat_hb, buf_combat_mask, buf_terrain_hb, buf_terrain_mask,
-            buf_global, actions_arr, log_probs_arr, rewards_arr, values_arr,
+            buf_global, actions_arr, log_probs_arr,
+            hits_landed_arr, hits_taken_arr,
+            values_atk_arr, values_def_arr, D,
         )
 
         if config.anneal_lr:
@@ -131,16 +134,17 @@ async def train(config: Config):
         await vec_env.resume_all()
 
         # Logging
-        avg_reward = rewards_arr.mean()
+        curriculum_reward = (hits_landed_arr / D - hits_taken_arr).mean()
         total_steps = (epoch + 1) * config.n_envs * config.rollout_len
         wandb.log({
             "loss/surrogate": metrics["surrogate"],
-            "loss/value": metrics["value"],
+            "loss/value_atk": metrics["value_atk"],
+            "loss/value_def": metrics["value_def"],
             "loss/entropy": metrics["entropy"],
             "metrics/kl": metrics["kl"],
             "metrics/lr": agent.optimizer.param_groups[0]["lr"],
             "curriculum/D": D,
-            "rollout/avg_reward": avg_reward,
+            "rollout/curriculum_reward": curriculum_reward,
             "rollout/total_hits_landed": total_landed,
             "rollout/total_hits_taken": total_taken,
             "rollout/hit_ratio": total_landed / max(total_taken, 1),
@@ -150,7 +154,7 @@ async def train(config: Config):
             f"epoch {epoch:4d} | "
             f"steps {total_steps:8d} | "
             f"D {D:7.1f} | "
-            f"avg_rew {avg_reward:7.4f} | "
+            f"curr_rew {curriculum_reward:7.4f} | "
             f"landed {total_landed:5.0f} | "
             f"taken {total_taken:5.0f} | "
             f"surr {metrics['surrogate']:7.4f} | "
