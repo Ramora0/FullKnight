@@ -26,6 +26,10 @@ namespace FullKnight.Net
 		public bool? done;
 		public string info;
 
+		// Raw damage signals (for Python-side reward computation)
+		public int? damage_dealt;
+		public int? damage_taken;
+
 		// Action (Python -> C#)
 		public int[] action_vec;
 	}

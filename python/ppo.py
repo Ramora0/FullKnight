@@ -62,20 +62,19 @@ class PPO:
                 lr_lambda=lambda epoch: 1.0 - epoch / config.epochs,
             )
 
-    def get_advantages(self, rewards, dones, values):
-        """GAE computation."""
+    def get_advantages(self, rewards, values):
+        """GAE computation for continuing (no-episode) tasks."""
         advantages = np.empty_like(rewards, dtype=np.float32)
         lastgaelam = 0
         for t in reversed(range(len(rewards))):
-            nonterminal = 1.0 - dones[t]
             delta = (
                 rewards[t]
-                + self.config.gamma * values[t + 1] * nonterminal
+                + self.config.gamma * values[t + 1]
                 - values[t]
             )
             lastgaelam = (
                 delta
-                + self.config.gamma * self.config.gae_lambda * nonterminal * lastgaelam
+                + self.config.gamma * self.config.gae_lambda * lastgaelam
             )
             advantages[t] = lastgaelam
         return advantages
@@ -103,14 +102,13 @@ class PPO:
 
     def train_on_rollout(self, buf_combat_hb, buf_combat_mask, buf_terrain_hb,
                          buf_terrain_mask, buf_global, actions_arr,
-                         log_probs_arr, rewards_arr, dones_arr, values_arr):
+                         log_probs_arr, rewards_arr, values_arr):
         """Train on a collected rollout with shuffled minibatches.
 
         buf_*: lists of length T, each element is (N, ...) numpy array
         actions_arr: dict of (T, N) numpy arrays
         log_probs_arr: (T, N)
         rewards_arr: (T, N)
-        dones_arr: (T, N)
         values_arr: (T+1, N)
         """
         T, N = rewards_arr.shape
@@ -121,7 +119,7 @@ class PPO:
         all_advantages = np.empty_like(rewards_arr)
         for env_i in range(N):
             all_advantages[:, env_i] = self.get_advantages(
-                rewards_arr[:, env_i], dones_arr[:, env_i], values_arr[:, env_i]
+                rewards_arr[:, env_i], values_arr[:, env_i]
             )
         all_returns = all_advantages + values_arr[:-1]
 

@@ -37,6 +37,13 @@ class Config:
     action_n: int = 4     # attack, spell, dash, none
     jump_n: int = 2       # yes, no
 
+    # Adaptive reward scaling
+    D_min: float = 30.0       # floor: face-tanking is net positive
+    D_max: float = 200.0      # ceiling: real boss HP
+    D_initial: float = 30.0   # starting difficulty
+    D_ema: float = 0.8        # smoothing: D moves 20% toward new value each epoch
+    knight_max_hp: int = 9    # for damage_taken normalization
+
     # PPO
     lr: float = 2.5e-4
     gamma: float = 0.99

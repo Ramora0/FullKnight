@@ -32,8 +32,10 @@ async def train(config: Config):
     os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
     wandb.init(project=config.wandb_project, config=vars(config))
 
+    D = config.D_initial
+
     for epoch in range(config.epochs):
-        # Reset all envs
+        # Reset scene each epoch so the knight doesn't get stuck
         combat_hb, combat_mask, terrain_hb, terrain_mask, global_state = \
             await vec_env.reset_all()
 
@@ -45,23 +47,15 @@ async def train(config: Config):
         buf_global = []
         buf_actions = {k: [] for k in ["movement", "direction", "action", "jump"]}
         buf_log_probs = []
-        buf_rewards = []
-        buf_dones = []
         buf_values = []
-
-        ep_rewards = np.zeros(config.n_envs)
-        ep_lengths = np.zeros(config.n_envs)
-        completed_ep_rewards = []
-        completed_ep_lengths = []
-        win_lengths = []
-        loss_lengths = []
+        buf_damage_dealt = []
+        buf_damage_taken = []
 
         for t in range(config.rollout_len):
             actions_np, log_probs, values = agent.collect_action(
                 combat_hb, combat_mask, terrain_hb, terrain_mask, global_state
             )
 
-            # Convert to list-of-lists for C# side
             action_vecs = [
                 [
                     int(actions_np["movement"][i]),
@@ -72,11 +66,9 @@ async def train(config: Config):
                 for i in range(config.n_envs)
             ]
 
-            # Step all envs
-            next_chb, next_cm, next_thb, next_tm, next_gs, rewards, dones = \
+            next_chb, next_cm, next_thb, next_tm, next_gs, dmg_dealt, dmg_taken = \
                 await vec_env.step_all(action_vecs)
 
-            # Store in buffers
             buf_combat_hb.append(combat_hb)
             buf_combat_mask.append(combat_mask)
             buf_terrain_hb.append(terrain_hb)
@@ -85,23 +77,9 @@ async def train(config: Config):
             for k in buf_actions:
                 buf_actions[k].append(actions_np[k])
             buf_log_probs.append(log_probs)
-            buf_rewards.append(rewards)
-            buf_dones.append(dones)
             buf_values.append(values)
-
-            # Track episode metrics
-            ep_rewards += rewards
-            ep_lengths += 1
-            for i in range(config.n_envs):
-                if dones[i]:
-                    completed_ep_rewards.append(ep_rewards[i])
-                    completed_ep_lengths.append(ep_lengths[i])
-                    if rewards[i] > 0.5:
-                        win_lengths.append(ep_lengths[i])
-                    else:
-                        loss_lengths.append(ep_lengths[i])
-                    ep_rewards[i] = 0
-                    ep_lengths[i] = 0
+            buf_damage_dealt.append(dmg_dealt)
+            buf_damage_taken.append(dmg_taken)
 
             combat_hb, combat_mask = next_chb, next_cm
             terrain_hb, terrain_mask = next_thb, next_tm
@@ -113,59 +91,61 @@ async def train(config: Config):
         )
         buf_values.append(final_values)
 
-        # Stack buffers: (T, N, ...)
-        rewards_arr = np.stack(buf_rewards)
-        dones_arr = np.stack(buf_dones)
+        # Stack buffers: (T, N)
+        damage_dealt_arr = np.stack(buf_damage_dealt)
+        damage_taken_arr = np.stack(buf_damage_taken)
         log_probs_arr = np.stack(buf_log_probs)
         values_arr = np.stack(buf_values)
         actions_arr = {k: np.stack(v) for k, v in buf_actions.items()}
 
+        # Compute adaptive D from this rollout (EMA-smoothed)
+        total_dealt = damage_dealt_arr.sum()
+        total_taken = damage_taken_arr.sum()
+        if total_taken > 0 and total_dealt > 0:
+            D_raw = total_dealt * config.knight_max_hp / total_taken
+            D_raw = np.clip(D_raw, config.D_min, config.D_max)
+            D = config.D_ema * D + (1 - config.D_ema) * D_raw
+
+        # Compute rewards retroactively using D
+        rewards_arr = damage_dealt_arr / D - damage_taken_arr / config.knight_max_hp
+
         # Pause game during training
         await vec_env.pause_all()
 
-        # Train
         metrics = agent.train_on_rollout(
             buf_combat_hb, buf_combat_mask, buf_terrain_hb, buf_terrain_mask,
-            buf_global, actions_arr, log_probs_arr, rewards_arr, dones_arr, values_arr,
+            buf_global, actions_arr, log_probs_arr, rewards_arr, values_arr,
         )
 
         if config.anneal_lr:
             agent.scheduler.step()
 
-        # Resume game
         await vec_env.resume_all()
 
         # Logging
-        # Include partial episodes in averages
-        all_ep_rewards = completed_ep_rewards + list(ep_rewards)
-        all_ep_lengths = completed_ep_lengths + list(ep_lengths)
-
+        avg_reward = rewards_arr.mean()
         total_steps = (epoch + 1) * config.n_envs * config.rollout_len
-        n_wins = len(win_lengths)
-        n_losses = len(loss_lengths)
-        n_completed = n_wins + n_losses
         wandb.log({
             "loss/surrogate": metrics["surrogate"],
             "loss/value": metrics["value"],
             "loss/entropy": metrics["entropy"],
             "metrics/kl": metrics["kl"],
             "metrics/lr": agent.optimizer.param_groups[0]["lr"],
-            "rollout/avg_ep_reward": np.mean(all_ep_rewards) if all_ep_rewards else 0,
-            "rollout/avg_ep_length": np.mean(all_ep_lengths) if all_ep_lengths else 0,
-            "rollout/completed_episodes": len(completed_ep_rewards),
-            "rollout/win_rate": n_wins / n_completed if n_completed else 0,
-            "rollout/avg_win_length": np.mean(win_lengths) if win_lengths else 0,
-            "rollout/avg_loss_length": np.mean(loss_lengths) if loss_lengths else 0,
+            "curriculum/D": D,
+            "rollout/avg_reward": avg_reward,
+            "rollout/total_damage_dealt": total_dealt,
+            "rollout/total_damage_taken": total_taken,
+            "rollout/hit_ratio": total_dealt / max(total_taken, 1),
         }, step=total_steps)
 
-        avg_rew = np.mean(all_ep_rewards) if all_ep_rewards else 0
         print(
             f"epoch {epoch:4d} | "
             f"steps {total_steps:8d} | "
-            f"avg_rew {avg_rew:7.3f} | "
+            f"D {D:7.1f} | "
+            f"avg_rew {avg_reward:7.4f} | "
+            f"dealt {total_dealt:5.0f} | "
+            f"taken {total_taken:5.0f} | "
             f"surr {metrics['surrogate']:7.4f} | "
-            f"val {metrics['value']:7.4f} | "
-            f"ent {metrics['entropy']:7.4f} | "
             f"kl {metrics['kl']:6.4f}"
         )
 
@@ -174,7 +154,6 @@ async def train(config: Config):
             agent.save_checkpoint(path)
             print(f"  Saved checkpoint: {path}")
 
-    # Final save
     agent.save_checkpoint(f"{config.save_path}_final.pth")
     wandb.finish()
 

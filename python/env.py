@@ -26,12 +26,12 @@ class HKEnv:
 
     async def step(self, action_vec):
         """Take a step. action_vec = [movement, direction, action, jump].
-        Returns (combat_hb, terrain_hb, global_state, reward, done, info).
+        Returns (combat_hb, terrain_hb, global_state, damage_dealt, damage_taken).
         """
         resp = await self.send_and_recv("action", {"action_vec": action_vec})
         d = resp["data"]
         combat_hb, terrain_hb, gs = self._parse_obs(d)
-        return combat_hb, terrain_hb, gs, d.get("reward", 0.0), d.get("done", False), d.get("info", "")
+        return combat_hb, terrain_hb, gs, d.get("damage_dealt", 0), d.get("damage_taken", 0)
 
     async def pause(self):
         await self.send_and_recv("pause", {})
