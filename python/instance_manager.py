@@ -25,7 +25,7 @@ class InstanceManager:
         self.exe = None
         for _, _, files in os.walk(self.root):
             for name in files:
-                if fnmatch.fnmatch(name.lower(), "hollow knight.*"):
+                if fnmatch.fnmatch(name.lower(), "hollow?knight.*"):
                     self.exe = os.path.join(self.root, name)
                     break
             break  # only top-level
@@ -36,7 +36,8 @@ class InstanceManager:
         self.instances = []
 
     def _instance_exe(self, name):
-        return self.exe.replace("hollow knight", name).replace("Hollow Knight", name)
+        exe_basename = os.path.basename(self.exe)
+        return os.path.join(self.root, exe_basename.replace(os.path.splitext(exe_basename)[0], name))
 
     def _instance_data(self, name):
         return os.path.join(self.root, name + "_Data")

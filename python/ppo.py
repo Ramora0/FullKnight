@@ -188,11 +188,12 @@ class PPO:
                 clipped = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps)
                 surrogate = -torch.min(ratio * adv_t[idx], clipped * adv_t[idx]).mean()
                 value_loss = F.mse_loss(values, ret_t[idx])
+                clipped_vloss = torch.clamp(value_loss, max=cfg.max_value_loss)
                 entropy_loss = -entropy.mean()
 
                 loss = (
                     surrogate
-                    + cfg.value_coeff * value_loss
+                    + cfg.value_coeff * clipped_vloss
                     + cfg.entropy_coeff * entropy_loss
                 )
 

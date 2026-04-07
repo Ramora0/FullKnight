@@ -93,6 +93,27 @@ namespace FullKnight.Environment
 			yield break;
 		}
 
+		private IEnumerator AutoReset()
+		{
+			_totalDamageTaken = 0;
+			_hitsTakenInStep = 0;
+			_damageDoneInStep = 0;
+			_bossDeadInStep = false;
+
+			yield return SceneHooks.LoadBossScene(_level);
+
+			_bossMaxHP = GetBossMaxHP();
+			_knightMaxHP = PlayerData.instance.maxHealth;
+
+			UnhookDamage();
+			HookDamage();
+
+			if (_timeManager != null) _timeManager.Dispose();
+			_timeManager = new Game.TimeScale(_timeScaleValue);
+
+			_hitboxObserver.Load();
+		}
+
 		private IEnumerator Step(MessageData data)
 		{
 			ActionDecoder.ApplyAction(_inputShim, data.action_vec);
@@ -127,16 +148,11 @@ namespace FullKnight.Environment
 			_damageDoneInStep = 0;
 			_bossDeadInStep = false;
 
-			// Auto-reset: reload boss scene for next episode
+			// Auto-reset: reload boss scene for next episode (no message sent)
 			if (done)
 			{
 				_inputShim.Reset();
-				yield return Reset(new MessageData
-				{
-					level = _level,
-					frames_per_wait = _frameSkipCount,
-					time_scale = _timeScaleValue
-				});
+				yield return AutoReset();
 			}
 
 			yield break;

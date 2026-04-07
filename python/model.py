@@ -133,16 +133,16 @@ class FullKnightActorCritic(nn.Module):
 
         # Action head: [attack, spell, dash, none]
         # Mask attack (idx 0) if can_attack == 0
-        logits_action[..., 0] = logits_action[..., 0] + (can_attack - 1) * 1e8
+        logits_action[..., 0] = logits_action[..., 0] + (can_attack - 1) * 1e4
         # Mask spell (idx 1) if can_cast == 0
-        logits_action[..., 1] = logits_action[..., 1] + (can_cast - 1) * 1e8
+        logits_action[..., 1] = logits_action[..., 1] + (can_cast - 1) * 1e4
         # Mask dash (idx 2) if can_dash == 0
-        logits_action[..., 2] = logits_action[..., 2] + (can_dash - 1) * 1e8
+        logits_action[..., 2] = logits_action[..., 2] + (can_dash - 1) * 1e4
 
         # Jump head: [yes, no]
         # Mask yes (idx 0) if no jump variant is available
         can_any_jump = torch.clamp(can_jump + can_double_jump + can_wall_jump, 0, 1)
-        logits_jump[..., 0] = logits_jump[..., 0] + (can_any_jump - 1) * 1e8
+        logits_jump[..., 0] = logits_jump[..., 0] + (can_any_jump - 1) * 1e4
 
         return logits_action, logits_jump
 

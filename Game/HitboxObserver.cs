@@ -75,7 +75,7 @@ namespace FullKnight.Game
 		public void Load()
 		{
 			Unload();
-			SceneManager.activeSceneChanged += CreateHitboxReader;
+			UnityEngine.SceneManagement.SceneManager.activeSceneChanged += CreateHitboxReader;
 			ModHooks.ColliderCreateHook += UpdateHitboxReader;
 			CreateHitboxReader();
 			loaded = true;
@@ -83,7 +83,7 @@ namespace FullKnight.Game
 
 		public void Unload()
 		{
-			SceneManager.activeSceneChanged -= CreateHitboxReader;
+			UnityEngine.SceneManagement.SceneManager.activeSceneChanged -= CreateHitboxReader;
 			ModHooks.ColliderCreateHook -= UpdateHitboxReader;
 			DestroyHitboxReader();
 		}

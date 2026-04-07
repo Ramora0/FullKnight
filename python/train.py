@@ -2,7 +2,7 @@ import asyncio
 import os
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 from config import Config
 from vec_env import VecEnv
@@ -13,11 +13,13 @@ from instance_manager import InstanceManager
 async def train(config: Config):
     # Optionally launch game instances
     mgr = None
-    if config.hk_path and os.path.exists(config.hk_path):
+    if config.n_envs > 1 and config.hk_path and os.path.exists(config.hk_path):
         print(f"Spawning {config.n_envs} HK instances...")
         mgr = InstanceManager(config.hk_path, config.hk_data_dir)
         mgr.spawn_n(config.n_envs)
         mgr.start_all()
+    else:
+        print("Single instance mode — launch Hollow Knight manually.")
 
     # Start vectorized environment server
     vec_env = VecEnv(config)
@@ -28,10 +30,7 @@ async def train(config: Config):
     print(f"Model parameters: {sum(p.numel() for p in agent.policy.parameters()):,}")
 
     os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
-    writer = SummaryWriter(config.log_path)
-
-    # Log hyperparameters
-    writer.add_text("config", str(config), 0)
+    wandb.init(project=config.wandb_project, config=vars(config))
 
     for epoch in range(config.epochs):
         # Reset all envs
@@ -142,20 +141,22 @@ async def train(config: Config):
         all_ep_lengths = completed_ep_lengths + list(ep_lengths)
 
         total_steps = (epoch + 1) * config.n_envs * config.rollout_len
-        writer.add_scalar("loss/surrogate", metrics["surrogate"], total_steps)
-        writer.add_scalar("loss/value", metrics["value"], total_steps)
-        writer.add_scalar("loss/entropy", metrics["entropy"], total_steps)
-        writer.add_scalar("metrics/kl", metrics["kl"], total_steps)
-        writer.add_scalar("metrics/lr", agent.optimizer.param_groups[0]["lr"], total_steps)
-        writer.add_scalar("rollout/avg_ep_reward", np.mean(all_ep_rewards) if all_ep_rewards else 0, total_steps)
-        writer.add_scalar("rollout/avg_ep_length", np.mean(all_ep_lengths) if all_ep_lengths else 0, total_steps)
-        writer.add_scalar("rollout/completed_episodes", len(completed_ep_rewards), total_steps)
         n_wins = len(win_lengths)
         n_losses = len(loss_lengths)
         n_completed = n_wins + n_losses
-        writer.add_scalar("rollout/win_rate", n_wins / n_completed if n_completed else 0, total_steps)
-        writer.add_scalar("rollout/avg_win_length", np.mean(win_lengths) if win_lengths else 0, total_steps)
-        writer.add_scalar("rollout/avg_loss_length", np.mean(loss_lengths) if loss_lengths else 0, total_steps)
+        wandb.log({
+            "loss/surrogate": metrics["surrogate"],
+            "loss/value": metrics["value"],
+            "loss/entropy": metrics["entropy"],
+            "metrics/kl": metrics["kl"],
+            "metrics/lr": agent.optimizer.param_groups[0]["lr"],
+            "rollout/avg_ep_reward": np.mean(all_ep_rewards) if all_ep_rewards else 0,
+            "rollout/avg_ep_length": np.mean(all_ep_lengths) if all_ep_lengths else 0,
+            "rollout/completed_episodes": len(completed_ep_rewards),
+            "rollout/win_rate": n_wins / n_completed if n_completed else 0,
+            "rollout/avg_win_length": np.mean(win_lengths) if win_lengths else 0,
+            "rollout/avg_loss_length": np.mean(loss_lengths) if loss_lengths else 0,
+        }, step=total_steps)
 
         avg_rew = np.mean(all_ep_rewards) if all_ep_rewards else 0
         print(
@@ -175,7 +176,7 @@ async def train(config: Config):
 
     # Final save
     agent.save_checkpoint(f"{config.save_path}_final.pth")
-    writer.close()
+    wandb.finish()
 
     if mgr:
         mgr.stop_all()

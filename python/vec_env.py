@@ -27,7 +27,7 @@ class VecEnv:
         await asyncio.gather(*[e.wait() for e in self.connected])
         print(f"All {self.n_envs} instances connected.")
 
-    async def _on_connect(self, websocket, path):
+    async def _on_connect(self, websocket):
         try:
             idx = self._ws_connections.index(None)
         except ValueError:

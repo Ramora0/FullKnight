@@ -20,7 +20,7 @@
     <DefineConstants>DEBUG;TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
-    <LocalRefs>F:\GOG Games\Hollow Knight\Hollow Knight_Data\Managed</LocalRefs>
+    <LocalRefs>C:\Program Files (x86)\Steam\steamapps\common\Hollow Knight\hollow_knight_Data\Managed</LocalRefs>
     <ModsPath>$(LocalRefs)/Mods</ModsPath>
     <ExportDir>Output</ExportDir>
   </PropertyGroup>
