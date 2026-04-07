@@ -65,13 +65,14 @@ class PPO:
                 lr_lambda=lambda epoch: 1.0 - epoch / config.epochs,
             )
 
-    def get_advantages(self, hits_landed, hits_taken, values_atk, values_def, D):
+    def get_advantages(self, damage_landed, hits_taken, values_atk, values_def, D):
         """GAE with decomposed value heads and curriculum scaling.
 
-        Values are trained on stationary rewards (hits only), D scales at advantage time.
+        Values are trained on stationary rewards, D scales at advantage time.
+        damage_landed is normalized to nail-hit equivalents (1.0 = one nail hit).
         δ_t = δ_attack_t / D - δ_defense_t
         """
-        T = len(hits_landed)
+        T = len(damage_landed)
         gamma = self.config.gamma
         lam = self.config.gae_lambda
 
@@ -84,7 +85,7 @@ class PPO:
 
         for t in reversed(range(T)):
             # Stationary TD errors for each head
-            delta_atk = hits_landed[t] + gamma * values_atk[t + 1] - values_atk[t]
+            delta_atk = damage_landed[t] + gamma * values_atk[t + 1] - values_atk[t]
             delta_def = hits_taken[t] + gamma * values_def[t + 1] - values_def[t]
 
             # Curriculum-scaled advantage
@@ -149,18 +150,18 @@ class PPO:
 
     def train_on_rollout(self, buf_combat_hb, buf_combat_mask, buf_terrain_hb,
                          buf_terrain_mask, buf_global, actions_arr,
-                         log_probs_arr, hits_landed_arr, hits_taken_arr,
+                         log_probs_arr, damage_landed_arr, hits_taken_arr,
                          values_atk_arr, values_def_arr, D):
         """Train on a collected rollout with shuffled minibatches.
 
         buf_*: lists of length T, each element is (N, ...) numpy array
         actions_arr: dict of (T, N) numpy arrays
         log_probs_arr: (T, N)
-        hits_landed_arr, hits_taken_arr: (T, N)
+        damage_landed_arr, hits_taken_arr: (T, N)
         values_atk_arr, values_def_arr: (T+1, N)
         D: current curriculum scaling factor
         """
-        T, N = hits_landed_arr.shape
+        T, N = damage_landed_arr.shape
         cfg = self.config
         total_samples = T * N
 
@@ -170,7 +171,7 @@ class PPO:
         all_def_returns = np.empty((T, N), dtype=np.float32)
         for env_i in range(N):
             adv, atk_ret, def_ret = self.get_advantages(
-                hits_landed_arr[:, env_i], hits_taken_arr[:, env_i],
+                damage_landed_arr[:, env_i], hits_taken_arr[:, env_i],
                 values_atk_arr[:, env_i], values_def_arr[:, env_i], D,
             )
             all_advantages[:, env_i] = adv

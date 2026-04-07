@@ -26,8 +26,8 @@ namespace FullKnight.Net
 		public bool? done;
 		public string info;
 
-		// Raw hit count signals (for Python-side reward computation)
-		public int? hits_landed;
+		// Raw reward signals (for Python-side reward computation)
+		public float? damage_landed;  // normalized to nail-hit equivalents
 		public int? hits_taken;
 
 		// Action (Python -> C#)

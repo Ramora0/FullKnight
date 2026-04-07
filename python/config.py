@@ -38,11 +38,12 @@ class Config:
     action_n: int = 4     # attack, spell, dash, none
     jump_n: int = 2       # yes, no
 
-    # Adaptive reward scaling (hit-ratio units)
+    # Adaptive reward scaling (nail-hit-equivalent units)
     D_min: float = 0.05       # floor
     D_max: float = 100.0      # ceiling: near-perfect play
-    D_initial: float = 0.3    # starting difficulty
+    D_initial: float = 0.6    # starting difficulty (nail-equivalent damage landed per hit taken)
     D_ema: float = 0.8        # smoothing: D moves 20% toward new value each epoch
+    D_max_delta: float = 0.1  # max relative change per epoch (10%)
 
 
     # PPO

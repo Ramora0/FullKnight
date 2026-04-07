@@ -13,7 +13,7 @@ namespace FullKnight.Environment
 		private int _frameSkipCount;
 		private int _timeScaleValue;
 		private int _hitsTakenInStep;
-		private int _hitsLandedInStep;
+		private float _damageLandedInStep;
 		private int _bossMaxHP;
 		private int _knightMaxHP;
 
@@ -65,7 +65,7 @@ namespace FullKnight.Environment
 			_frameSkipCount = data.frames_per_wait ?? _frameSkipCount;
 			_timeScaleValue = data.time_scale ?? _timeScaleValue;
 			_hitsTakenInStep = 0;
-			_hitsLandedInStep = 0;
+			_damageLandedInStep = 0;
 
 			yield return SceneHooks.LoadBossScene(_level);
 
@@ -106,14 +106,14 @@ namespace FullKnight.Environment
 			data.combat_hitboxes = obs.CombatHitboxes;
 			data.terrain_hitboxes = obs.TerrainHitboxes;
 			data.global_state = gs;
-			data.hits_landed = _hitsLandedInStep;
+			data.damage_landed = _damageLandedInStep;
 			data.hits_taken = _hitsTakenInStep;
 
 			SendMessage(new Message { type = "step", data = data });
 
 			// Reset per-step counters
 			_hitsTakenInStep = 0;
-			_hitsLandedInStep = 0;
+			_damageLandedInStep = 0;
 
 			yield break;
 		}
@@ -170,9 +170,11 @@ namespace FullKnight.Environment
 			return 1;
 		}
 
+		private const float NailDamage = 21f;
+
 		private void OnBossDamaged(On.HealthManager.orig_TakeDamage orig, HealthManager self, HitInstance hitInstance)
 		{
-			_hitsLandedInStep++;
+			_damageLandedInStep += hitInstance.DamageDealt / NailDamage;
 			// Prevent boss death by ensuring HP stays above zero before orig
 			if (self.hp - hitInstance.DamageDealt <= 0)
 				self.hp = _bossMaxHP;

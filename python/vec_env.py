@@ -62,17 +62,17 @@ class VecEnv:
     async def step_all(self, actions):
         """Step all envs in parallel.
         actions: list of N action_vecs, each [movement, direction, action, jump].
-        Returns (combat_hb, combat_mask, terrain_hb, terrain_mask, global_states, hits_landed, hits_taken).
+        Returns (combat_hb, combat_mask, terrain_hb, terrain_mask, global_states, damage_landed, hits_taken).
         """
         results = await asyncio.gather(*[
             self.envs[i].step(actions[i]) for i in range(self.n_envs)
         ])
-        combat_lists, terrain_lists, gs_list, hits_landed, hits_taken = zip(*results)
+        combat_lists, terrain_lists, gs_list, damage_landed, hits_taken = zip(*results)
 
         obs_batch = self._batch_observations(list(zip(combat_lists, terrain_lists, gs_list)))
-        hits_landed = np.array(hits_landed, dtype=np.float32)
+        damage_landed = np.array(damage_landed, dtype=np.float32)
         hits_taken = np.array(hits_taken, dtype=np.float32)
-        return *obs_batch, hits_landed, hits_taken
+        return *obs_batch, damage_landed, hits_taken
 
     async def pause_all(self):
         await asyncio.gather(*[env.pause() for env in self.envs])

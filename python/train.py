@@ -54,7 +54,7 @@ async def train(config: Config):
         buf_log_probs = []
         buf_values_atk = []
         buf_values_def = []
-        buf_hits_landed = []
+        buf_damage_landed = []
         buf_hits_taken = []
 
         for t in range(config.rollout_len):
@@ -72,7 +72,7 @@ async def train(config: Config):
                 for i in range(config.n_envs)
             ]
 
-            next_chb, next_cm, next_thb, next_tm, next_gs, hits_landed, hits_taken = \
+            next_chb, next_cm, next_thb, next_tm, next_gs, damage_landed, hits_taken = \
                 await vec_env.step_all(action_vecs)
 
             buf_combat_hb.append(combat_hb)
@@ -85,7 +85,7 @@ async def train(config: Config):
             buf_log_probs.append(log_probs)
             buf_values_atk.append(values_atk)
             buf_values_def.append(values_def)
-            buf_hits_landed.append(hits_landed)
+            buf_damage_landed.append(damage_landed)
             buf_hits_taken.append(hits_taken)
 
             combat_hb, combat_mask = next_chb, next_cm
@@ -103,7 +103,7 @@ async def train(config: Config):
         buf_values_def.append(final_vdef)
 
         # Stack buffers: (T, N)
-        hits_landed_arr = np.stack(buf_hits_landed)
+        damage_landed_arr = np.stack(buf_damage_landed)
         hits_taken_arr = np.stack(buf_hits_taken)
         log_probs_arr = np.stack(buf_log_probs)
         values_atk_arr = np.stack(buf_values_atk)
@@ -111,12 +111,13 @@ async def train(config: Config):
         actions_arr = {k: np.stack(v) for k, v in buf_actions.items()}
 
         # Compute adaptive D from this rollout (EMA-smoothed)
-        total_landed = hits_landed_arr.sum()
+        total_landed = damage_landed_arr.sum()
         total_taken = hits_taken_arr.sum()
         if total_taken > 0 and total_landed > 0:
             D_raw = total_landed / total_taken
             D_raw = np.clip(D_raw, config.D_min, config.D_max)
-            D = config.D_ema * D + (1 - config.D_ema) * D_raw
+            D_new = config.D_ema * D + (1 - config.D_ema) * D_raw
+            D = np.clip(D_new, D * (1 - config.D_max_delta), D * (1 + config.D_max_delta))
 
         # Pause game during training
         await vec_env.pause_all()
@@ -124,7 +125,7 @@ async def train(config: Config):
         metrics = agent.train_on_rollout(
             buf_combat_hb, buf_combat_mask, buf_terrain_hb, buf_terrain_mask,
             buf_global, actions_arr, log_probs_arr,
-            hits_landed_arr, hits_taken_arr,
+            damage_landed_arr, hits_taken_arr,
             values_atk_arr, values_def_arr, D,
         )
 
@@ -134,7 +135,7 @@ async def train(config: Config):
         await vec_env.resume_all()
 
         # Logging
-        curriculum_reward = (hits_landed_arr / D - hits_taken_arr).mean()
+        curriculum_reward = (damage_landed_arr / D - hits_taken_arr).mean()
         total_steps = (epoch + 1) * config.n_envs * config.rollout_len
         wandb.log({
             "loss/surrogate": metrics["surrogate"],
@@ -145,9 +146,10 @@ async def train(config: Config):
             "metrics/lr": agent.optimizer.param_groups[0]["lr"],
             "curriculum/D": D,
             "rollout/curriculum_reward": curriculum_reward,
-            "rollout/total_hits_landed": total_landed,
+            "rollout/total_damage_landed": total_landed,
             "rollout/total_hits_taken": total_taken,
             "rollout/hit_ratio": total_landed / max(total_taken, 1),
+            "epoch": epoch,
         }, step=total_steps)
 
         print(

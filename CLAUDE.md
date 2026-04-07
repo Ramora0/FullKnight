@@ -78,6 +78,10 @@ The model applies **validity masking** using the 6 `can_*` flags from global sta
 
 Windows-only. Creates junction-linked copies of the HK game directory to run N instances simultaneously. Configured via `Config.hk_path`.
 
+### Environment
+
+Instead of training discretely on beating a boss, we train on an infinite boss game where the boss and player never die. Since the terminal state of a boss dying is just the sum of per step rewards, actually killing the boss isn't informative; its the progressive damage given vs taken thats the real, immediate reward signal.
+
 ## Config
 
 All hyperparameters and environment settings are in `python/config.py` as a `@dataclass`. Key settings: `n_envs`, `level` (HK scene name), `frames_per_wait` (frame skip), `time_scale`.
