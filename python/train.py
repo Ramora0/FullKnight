@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import os
 import numpy as np
@@ -179,11 +178,7 @@ async def train(config: Config):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--visualize", action="store_true", help="Live-render model observations")
-    args = parser.parse_args()
-
-    config = Config(visualize=args.visualize)
+    config = Config.from_cli()
     asyncio.run(train(config))
 
 

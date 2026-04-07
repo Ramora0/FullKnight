@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import argparse
+from dataclasses import dataclass, fields
 
 
 @dataclass
@@ -69,3 +70,18 @@ class Config:
 
     # Debug
     visualize: bool = False
+
+    @classmethod
+    def from_cli(cls) -> "Config":
+        """Build Config from dataclass defaults, overridden by any CLI args."""
+        parser = argparse.ArgumentParser()
+        defaults = cls()
+        for f in fields(cls):
+            if f.type is bool:
+                parser.add_argument(f"--{f.name}", action="store_true", default=None)
+                parser.add_argument(f"--no-{f.name}", dest=f.name, action="store_false")
+            else:
+                parser.add_argument(f"--{f.name}", type=f.type, default=None)
+        args = parser.parse_args()
+        overrides = {k: v for k, v in vars(args).items() if v is not None}
+        return cls(**overrides)
