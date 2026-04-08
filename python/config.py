@@ -71,6 +71,9 @@ class Config:
     # Resume
     resume: str = ""  # path to checkpoint to resume from
 
+    # Reproducibility
+    seed: int = 0  # 0 = non-deterministic
+
     # Debug
     visualize: bool = False
 

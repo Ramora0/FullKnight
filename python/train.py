@@ -12,7 +12,21 @@ from ppo import PPO
 from instance_manager import InstanceManager
 
 
+def seed_everything(seed: int):
+    """Seed all RNGs for deterministic model init and action sampling."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
 async def train(config: Config):
+    if config.seed:
+        seed_everything(config.seed)
+        print(f"Seeded all RNGs with {config.seed}")
+
     vis = None
     if config.visualize:
         from visualizer import Visualizer
