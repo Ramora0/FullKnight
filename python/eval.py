@@ -119,21 +119,20 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
 
-    # Stop recording
-    if recorder:
-        stop_recording(recorder)
-        print(f"Recording saved to: {record}")
+    finally:
+        if recorder:
+            stop_recording(recorder)
+            print(f"Recording saved to: {record}")
 
-    # Close connection
-    try:
-        await game_ws.send(json.dumps({"type": "close", "data": {}, "sender": "server"}))
-    except Exception:
-        pass
-    server.close()
-    await server.wait_closed()
+        try:
+            await game_ws.send(json.dumps({"type": "close", "data": {}, "sender": "server"}))
+        except Exception:
+            pass
+        server.close()
+        await server.wait_closed()
 
-    if mgr:
-        mgr.stop_all()
+        if mgr:
+            mgr.stop_all()
 
 
 def parse_obs(data, config):
