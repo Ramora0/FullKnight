@@ -52,7 +52,7 @@ class Config:
     gamma: float = 0.95
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    value_coeff: float = 0.25
+    value_coeff: float = 0.5
     entropy_coeff: float = 0.01
     max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
