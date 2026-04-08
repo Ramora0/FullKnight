@@ -34,6 +34,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
         print(f"Launching Hollow Knight from {launch_path} ...")
         mgr = InstanceManager(launch_path, config.hk_data_dir)
         mgr.spawn_n(1)
+        mgr._disable_steam_api()
         mgr.start_instance("i0", graphical=True)
     else:
         print(f"hk_path not found ({launch_path}) — launch Hollow Knight manually.")
