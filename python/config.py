@@ -68,6 +68,9 @@ class Config:
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
 
+    # Resume
+    resume: str = ""  # path to checkpoint to resume from
+
     # Debug
     visualize: bool = False
 

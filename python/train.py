@@ -32,6 +32,9 @@ async def train(config: Config):
         await vec_env.start_server()
 
         agent = PPO(config)
+        if config.resume:
+            agent.load_checkpoint(config.resume)
+            print(f"Resumed from: {config.resume}")
         print(f"Using device: {agent.device}")
         print(f"Model parameters: {sum(p.numel() for p in agent.policy.parameters()):,}")
 

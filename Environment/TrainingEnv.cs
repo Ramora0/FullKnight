@@ -97,6 +97,7 @@ namespace FullKnight.Environment
 			data.terrain_hitboxes = obs.TerrainHitboxes;
 			data.global_state = gs;
 
+			Time.timeScale = 0;
 			SendMessage(new Message { type = "reset", data = data });
 			yield break;
 		}
@@ -117,6 +118,8 @@ namespace FullKnight.Environment
 				yield break;
 			}
 
+			Time.timeScale = _timeScaleValue;
+
 			ActionDecoder.ApplyAction(_inputShim, data.action_vec);
 
 			// In training mode, restore knight HP each step for infinite fighting
@@ -130,6 +133,8 @@ namespace FullKnight.Environment
 				if (_evalMode && (_bossDied || PlayerData.instance.health <= 0))
 					break;
 			}
+
+			Time.timeScale = 0;
 
 			// Check for episode end in eval mode
 			if (_evalMode && !_episodeDone)
