@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from collections import deque
 import numpy as np
 import torch
 import wandb
@@ -42,6 +43,9 @@ async def train(config: Config):
         wandb.init(project=config.wandb_project, config=vars(config))
 
         D = config.D_initial
+        time_budget = int(os.environ.get('FULLKNIGHT_TIME_BUDGET', 0))
+        t_start = time.perf_counter()
+        recent = deque(maxlen=20)
 
         for epoch in range(config.epochs):
             # Reset scene each epoch so the knight doesn't get stuck
@@ -193,10 +197,42 @@ async def train(config: Config):
                 f"kl {metrics['kl']:6.4f}"
             )
 
+            recent.append({
+                'hit_ratio': float(total_landed / max(total_taken, 1)),
+                'curriculum_reward': float(curriculum_reward),
+                'damage_landed': float(total_landed),
+                'damage_taken': float(total_taken),
+                'entropy': metrics['entropy'],
+                'kl': metrics['kl'],
+                'D': float(D),
+                'surrogate': metrics['surrogate'],
+            })
+
+            if time_budget and (time.perf_counter() - t_start) >= time_budget:
+                print(f"Time budget ({time_budget}s) reached after {epoch + 1} epochs")
+                break
+
             if epoch % config.save_every == 0:
                 path = f"{config.save_path}_{epoch}.pth"
                 agent.save_checkpoint(path)
                 print(f"  Saved checkpoint: {path}")
+
+        # Print summary (used by autoresearch pipeline)
+        if recent:
+            n = len(recent)
+            avg = {k: sum(m[k] for m in recent) / n for k in recent[0]}
+            elapsed = time.perf_counter() - t_start
+            print("\n---")
+            print(f"hit_ratio:          {avg['hit_ratio']:.6f}")
+            print(f"curriculum_reward:   {avg['curriculum_reward']:.6f}")
+            print(f"avg_damage_landed:   {avg['damage_landed']:.2f}")
+            print(f"avg_damage_taken:    {avg['damage_taken']:.2f}")
+            print(f"final_D:             {avg['D']:.2f}")
+            print(f"final_entropy:       {avg['entropy']:.6f}")
+            print(f"final_kl:            {avg['kl']:.6f}")
+            print(f"final_surrogate:     {avg['surrogate']:.6f}")
+            print(f"epochs_completed:    {epoch + 1}")
+            print(f"training_seconds:    {elapsed:.1f}")
 
         agent.save_checkpoint(f"{config.save_path}_final.pth")
         wandb.finish()
