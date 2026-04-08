@@ -5,6 +5,7 @@ Output/
 *.dll
 *.pdb
 *.cache
+save/
 
 # Python
 __pycache__/
