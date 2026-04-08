@@ -21,9 +21,13 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment trains for a **fixed time budget of 20 minutes** (wall clock). You launch it simply as: `bash autoresearch/run_experiment.sh`
+Each experiment trains for a **fixed time budget of 20 minutes** (wall clock). Launch it as:
 
-The script handles everything: sets the time budget, disables wandb, redirects verbose output to `autoresearch/run.log`, and prints only the final summary to stdout.
+```bash
+.venv/Scripts/python.exe python/train.py --time_budget 1200 > autoresearch/run.log 2>&1
+```
+
+The `--time_budget` flag sets the wall-clock limit in seconds and auto-disables wandb. All verbose output goes to `autoresearch/run.log`; pipe through `sed -n '/^---$/,$ p' autoresearch/run.log` afterward to extract the summary block.
 
 **What you CAN do:**
 - Modify `python/config.py` — this is the only file you edit. Only numeric hyperparameters are fair game: learning rate, discount factor, entropy coefficient, batch size, network dimensions, curriculum parameters, etc.
