@@ -123,17 +123,43 @@ class PPO:
                 normed[i, :n_real] = normalizer.normalize(hitboxes[i, :n_real])
         return normed
 
+    def _ensure_event_log(self):
+        if not hasattr(self, '_event_log'):
+            self._event_log = []
+            self._norm_total = 0.0
+
+    def report_timing(self):
+        """Call once per epoch after cuda.synchronize(). Returns timing dict."""
+        if not hasattr(self, '_event_log') or not self._event_log:
+            return None
+        fwd_ms = sum(s.elapsed_time(e) for s, e, _ in self._event_log)
+        xfer_ms = sum(s.elapsed_time(e) for _, _, (s, e) in self._event_log)
+        c = len(self._event_log)
+        result = {
+            'normalize_s': self._norm_total,
+            'forward_s': fwd_ms / 1000,
+            'transfer_s': xfer_ms / 1000,
+            'count': c,
+        }
+        self._event_log.clear()
+        self._norm_total = 0.0
+        return result
+
     @torch.no_grad()
     def collect_action(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state):
         """Get actions for a batch of observations during rollout collection.
         All inputs are numpy arrays. Returns numpy arrays.
         """
+        import time as _time
+        self._ensure_event_log()
+
+        t0 = _time.perf_counter()
         n_cont = self.config.global_state_dim - self.config.n_validity_flags
         self.obs_normalizer.update(global_state[..., :n_cont])
         gs_norm = self._normalize_global_state(global_state)
-
         chb_norm = self._normalize_hitboxes(combat_hb, combat_mask, self.combat_normalizer)
         thb_norm = self._normalize_hitboxes(terrain_hb, terrain_mask, self.terrain_normalizer)
+        self._norm_total += _time.perf_counter() - t0
 
         chb = torch.from_numpy(chb_norm).float().to(self.device)
         cm = torch.from_numpy(combat_mask).float().to(self.device)
@@ -141,12 +167,24 @@ class PPO:
         tm = torch.from_numpy(terrain_mask).float().to(self.device)
         gs = torch.from_numpy(gs_norm).float().to(self.device)
 
+        fwd_start = torch.cuda.Event(enable_timing=True)
+        fwd_end = torch.cuda.Event(enable_timing=True)
+        xfer_start = torch.cuda.Event(enable_timing=True)
+        xfer_end = torch.cuda.Event(enable_timing=True)
+
+        fwd_start.record()
         actions, log_prob, _, value_atk, value_def = self.policy.get_action_and_value(
             chb, cm, thb, tm, gs
         )
+        fwd_end.record()
 
+        xfer_start.record()
         actions_np = {k: v.cpu().numpy() for k, v in actions.items()}
-        return actions_np, log_prob.cpu().numpy(), value_atk.cpu().numpy(), value_def.cpu().numpy()
+        result = actions_np, log_prob.cpu().numpy(), value_atk.cpu().numpy(), value_def.cpu().numpy()
+        xfer_end.record()
+
+        self._event_log.append((fwd_start, fwd_end, (xfer_start, xfer_end)))
+        return result
 
     def train_on_rollout(self, buf_combat_hb, buf_combat_mask, buf_terrain_hb,
                          buf_terrain_mask, buf_global, actions_arr,

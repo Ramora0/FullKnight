@@ -3,6 +3,7 @@ Manages multiple Hollow Knight instances on Windows.
 Creates junction-linked copies of the game directory and spawns/kills processes.
 Adapted from HKRL's multi_instance_manager.py.
 """
+import atexit
 import os
 import fnmatch
 import shutil
@@ -34,6 +35,10 @@ class InstanceManager:
             raise FileNotFoundError("Could not find Hollow Knight executable")
 
         self.instances = []
+
+        # Locate Steam API DLL so we can disable it during multi-instance runs
+        self._steam_api = os.path.join(self.root, self.data_dir, "Plugins", "x86_64", "steam_api64.dll")
+        self._steam_api_bak = self._steam_api + ".bak"
 
     def _instance_exe(self, name):
         exe_basename = os.path.basename(self.exe)
@@ -93,7 +98,15 @@ class InstanceManager:
         if not self._instance_exists(name):
             return False
         try:
-            subprocess.Popen(self._instance_exe(name))
+            subprocess.Popen([
+                self._instance_exe(name),
+                "-batchmode",
+                "-screen-width", "64",
+                "-screen-height", "64",
+                "-screen-quality", "0",
+                "-screen-fullscreen", "0",
+                "-nolog",
+            ])
             return True
         except Exception as e:
             print(f"Failed to start instance {name}: {e}")
@@ -115,13 +128,26 @@ class InstanceManager:
         for i in range(n):
             self.create_instance(f"i{i}")
 
+    def _disable_steam_api(self):
+        """Rename steam_api64.dll to prevent Steam from auto-launching."""
+        if os.path.exists(self._steam_api):
+            os.rename(self._steam_api, self._steam_api_bak)
+            atexit.register(self._restore_steam_api)
+
+    def _restore_steam_api(self):
+        """Restore steam_api64.dll."""
+        if os.path.exists(self._steam_api_bak):
+            os.rename(self._steam_api_bak, self._steam_api)
+
     def start_all(self):
+        self._disable_steam_api()
         for name in self.instances:
             self.start_instance(name)
 
     def stop_all(self):
         for name in reversed(self.instances):
             self.stop_instance(name)
+        self._restore_steam_api()
 
     def destroy_all(self):
         for name in reversed(list(self.instances)):
