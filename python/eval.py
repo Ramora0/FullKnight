@@ -171,7 +171,7 @@ def get_action(agent, obs, config, deterministic=False):
     chb, cm, thb, tm, gs_batch = batch_obs(combat_hb_list, terrain_hb_list, gs, config)
 
     # Normalize global state (continuous features only, flags pass through)
-    n_cont = config.global_state_dim - config.n_validity_flags
+    n_cont = config.global_state_dim - config.n_binary_flags
     gs_norm = np.empty_like(gs_batch)
     gs_norm[..., :n_cont] = agent.obs_normalizer.normalize(gs_batch[..., :n_cont])
     gs_norm[..., n_cont:] = gs_batch[..., n_cont:]

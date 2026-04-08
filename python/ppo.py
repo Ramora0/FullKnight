@@ -51,7 +51,7 @@ class PPO:
 
         self.policy = FullKnightActorCritic(config).to(self.device)
         # Only normalize continuous features (indices 0-7), not binary validity flags (8-13)
-        self.obs_normalizer = RunningNormalizer(config.global_state_dim - config.n_validity_flags)
+        self.obs_normalizer = RunningNormalizer(config.global_state_dim - config.n_binary_flags)
         self.combat_normalizer = RunningNormalizer(config.combat_feature_dim)
         self.terrain_normalizer = RunningNormalizer(config.terrain_feature_dim)
 
@@ -102,8 +102,8 @@ class PPO:
         return advantages, atk_returns, def_returns
 
     def _normalize_global_state(self, global_state):
-        """Normalize continuous features (0:8), pass binary validity flags (8:14) through raw."""
-        n_cont = self.config.global_state_dim - self.config.n_validity_flags
+        """Normalize continuous features (0:7), pass binary flags (7:19) through raw."""
+        n_cont = self.config.global_state_dim - self.config.n_binary_flags
         gs_norm = np.empty_like(global_state)
         gs_norm[..., :n_cont] = self.obs_normalizer.normalize(global_state[..., :n_cont])
         gs_norm[..., n_cont:] = global_state[..., n_cont:]
@@ -154,7 +154,7 @@ class PPO:
         self._ensure_event_log()
 
         t0 = _time.perf_counter()
-        n_cont = self.config.global_state_dim - self.config.n_validity_flags
+        n_cont = self.config.global_state_dim - self.config.n_binary_flags
         self.obs_normalizer.update(global_state[..., :n_cont])
         gs_norm = self._normalize_global_state(global_state)
         chb_norm = self._normalize_hitboxes(combat_hb, combat_mask, self.combat_normalizer)

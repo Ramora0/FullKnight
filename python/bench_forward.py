@@ -24,7 +24,7 @@ terrain_hb = torch.randn(B, N_TERRAIN, config.terrain_feature_dim, device=device
 terrain_mask = torch.ones(B, N_TERRAIN, device=device)
 global_state = torch.randn(B, config.global_state_dim, device=device)
 # Make validity flags binary
-global_state[:, 8:] = (global_state[:, 8:] > 0).float()
+global_state[:, 7:] = (global_state[:, 7:] > 0).float()
 
 print(f"\nBenchmarking {ITERS} forward passes (batch={B}, combat={N_COMBAT}, terrain={N_TERRAIN})")
 

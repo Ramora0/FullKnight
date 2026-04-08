@@ -13,6 +13,12 @@ namespace FullKnight.Game
 		private bool KeyAttack = false;
 		private bool KeyDash = false;
 		private bool KeyCast = false;
+		private bool KeyDreamNail = false;
+		private bool KeySuperDash = false;
+
+		// When true, force one tick of key=false before pressing again (tap actions)
+		private bool _retapAttack = false;
+		private bool _retapCast = false;
 
 		public InputDeviceShim() :
 			base("FullKnightInputShimDevice")
@@ -32,14 +38,22 @@ namespace FullKnight.Game
 
 		public override void Update(ulong updateTick, float deltaTime)
 		{
+			// Retap: force one tick of false to create a fresh press transition
+			bool effectiveAttack = KeyAttack;
+			bool effectiveCast = KeyCast;
+			if (_retapAttack) { effectiveAttack = false; _retapAttack = false; }
+			if (_retapCast) { effectiveCast = false; _retapCast = false; }
+
 			UpdateWithState(InputControlType.DPadUp, KeyUp, updateTick, deltaTime);
 			UpdateWithState(InputControlType.DPadDown, KeyDown, updateTick, deltaTime);
 			UpdateWithState(InputControlType.DPadLeft, KeyLeft, updateTick, deltaTime);
 			UpdateWithState(InputControlType.DPadRight, KeyRight, updateTick, deltaTime);
 			UpdateWithState(InputControlType.Action1, KeyJump, updateTick, deltaTime);
-			UpdateWithState(InputControlType.RightBumper, KeyCast, updateTick, deltaTime);
-			UpdateWithState(InputControlType.Action3, KeyAttack, updateTick, deltaTime);
+			UpdateWithState(InputControlType.RightBumper, effectiveCast, updateTick, deltaTime);
+			UpdateWithState(InputControlType.Action3, effectiveAttack, updateTick, deltaTime);
 			UpdateWithValue(InputControlType.RightTrigger, KeyDash ? 1 : 0, updateTick, deltaTime);
+			UpdateWithState(InputControlType.Action4, KeyDreamNail, updateTick, deltaTime);
+			UpdateWithValue(InputControlType.LeftTrigger, KeySuperDash ? 1 : 0, updateTick, deltaTime);
 		}
 
 		private static bool CanDash() =>
@@ -60,6 +74,15 @@ namespace FullKnight.Game
 		private static bool CanWallJump() =>
 			ReflectionHelper.CallMethod<HeroController, bool>(HeroController.instance, "CanWallJump");
 
+		private static bool CanNailCharge() =>
+			ReflectionHelper.CallMethod<HeroController, bool>(HeroController.instance, "CanNailCharge");
+
+		private static bool CanDreamNail() =>
+			HeroController.instance.CanDreamNail();
+
+		private static bool CanSuperDash() =>
+			HeroController.instance.CanSuperDash();
+
 		public void Reset()
 		{
 			KeyUp = false;
@@ -70,15 +93,10 @@ namespace FullKnight.Game
 			KeyAttack = false;
 			KeyDash = false;
 			KeyCast = false;
-		}
-
-		public void Dash()
-		{
-			if (!CanDash()) return;
-			if (KeyLeft) HeroController.instance.FaceLeft();
-			else if (KeyRight) HeroController.instance.FaceRight();
-			KeyDash = true;
-			KeyJump = false;
+			KeyDreamNail = false;
+			KeySuperDash = false;
+			_retapAttack = false;
+			_retapCast = false;
 		}
 
 		public void Left() { KeyLeft = true; KeyRight = false; }
@@ -93,38 +111,117 @@ namespace FullKnight.Game
 			KeyDash = false;
 		}
 
-		public void Attack()
+		private void FaceDirection()
 		{
-			if (!CanAttack()) return;
 			if (KeyLeft) HeroController.instance.FaceLeft();
-			if (KeyRight) HeroController.instance.FaceRight();
-			KeyAttack = true;
-			KeyCast = false;
+			else if (KeyRight) HeroController.instance.FaceRight();
 		}
 
-		public void Cast()
+		/// <summary>Tap attack: release-then-press to guarantee a fresh swing.</summary>
+		public void AttackTap()
+		{
+			if (!CanAttack()) return;
+			FaceDirection();
+			_retapAttack = KeyAttack; // force release tick only if already held
+			KeyAttack = true;
+			KeyCast = false;
+			KeyDreamNail = false;
+			KeySuperDash = false;
+		}
+
+		/// <summary>Hold attack: keep KeyAttack held for nail art charge.</summary>
+		public void NailCharge()
+		{
+			// Already holding — continue the charge regardless of CanNailCharge
+			if (KeyAttack) return;
+			if (!CanNailCharge()) return;
+			FaceDirection();
+			KeyAttack = true;
+			KeyCast = false;
+			KeyDreamNail = false;
+			KeySuperDash = false;
+		}
+
+		/// <summary>Tap cast: release-then-press for spell.</summary>
+		public void SpellTap()
 		{
 			if (!CanCast()) return;
-			if (KeyLeft) HeroController.instance.FaceLeft();
-			if (KeyRight) HeroController.instance.FaceRight();
+			FaceDirection();
+			_retapCast = KeyCast;
 			KeyCast = true;
 			KeyAttack = false;
+			KeyDreamNail = false;
+			KeySuperDash = false;
+		}
+
+		/// <summary>Hold cast: keep KeyCast held for focus/heal.</summary>
+		public void Focus()
+		{
+			if (!KeyCast && !CanCast()) return;
+			FaceDirection();
+			KeyCast = true;
+			KeyAttack = false;
+			KeyDreamNail = false;
+			KeySuperDash = false;
+		}
+
+		public void Dash()
+		{
+			if (!CanDash()) return;
+			FaceDirection();
+			KeyDash = true;
+			KeyJump = false;
+			KeyAttack = false;
+			KeyCast = false;
+			KeyDreamNail = false;
+			KeySuperDash = false;
+		}
+
+		/// <summary>Hold dream nail.</summary>
+		public void DreamNail()
+		{
+			if (!KeyDreamNail && !CanDreamNail()) return;
+			KeyDreamNail = true;
+			KeyAttack = false;
+			KeyCast = false;
+			KeySuperDash = false;
+		}
+
+		/// <summary>Hold super dash (crystal heart).</summary>
+		public void SuperDash()
+		{
+			if (!KeySuperDash && !CanSuperDash()) return;
+			KeySuperDash = true;
+			KeyAttack = false;
+			KeyCast = false;
+			KeyDreamNail = false;
 		}
 
 		public void StopLR() { KeyLeft = false; KeyRight = false; }
 		public void StopUD() { KeyUp = false; KeyDown = false; }
 		public void StopJD() { KeyJump = false; KeyDash = false; }
-		public void StopAC() { KeyAttack = false; KeyCast = false; }
+		public void StopActions()
+		{
+			KeyAttack = false;
+			KeyCast = false;
+			KeyDash = false;
+			KeyDreamNail = false;
+			KeySuperDash = false;
+			_retapAttack = false;
+			_retapCast = false;
+		}
 	}
 
 	public static class ActionDecoder
 	{
 		/// <summary>
 		/// Decode factored action vector into InputDeviceShim calls.
-		/// action[0] movement: 0=left, 1=right, 2=none
+		/// action[0] movement:  0=left, 1=right, 2=none
 		/// action[1] direction: 0=up, 1=down, 2=none
-		/// action[2] action: 0=attack, 1=spell, 2=dash, 3=none
-		/// action[3] jump: 0=yes, 1=no
+		/// action[2] action:    0=attack(tap), 1=charge(hold), 2=spell(tap),
+		///                      3=focus(hold), 4=dash, 5=dream_nail(hold),
+		///                      6=super_dash(hold), 7=none
+		/// action[3] jump:      0=yes, 1=no
 		///
 		/// Apply order: movement -> direction -> jump -> action
 		/// so that dash overrides jump when both are requested.
@@ -154,14 +251,18 @@ namespace FullKnight.Game
 				default: break;
 			}
 
-			// Action (attack/spell/dash/none)
+			// Action
 			switch (action[2])
 			{
-				case 0: shim.Attack(); break;
-				case 1: shim.Cast(); break;
-				case 2: shim.Dash(); break;
+				case 0: shim.AttackTap(); break;
+				case 1: shim.NailCharge(); break;
+				case 2: shim.SpellTap(); break;
+				case 3: shim.Focus(); break;
+				case 4: shim.Dash(); break;
+				case 5: shim.DreamNail(); break;
+				case 6: shim.SuperDash(); break;
 				default:
-					shim.StopAC();
+					shim.StopActions();
 					// Only stop jump/dash if no action and no jump requested
 					if (action[3] != 0) shim.StopJD();
 					break;

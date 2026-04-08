@@ -23,10 +23,12 @@ class Config:
     # Observation dims
     combat_feature_dim: int = 7  # [rel_x, rel_y, w, h, is_trigger, hurts_knight, is_target]
     terrain_feature_dim: int = 5 # [rel_x, rel_y, w, h, is_trigger]
-    global_state_dim: int = 14   # vel, hp, soul, abilities, boss_hp, knight_bounds, 6 validity flags
-    n_validity_flags: int = 6
+    global_state_dim: int = 23   # vel, hp, soul, boss_hp, knight_bounds, 7 ability flags, 9 validity flags
+    n_binary_flags: int = 16     # 7 ability unlock + 9 action validity (not normalized)
 
     # Encoder dims
+    global_hidden: int = 64
+    global_output: int = 64
     combat_hidden: int = 64
     combat_output: int = 64
     terrain_hidden: int = 64
@@ -36,7 +38,7 @@ class Config:
     # Action dims
     movement_n: int = 3   # left, right, none
     direction_n: int = 3  # up, down, none
-    action_n: int = 4     # attack, spell, dash, none
+    action_n: int = 8     # attack_tap, nail_charge, spell_tap, focus, dash, dream_nail, super_dash, none
     jump_n: int = 2       # yes, no
 
     # Adaptive reward scaling (nail-hit-equivalent units)

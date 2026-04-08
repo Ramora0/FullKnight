@@ -111,7 +111,7 @@ namespace FullKnight.Environment
 				data.info = _episodeResult;
 				data.combat_hitboxes = new List<float[]>();
 				data.terrain_hitboxes = new List<float[]>();
-				data.global_state = new float[14];
+				data.global_state = new float[19];
 				data.damage_landed = 0;
 				data.hits_taken = 0;
 				SendMessage(new Message { type = "step", data = data });
@@ -163,7 +163,7 @@ namespace FullKnight.Environment
 				data.info = _episodeResult;
 				data.combat_hitboxes = new List<float[]>();
 				data.terrain_hitboxes = new List<float[]>();
-				data.global_state = new float[14];
+				data.global_state = new float[19];
 				SendMessage(new Message { type = "step", data = data });
 				yield break;
 			}

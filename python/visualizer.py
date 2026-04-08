@@ -25,9 +25,9 @@ class Visualizer:
         gs = global_state[0]
         vel_x, vel_y = gs[0], gs[1]
         hp = gs[2]
-        boss_hp = gs[5]
-        knight_w = gs[6]
-        knight_h = gs[7]
+        boss_hp = gs[4]
+        knight_w = gs[5]
+        knight_h = gs[6]
 
         # Terrain hitboxes (gray)
         t_hb = terrain_hb[0]

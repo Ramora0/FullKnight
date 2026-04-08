@@ -59,20 +59,27 @@ class FullKnightActorCritic(nn.Module):
         super().__init__()
         self.config = config
 
+        self.global_encoder = nn.Sequential(
+            nn.Linear(config.global_state_dim, config.global_hidden),
+            nn.ReLU(),
+            nn.Linear(config.global_hidden, config.global_output),
+            nn.ReLU(),
+        )
+
         self.combat_encoder = HitboxEncoder(
             input_dim=config.combat_feature_dim,
             hidden_dim=config.combat_hidden,
             output_dim=config.combat_output,
-            query_dim=config.global_state_dim,
+            query_dim=config.global_output,
         )
         self.terrain_encoder = HitboxEncoder(
             input_dim=config.terrain_feature_dim,
             hidden_dim=config.terrain_hidden,
             output_dim=config.terrain_output,
-            query_dim=config.global_state_dim,
+            query_dim=config.global_output,
         )
 
-        trunk_in = config.combat_output + config.terrain_output + config.global_state_dim
+        trunk_in = config.combat_output + config.terrain_output + config.global_output
         self.trunk = nn.Sequential(
             nn.Linear(trunk_in, config.hidden_dim),
             nn.ReLU(),
@@ -111,45 +118,55 @@ class FullKnightActorCritic(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
                 nn.init.constant_(module.bias, 0.0)
 
-        # Bias action head toward attack (idx 0) at init (~50% vs 25% uniform)
+        # Bias action head toward attack_tap (idx 0) at init
         with torch.no_grad():
             self.head_action.bias[0] = 1.0
 
     def _encode(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state):
-        combat_emb = self.combat_encoder(combat_hb, combat_mask, global_state)
-        terrain_emb = self.terrain_encoder(terrain_hb, terrain_mask, global_state)
-        combined = torch.cat([combat_emb, terrain_emb, global_state], dim=-1)
+        global_emb = self.global_encoder(global_state)
+        combat_emb = self.combat_encoder(combat_hb, combat_mask, global_emb)
+        terrain_emb = self.terrain_encoder(terrain_hb, terrain_mask, global_emb)
+        combined = torch.cat([combat_emb, terrain_emb, global_emb], dim=-1)
         return self.trunk(combined)
 
     def _extract_validity(self, global_state):
-        """Extract the 6 validity flags from the last 6 elements of global_state."""
-        # global_state layout: [vel_x, vel_y, hp, soul, abilities, boss_hp,
+        """Extract the 9 validity flags from global_state."""
+        # global_state layout: [vel_x, vel_y, hp, soul, boss_hp,
         #                       knight_w, knight_h,
+        #                       has_dash, has_wall_jump, has_double_jump,
+        #                       has_super_dash, has_dream_nail, has_acid_armour, has_nail_art,
         #                       can_jump, can_double_jump, can_wall_jump,
-        #                       can_dash, can_attack, can_cast]
-        can_jump = global_state[..., 8]
-        can_double_jump = global_state[..., 9]
-        can_wall_jump = global_state[..., 10]
-        can_dash = global_state[..., 11]
-        can_attack = global_state[..., 12]
-        can_cast = global_state[..., 13]
-        return can_jump, can_double_jump, can_wall_jump, can_dash, can_attack, can_cast
+        #                       can_dash, can_attack, can_cast,
+        #                       can_nail_charge, can_dream_nail, can_super_dash]
+        can_jump = global_state[..., 14]
+        can_double_jump = global_state[..., 15]
+        can_wall_jump = global_state[..., 16]
+        can_dash = global_state[..., 17]
+        can_attack = global_state[..., 18]
+        can_cast = global_state[..., 19]
+        can_nail_charge = global_state[..., 20]
+        can_dream_nail = global_state[..., 21]
+        can_super_dash = global_state[..., 22]
+        return (can_jump, can_double_jump, can_wall_jump, can_dash,
+                can_attack, can_cast, can_nail_charge, can_dream_nail, can_super_dash)
 
     def _mask_logits(self, logits_action, logits_jump, global_state):
         """Apply action validity masking to logits."""
-        can_jump, can_double_jump, can_wall_jump, can_dash, can_attack, can_cast = \
+        (can_jump, can_double_jump, can_wall_jump, can_dash,
+         can_attack, can_cast, can_nail_charge, can_dream_nail, can_super_dash) = \
             self._extract_validity(global_state)
 
-        # Action head: [attack, spell, dash, none]
-        # Mask attack (idx 0) if can_attack == 0
+        # Action head: [attack_tap, nail_charge, spell_tap, focus, dash,
+        #               dream_nail, super_dash, none]
         logits_action[..., 0] = logits_action[..., 0] + (can_attack - 1) * 1e4
-        # Mask spell (idx 1) if can_cast == 0
-        logits_action[..., 1] = logits_action[..., 1] + (can_cast - 1) * 1e4
-        # Mask dash (idx 2) if can_dash == 0
-        logits_action[..., 2] = logits_action[..., 2] + (can_dash - 1) * 1e4
+        logits_action[..., 1] = logits_action[..., 1] + (can_nail_charge - 1) * 1e4
+        logits_action[..., 2] = logits_action[..., 2] + (can_cast - 1) * 1e4
+        logits_action[..., 3] = logits_action[..., 3] + (can_cast - 1) * 1e4
+        logits_action[..., 4] = logits_action[..., 4] + (can_dash - 1) * 1e4
+        logits_action[..., 5] = logits_action[..., 5] + (can_dream_nail - 1) * 1e4
+        logits_action[..., 6] = logits_action[..., 6] + (can_super_dash - 1) * 1e4
 
         # Jump head: [yes, no]
-        # Mask yes (idx 0) if no jump variant is available
         can_any_jump = torch.clamp(can_jump + can_double_jump + can_wall_jump, 0, 1)
         logits_jump[..., 0] = logits_jump[..., 0] + (can_any_jump - 1) * 1e4
 

@@ -37,7 +37,7 @@ combat_mask = torch.ones(B, 20, device=device)
 terrain_hb = torch.randn(B, 30, config.terrain_feature_dim, device=device)
 terrain_mask = torch.ones(B, 30, device=device)
 gs = torch.randn(B, config.global_state_dim, device=device)
-gs[:, 8:] = (gs[:, 8:] > 0).float()
+gs[:, 7:] = (gs[:, 7:] > 0).float()
 
 with torch.no_grad():
     bench("pre-alloc fixed", lambda: model.get_action_and_value(

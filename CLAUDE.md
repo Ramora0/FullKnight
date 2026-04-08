@@ -46,17 +46,19 @@ The Python side is the **server**. Each game instance connects as a client. `Vec
 ### Observation Space
 
 - **Hitboxes** (variable-length sets): Each hitbox is `[rel_x, rel_y, width, height, is_trigger]` relative to the knight. Split into combat (enemy + attack colliders) and terrain. Padded and masked for batching.
-- **Global state** (14 floats): `[vel_x, vel_y, hp, soul, abilities_bitmask, boss_hp, knight_w, knight_h, can_jump, can_double_jump, can_wall_jump, can_dash, can_attack, can_cast]`
+- **Global state** (23 floats): `[vel_x, vel_y, hp, soul, boss_hp, knight_w, knight_h, has_dash, has_wall_jump, has_double_jump, has_super_dash, has_dream_nail, has_acid_armour, has_nail_art, can_jump, can_double_jump, can_wall_jump, can_dash, can_attack, can_cast, can_nail_charge, can_dream_nail, can_super_dash]`
 
 ### Action Space (Factored)
 
 Four independent sub-actions decoded by `ActionDecoder.ApplyAction`:
 - `action[0]` movement: 0=left, 1=right, 2=none
 - `action[1]` direction: 0=up, 1=down, 2=none
-- `action[2]` action: 0=attack, 1=spell, 2=dash, 3=none
+- `action[2]` action: 0=attack(tap), 1=nail_charge(hold), 2=spell(tap), 3=focus(hold), 4=dash, 5=dream_nail(hold), 6=super_dash(hold), 7=none
 - `action[3]` jump: 0=yes, 1=no
 
-The model applies **validity masking** using the 6 `can_*` flags from global state to zero out impossible actions before sampling.
+Tap vs hold: tap actions force a release-then-press transition for a fresh input event. Hold actions keep the key pressed across steps, enabling charge mechanics (nail arts, focus healing, dream nail, super dash). Hold actions only check `Can*` on the initial press; subsequent steps maintain the hold.
+
+The model applies **validity masking** using the 9 `can_*` flags from global state to zero out impossible actions before sampling.
 
 ### Model (`model.py`)
 
