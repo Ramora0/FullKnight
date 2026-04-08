@@ -12,10 +12,11 @@ import websockets
 
 from config import Config
 from ppo import PPO
+from instance_manager import InstanceManager
 
 
 async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
-                    level="GG_Mega_Moss_Charger", record=None):
+                    level="GG_Mega_Moss_Charger", record=None, hk_path=None):
     config = Config(n_envs=1, level=level, time_scale=time_scale)
 
     # Load agent
@@ -24,6 +25,17 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     agent.policy.eval()
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Level: {level} | Time scale: {time_scale}x | Deterministic: {deterministic}")
+
+    # Launch game instance with full graphics
+    mgr = None
+    launch_path = hk_path or config.hk_path
+    if launch_path and os.path.exists(launch_path):
+        print(f"Launching Hollow Knight from {launch_path} ...")
+        mgr = InstanceManager(launch_path, config.hk_data_dir)
+        mgr.spawn_n(1)
+        mgr.start_instance("i0", graphical=True)
+    else:
+        print(f"hk_path not found ({launch_path}) — launch Hollow Knight manually.")
 
     # Wait for game to connect
     game_ws = None
@@ -118,6 +130,9 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
         pass
     server.close()
     await server.wait_closed()
+
+    if mgr:
+        mgr.stop_all()
 
 
 def parse_obs(data, config):
@@ -278,6 +293,8 @@ def main():
                         help="Boss scene name (default: GG_Mega_Moss_Charger)")
     parser.add_argument("--record", metavar="FILE",
                         help="Record screen to video file (requires ffmpeg)")
+    parser.add_argument("--hk-path", default=None,
+                        help="Path to Hollow Knight install (overrides config default)")
     args = parser.parse_args()
 
     asyncio.run(eval_play(
@@ -286,6 +303,7 @@ def main():
         time_scale=args.time_scale,
         level=args.level,
         record=args.record,
+        hk_path=args.hk_path,
     ))
 
 

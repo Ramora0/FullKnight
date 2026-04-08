@@ -94,19 +94,23 @@ class InstanceManager:
             print(f"Failed to delete instance {name}: {e}")
             return False
 
-    def start_instance(self, name):
+    def start_instance(self, name, graphical=False):
         if not self._instance_exists(name):
             return False
         try:
-            subprocess.Popen([
-                self._instance_exe(name),
-                "-batchmode",
-                "-screen-width", "64",
-                "-screen-height", "64",
-                "-screen-quality", "0",
-                "-screen-fullscreen", "0",
-                "-nolog",
-            ])
+            if graphical:
+                cmd = [self._instance_exe(name)]
+            else:
+                cmd = [
+                    self._instance_exe(name),
+                    "-batchmode",
+                    "-screen-width", "64",
+                    "-screen-height", "64",
+                    "-screen-quality", "0",
+                    "-screen-fullscreen", "0",
+                    "-nolog",
+                ]
+            subprocess.Popen(cmd)
             return True
         except Exception as e:
             print(f"Failed to start instance {name}: {e}")
