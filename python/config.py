@@ -74,6 +74,9 @@ class Config:
     # Reproducibility
     seed: int = 0  # 0 = non-deterministic
 
+    # Time budget (seconds, 0 = unlimited). Disables wandb when set.
+    time_budget: int = 0
+
     # Debug
     visualize: bool = False
 

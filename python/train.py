@@ -54,10 +54,12 @@ async def train(config: Config):
         print(f"Model parameters: {sum(p.numel() for p in agent.policy.parameters()):,}")
 
         os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
+        if config.time_budget:
+            os.environ["WANDB_MODE"] = "disabled"
         wandb.init(project=config.wandb_project, config=vars(config))
 
         D = config.D_initial
-        time_budget = int(os.environ.get('FULLKNIGHT_TIME_BUDGET', 0))
+        time_budget = config.time_budget
         t_start = time.perf_counter()
         recent = deque(maxlen=20)
 
