@@ -143,10 +143,10 @@ class InstanceManager:
         if os.path.exists(self._steam_api_bak):
             os.rename(self._steam_api_bak, self._steam_api)
 
-    def start_all(self):
+    def start_all(self, graphical=False):
         self._disable_steam_api()
         for name in self.instances:
-            self.start_instance(name)
+            self.start_instance(name, graphical=graphical)
 
     def stop_all(self):
         for name in reversed(self.instances):

@@ -30,6 +30,10 @@ namespace FullKnight.Net
 		public float? damage_landed;  // normalized to nail-hit equivalents
 		public int? hits_taken;
 
+		// Diagnostic: time elapsed during frame skip
+		public float? step_game_time;   // scaled (Time.deltaTime)
+		public float? step_real_time;   // unscaled (Time.unscaledDeltaTime)
+
 		// Mode (Python -> C#, sent during reset)
 		public bool? eval;
 

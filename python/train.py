@@ -37,7 +37,7 @@ async def train(config: Config):
         print(f"Spawning {config.n_envs} HK instance(s)...")
         mgr = InstanceManager(config.hk_path, config.hk_data_dir)
         mgr.spawn_n(config.n_envs)
-        mgr.start_all()
+        mgr.start_all(graphical=(config.n_envs == 1))
     else:
         print(f"hk_path not found ({config.hk_path}) — launch Hollow Knight manually.")
 
@@ -82,6 +82,9 @@ async def train(config: Config):
             buf_damage_landed = []
             buf_hits_taken = []
             buf_hx = []
+            buf_step_game_times = []
+            buf_step_real_times = []
+            buf_step_wall_times = []
 
             t_rollout_start = time.perf_counter()
 
@@ -101,8 +104,10 @@ async def train(config: Config):
                     for i in range(config.n_envs)
                 ]
 
-                next_chb, next_cm, next_thb, next_tm, next_gs, damage_landed, hits_taken = \
+                t_step = time.perf_counter()
+                next_chb, next_cm, next_thb, next_tm, next_gs, damage_landed, hits_taken, step_game_times, step_real_times = \
                     await vec_env.step_all(action_vecs)
+                wall_dt = time.perf_counter() - t_step
 
                 buf_combat_hb.append(combat_hb)
                 buf_combat_mask.append(combat_mask)
@@ -116,6 +121,9 @@ async def train(config: Config):
                 buf_values_def.append(values_def)
                 buf_damage_landed.append(damage_landed)
                 buf_hits_taken.append(hits_taken)
+                buf_step_game_times.append(step_game_times)
+                buf_step_real_times.append(step_real_times)
+                buf_step_wall_times.append(wall_dt)
 
                 combat_hb, combat_mask = next_chb, next_cm
                 terrain_hb, terrain_mask = next_thb, next_tm
@@ -139,6 +147,37 @@ async def train(config: Config):
             values_def_arr = np.stack(buf_values_def)
             actions_arr = {k: np.stack(v) for k, v in buf_actions.items()}
             buf_hx_arr = np.stack(buf_hx)  # (T, N, hidden_dim)
+
+            # Diagnostic: measure per-env warmup (steps before first combat event)
+            any_event = (damage_landed_arr > 0) | (hits_taken_arr > 0)  # (T, N)
+            active_steps = any_event.sum()
+            total_steps_epoch = damage_landed_arr.shape[0] * damage_landed_arr.shape[1]
+            first_event_steps = []
+            for env_i in range(damage_landed_arr.shape[1]):
+                col = any_event[:, env_i]
+                idxs = np.where(col)[0]
+                first_event_steps.append(int(idxs[0]) if len(idxs) > 0 else damage_landed_arr.shape[0])
+            avg_warmup = np.mean(first_event_steps)
+
+            # Diagnostic: game time per step (detects graphical vs batchmode FPS difference)
+            game_time_arr = np.stack(buf_step_game_times)  # (T, N)
+            real_time_arr = np.stack(buf_step_real_times)  # (T, N)
+            wall_time_arr = np.array(buf_step_wall_times)  # (T,) — Python wall clock per step_all
+            avg_game_time = game_time_arr.mean()
+            avg_real_time = real_time_arr.mean()
+            avg_wall_time = wall_time_arr.mean()
+            print(
+                f"  diag | active_steps {active_steps}/{total_steps_epoch} "
+                f"({100*active_steps/total_steps_epoch:.1f}%) | "
+                f"avg_warmup {avg_warmup:.0f} steps | "
+                f"per_env_warmup {first_event_steps}"
+            )
+            print(
+                f"  diag | wall_dt/step {avg_wall_time*1000:.1f}ms | "
+                f"implied_fps {config.frames_per_wait / max(avg_wall_time, 1e-9):.0f} | "
+                f"game_dt(c#) {avg_game_time:.4f}s | "
+                f"real_dt(c#) {avg_real_time:.4f}s"
+            )
 
             # Compute adaptive D from this rollout
             total_landed = damage_landed_arr.sum()
@@ -203,6 +242,10 @@ async def train(config: Config):
                 "rollout/total_damage_landed": total_landed,
                 "rollout/total_hits_taken": total_taken,
                 "rollout/hit_ratio": total_landed / max(total_taken, 1),
+                "diag/active_step_pct": 100 * active_steps / total_steps_epoch,
+                "diag/avg_warmup_steps": avg_warmup,
+                "diag/avg_game_time_per_step": avg_game_time,
+                "diag/avg_wall_time_per_step": avg_wall_time,
                 "epoch": epoch,
             }, step=total_steps)
 
