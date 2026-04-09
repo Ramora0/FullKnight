@@ -35,6 +35,10 @@ class Config:
     terrain_output: int = 64
     hidden_dim: int = 256
 
+    # GRU (temporal memory)
+    seq_len: int = 16           # truncated BPTT chunk length
+    chunks_per_batch: int = 8   # chunks per minibatch (effective batch = chunks_per_batch * seq_len)
+
     # Action dims
     movement_n: int = 3   # left, right, none
     direction_n: int = 3  # up, down, none

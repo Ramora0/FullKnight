@@ -65,7 +65,9 @@ The model applies **validity masking** using the 9 `can_*` flags from global sta
 `FullKnightActorCritic` uses set encoders to handle variable-length hitbox inputs:
 - `CombatEncoder`: single-head attention pooling, queried by global state
 - `TerrainEncoder`: sum pooling
-- Outputs feed into a shared trunk → 4 actor heads (one per sub-action) + critic head
+- Outputs feed into a shared trunk → GRUCell (with residual + LayerNorm) → 4 actor heads (one per sub-action) + critic head
+
+The GRU provides temporal memory across timesteps. Hidden state flows during rollout collection and is stored at chunk boundaries for truncated BPTT during training (`seq_len` steps). The residual connection ensures the GRU starts as a near-passthrough at initialization.
 
 ### Key C# Components
 

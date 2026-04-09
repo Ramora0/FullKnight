@@ -72,6 +72,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     })
 
     obs = parse_obs(resp["data"], config)
+    hx = np.zeros((1, config.hidden_dim), dtype=np.float32)
 
     # Start screen recording
     recorder = None
@@ -88,7 +89,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
 
     try:
         while True:
-            action_vec = get_action(agent, obs, config, deterministic)
+            action_vec, hx = get_action(agent, obs, config, deterministic, hx)
 
             resp = await send_recv("action", {"action_vec": action_vec})
             d = resp["data"]
@@ -165,8 +166,10 @@ def batch_obs(combat_hb_list, terrain_hb_list, gs, config):
 
 
 @torch.no_grad()
-def get_action(agent, obs, config, deterministic=False):
-    """Get action from the policy using frozen normalizers (no stats update)."""
+def get_action(agent, obs, config, deterministic, hx):
+    """Get action from the policy using frozen normalizers (no stats update).
+    Returns (action_vec, hx_new).
+    """
     combat_hb_list, terrain_hb_list, gs = obs
     chb, cm, thb, tm, gs_batch = batch_obs(combat_hb_list, terrain_hb_list, gs, config)
 
@@ -192,9 +195,10 @@ def get_action(agent, obs, config, deterministic=False):
     thb_t = torch.from_numpy(thb).float().to(device)
     tm_t = torch.from_numpy(tm).float().to(device)
     gs_t = torch.from_numpy(gs_norm).float().to(device)
+    hx_t = torch.from_numpy(hx).float().to(device)
 
     if deterministic:
-        h = agent.policy._encode(chb_t, cm_t, thb_t, tm_t, gs_t)
+        h, hx_new = agent.policy._encode(chb_t, cm_t, thb_t, tm_t, gs_t, hx=hx_t)
         logits_m = agent.policy.head_movement(h)
         logits_d = agent.policy.head_direction(h)
         logits_a = agent.policy.head_action(h).clone()
@@ -206,15 +210,15 @@ def get_action(agent, obs, config, deterministic=False):
         a_a = logits_a.argmax(-1).item()
         a_j = logits_j.argmax(-1).item()
     else:
-        actions, _, _, _, _ = agent.policy.get_action_and_value(
-            chb_t, cm_t, thb_t, tm_t, gs_t
+        actions, _, _, _, _, hx_new = agent.policy.get_action_and_value(
+            chb_t, cm_t, thb_t, tm_t, gs_t, hx=hx_t
         )
         a_m = actions["movement"].item()
         a_d = actions["direction"].item()
         a_a = actions["action"].item()
         a_j = actions["jump"].item()
 
-    return [a_m, a_d, a_a, a_j]
+    return [a_m, a_d, a_a, a_j], hx_new.cpu().numpy()
 
 
 # ---------------------------------------------------------------------------

@@ -87,6 +87,10 @@ class FullKnightActorCritic(nn.Module):
             nn.ReLU(),
         )
 
+        # GRU for temporal memory (between trunk and heads)
+        self.gru = nn.GRUCell(config.hidden_dim, config.hidden_dim)
+        self.gru_ln = nn.LayerNorm(config.hidden_dim)
+
         # Actor heads
         self.head_movement = nn.Linear(config.hidden_dim, config.movement_n)
         self.head_direction = nn.Linear(config.hidden_dim, config.direction_n)
@@ -118,16 +122,30 @@ class FullKnightActorCritic(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
                 nn.init.constant_(module.bias, 0.0)
 
+        # GRU: small init so residual starts as near-passthrough
+        nn.init.orthogonal_(self.gru.weight_ih, gain=0.1)
+        nn.init.orthogonal_(self.gru.weight_hh, gain=0.1)
+        nn.init.constant_(self.gru.bias_ih, 0.0)
+        nn.init.constant_(self.gru.bias_hh, 0.0)
+
         # Bias action head toward attack_tap (idx 0) at init
         with torch.no_grad():
             self.head_action.bias[0] = 1.0
 
-    def _encode(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state):
+    def _encode(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state, hx=None):
         global_emb = self.global_encoder(global_state)
         combat_emb = self.combat_encoder(combat_hb, combat_mask, global_emb)
         terrain_emb = self.terrain_encoder(terrain_hb, terrain_mask, global_emb)
         combined = torch.cat([combat_emb, terrain_emb, global_emb], dim=-1)
-        return self.trunk(combined)
+        trunk_out = self.trunk(combined)
+
+        # GRU with residual connection
+        if hx is None:
+            hx = torch.zeros_like(trunk_out)
+        gru_out = self.gru(trunk_out, hx)
+        features = trunk_out + self.gru_ln(gru_out)
+
+        return features, gru_out
 
     def _extract_validity(self, global_state):
         """Extract the 9 validity flags from global_state."""
@@ -172,21 +190,21 @@ class FullKnightActorCritic(nn.Module):
 
         return logits_action, logits_jump
 
-    def get_value(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state):
-        h = self._encode(combat_hb, combat_mask, terrain_hb, terrain_mask, global_state)
-        return self.critic_attack(h).squeeze(-1), self.critic_defense(h).squeeze(-1)
+    def get_value(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state, hx=None):
+        h, hx_new = self._encode(combat_hb, combat_mask, terrain_hb, terrain_mask, global_state, hx)
+        return self.critic_attack(h).squeeze(-1), self.critic_defense(h).squeeze(-1), hx_new
 
     def get_action_and_value(self, combat_hb, combat_mask, terrain_hb, terrain_mask,
-                             global_state, actions=None):
+                             global_state, hx=None, actions=None):
         """
         If actions is None: sample new actions.
         If actions is provided: compute log_probs and entropy for given actions.
 
         actions: dict with keys 'movement', 'direction', 'action', 'jump',
                  each (B,) LongTensor.
-        Returns: actions_dict, log_prob (B,), entropy (B,), value_atk (B,), value_def (B,)
+        Returns: actions_dict, log_prob (B,), entropy (B,), value_atk (B,), value_def (B,), hx_new (B, hidden_dim)
         """
-        h = self._encode(combat_hb, combat_mask, terrain_hb, terrain_mask, global_state)
+        h, hx_new = self._encode(combat_hb, combat_mask, terrain_hb, terrain_mask, global_state, hx)
 
         logits_m = self.head_movement(h)
         logits_d = self.head_direction(h)
@@ -235,4 +253,41 @@ class FullKnightActorCritic(nn.Module):
             "action": a_a,
             "jump": a_j,
         }
-        return actions_dict, log_prob, entropy, value_atk, value_def
+        return actions_dict, log_prob, entropy, value_atk, value_def, hx_new
+
+    def forward_sequence(self, combat_hb, combat_mask, terrain_hb, terrain_mask,
+                         global_state, hx, actions):
+        """Truncated BPTT over a chunk of L timesteps.
+
+        Args:
+            combat_hb:    (B, L, max_combat, feat)
+            combat_mask:  (B, L, max_combat)
+            terrain_hb:   (B, L, max_terrain, feat)
+            terrain_mask: (B, L, max_terrain)
+            global_state: (B, L, global_dim)
+            hx:           (B, hidden_dim) initial hidden state
+            actions:      dict of (B, L) LongTensors
+
+        Returns: log_probs (B,L), entropies (B,L), values_atk (B,L), values_def (B,L)
+        """
+        L = global_state.shape[1]
+        all_lp, all_ent, all_vatk, all_vdef = [], [], [], []
+
+        for t in range(L):
+            step_actions = {k: v[:, t] for k, v in actions.items()}
+            _, lp, ent, vatk, vdef, hx = self.get_action_and_value(
+                combat_hb[:, t], combat_mask[:, t],
+                terrain_hb[:, t], terrain_mask[:, t],
+                global_state[:, t], hx=hx, actions=step_actions,
+            )
+            all_lp.append(lp)
+            all_ent.append(ent)
+            all_vatk.append(vatk)
+            all_vdef.append(vdef)
+
+        return (
+            torch.stack(all_lp, dim=1),
+            torch.stack(all_ent, dim=1),
+            torch.stack(all_vatk, dim=1),
+            torch.stack(all_vdef, dim=1),
+        )

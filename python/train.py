@@ -67,6 +67,7 @@ async def train(config: Config):
             # Reset scene each epoch so the knight doesn't get stuck
             combat_hb, combat_mask, terrain_hb, terrain_mask, global_state = \
                 await vec_env.reset_all()
+            agent.reset_hidden(config.n_envs)
 
             # Rollout buffers
             buf_combat_hb = []
@@ -80,10 +81,12 @@ async def train(config: Config):
             buf_values_def = []
             buf_damage_landed = []
             buf_hits_taken = []
+            buf_hx = []
 
             t_rollout_start = time.perf_counter()
 
             for t in range(config.rollout_len):
+                buf_hx.append(agent.get_hx_snapshot())
                 actions_np, log_probs, values_atk, values_def = agent.collect_action(
                     combat_hb, combat_mask, terrain_hb, terrain_mask, global_state
                 )
@@ -135,6 +138,7 @@ async def train(config: Config):
             values_atk_arr = np.stack(buf_values_atk)
             values_def_arr = np.stack(buf_values_def)
             actions_arr = {k: np.stack(v) for k, v in buf_actions.items()}
+            buf_hx_arr = np.stack(buf_hx)  # (T, N, hidden_dim)
 
             # Compute adaptive D from this rollout
             total_landed = damage_landed_arr.sum()
@@ -161,7 +165,7 @@ async def train(config: Config):
                 buf_combat_hb, buf_combat_mask, buf_terrain_hb, buf_terrain_mask,
                 buf_global, actions_arr, log_probs_arr,
                 damage_landed_arr, hits_taken_arr,
-                values_atk_arr, values_def_arr, D,
+                values_atk_arr, values_def_arr, D, buf_hx_arr,
             )
             torch.cuda.synchronize()
             t_train = time.perf_counter() - t0

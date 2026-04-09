@@ -50,6 +50,8 @@ class PPO:
         )
 
         self.policy = FullKnightActorCritic(config).to(self.device)
+        self.hx = None  # GRU hidden state, shape (N, hidden_dim) during rollout
+
         # Only normalize continuous features (indices 0-7), not binary validity flags (8-13)
         self.obs_normalizer = RunningNormalizer(config.global_state_dim - config.n_binary_flags)
         self.combat_normalizer = RunningNormalizer(config.combat_feature_dim)
@@ -123,6 +125,14 @@ class PPO:
                 normed[i, :n_real] = normalizer.normalize(hitboxes[i, :n_real])
         return normed
 
+    def reset_hidden(self, n_envs):
+        """Zero the GRU hidden state. Call at epoch start."""
+        self.hx = np.zeros((n_envs, self.config.hidden_dim), dtype=np.float32)
+
+    def get_hx_snapshot(self):
+        """Return a copy of the current hidden state for buffering."""
+        return self.hx.copy()
+
     def _ensure_event_log(self):
         if not hasattr(self, '_event_log'):
             self._event_log = []
@@ -172,11 +182,15 @@ class PPO:
         xfer_start = torch.cuda.Event(enable_timing=True)
         xfer_end = torch.cuda.Event(enable_timing=True)
 
+        hx_t = torch.from_numpy(self.hx).float().to(self.device)
+
         fwd_start.record()
-        actions, log_prob, _, value_atk, value_def = self.policy.get_action_and_value(
-            chb, cm, thb, tm, gs
+        actions, log_prob, _, value_atk, value_def, hx_new = self.policy.get_action_and_value(
+            chb, cm, thb, tm, gs, hx=hx_t
         )
         fwd_end.record()
+
+        self.hx = hx_new.cpu().numpy()
 
         xfer_start.record()
         actions_np = {k: v.cpu().numpy() for k, v in actions.items()}
@@ -189,8 +203,8 @@ class PPO:
     def train_on_rollout(self, buf_combat_hb, buf_combat_mask, buf_terrain_hb,
                          buf_terrain_mask, buf_global, actions_arr,
                          log_probs_arr, damage_landed_arr, hits_taken_arr,
-                         values_atk_arr, values_def_arr, D):
-        """Train on a collected rollout with shuffled minibatches.
+                         values_atk_arr, values_def_arr, D, buf_hx):
+        """Train on a collected rollout with chunked truncated BPTT.
 
         buf_*: lists of length T, each element is (N, ...) numpy array
         actions_arr: dict of (T, N) numpy arrays
@@ -198,12 +212,16 @@ class PPO:
         damage_landed_arr, hits_taken_arr: (T, N)
         values_atk_arr, values_def_arr: (T+1, N)
         D: current curriculum scaling factor
+        buf_hx: (T, N, hidden_dim) GRU hidden states at each timestep
         """
         T, N = damage_landed_arr.shape
         cfg = self.config
-        total_samples = T * N
+        L = cfg.seq_len
+        n_chunks_per_env = T // L
+        T_used = n_chunks_per_env * L
+        total_chunks = n_chunks_per_env * N
 
-        # Compute decomposed GAE per-env, then flatten
+        # Compute decomposed GAE per-env
         all_advantages = np.empty((T, N), dtype=np.float32)
         all_atk_returns = np.empty((T, N), dtype=np.float32)
         all_def_returns = np.empty((T, N), dtype=np.float32)
@@ -216,86 +234,138 @@ class PPO:
             all_atk_returns[:, env_i] = atk_ret
             all_def_returns[:, env_i] = def_ret
 
-        flat_adv = all_advantages.reshape(-1)
-        flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
-        flat_atk_ret = all_atk_returns.reshape(-1)
-        flat_def_ret = all_def_returns.reshape(-1)
-        flat_lp = log_probs_arr.reshape(-1)
-        flat_act = {k: actions_arr[k].reshape(-1) for k in actions_arr}
+        # --- Chunk (T, N) arrays into (total_chunks, L) ---
+        def chunk_tn(arr):
+            """(T, N) -> (total_chunks, L): group by chunk then env."""
+            return arr[:T_used].reshape(n_chunks_per_env, L, N).transpose(0, 2, 1).reshape(-1, L)
 
-        # Flatten observations with global-max padding
+        adv_chunks = chunk_tn(all_advantages)
+        atk_ret_chunks = chunk_tn(all_atk_returns)
+        def_ret_chunks = chunk_tn(all_def_returns)
+        lp_chunks = chunk_tn(log_probs_arr)
+        act_chunks = {k: chunk_tn(actions_arr[k]) for k in actions_arr}
+
+        # Hidden states at chunk boundaries
+        chunk_starts = np.arange(n_chunks_per_env) * L
+        hx_at_starts = buf_hx[chunk_starts]  # (n_chunks_per_env, N, hidden_dim)
+        hx_chunks = hx_at_starts.reshape(-1, cfg.hidden_dim)  # (total_chunks, hidden_dim)
+
+        # --- Build (T_used, N, ...) observation arrays with global-max padding ---
         max_combat = max(buf_combat_hb[t].shape[1] for t in range(T))
         max_terrain = max(buf_terrain_hb[t].shape[1] for t in range(T))
         max_combat = max(max_combat, 1)
         max_terrain = max(max_terrain, 1)
 
-        flat_chb = np.zeros((total_samples, max_combat, cfg.combat_feature_dim), dtype=np.float32)
-        flat_cm = np.zeros((total_samples, max_combat), dtype=np.float32)
-        flat_thb = np.zeros((total_samples, max_terrain, cfg.terrain_feature_dim), dtype=np.float32)
-        flat_tm = np.zeros((total_samples, max_terrain), dtype=np.float32)
-        flat_gs = np.zeros((total_samples, cfg.global_state_dim), dtype=np.float32)
+        flat_chb = np.zeros((T_used, N, max_combat, cfg.combat_feature_dim), dtype=np.float32)
+        flat_cm = np.zeros((T_used, N, max_combat), dtype=np.float32)
+        flat_thb = np.zeros((T_used, N, max_terrain, cfg.terrain_feature_dim), dtype=np.float32)
+        flat_tm = np.zeros((T_used, N, max_terrain), dtype=np.float32)
+        flat_gs = np.zeros((T_used, N, cfg.global_state_dim), dtype=np.float32)
 
-        for t in range(T):
-            s, e = t * N, (t + 1) * N
+        for t in range(T_used):
             nc = buf_combat_hb[t].shape[1]
-            flat_chb[s:e, :nc] = buf_combat_hb[t]
-            flat_cm[s:e, :nc] = buf_combat_mask[t]
+            flat_chb[t, :, :nc] = buf_combat_hb[t]
+            flat_cm[t, :, :nc] = buf_combat_mask[t]
             nt = buf_terrain_hb[t].shape[1]
-            flat_thb[s:e, :nt] = buf_terrain_hb[t]
-            flat_tm[s:e, :nt] = buf_terrain_mask[t]
-            flat_gs[s:e] = buf_global[t]
+            flat_thb[t, :, :nt] = buf_terrain_hb[t]
+            flat_tm[t, :, :nt] = buf_terrain_mask[t]
+            flat_gs[t] = buf_global[t]
 
-        # Normalize global state (continuous only) and hitboxes
-        flat_gs = self._normalize_global_state(flat_gs)
+        # Normalize (flatten to 2D for normalizers, then reshape back)
+        total_samples = T_used * N
+        flat_gs_2d = flat_gs.reshape(total_samples, cfg.global_state_dim)
+        flat_gs_2d = self._normalize_global_state(flat_gs_2d)
+        flat_gs = flat_gs_2d.reshape(T_used, N, cfg.global_state_dim)
+
+        flat_chb_2d = flat_chb.reshape(total_samples, max_combat, cfg.combat_feature_dim)
+        flat_cm_2d = flat_cm.reshape(total_samples, max_combat)
         for i in range(total_samples):
-            nc = int(flat_cm[i].sum())
+            nc = int(flat_cm_2d[i].sum())
             if nc > 0:
-                flat_chb[i, :nc] = self.combat_normalizer.normalize(flat_chb[i, :nc])
-            nt = int(flat_tm[i].sum())
+                flat_chb_2d[i, :nc] = self.combat_normalizer.normalize(flat_chb_2d[i, :nc])
+        flat_chb = flat_chb_2d.reshape(T_used, N, max_combat, cfg.combat_feature_dim)
+
+        flat_thb_2d = flat_thb.reshape(total_samples, max_terrain, cfg.terrain_feature_dim)
+        flat_tm_2d = flat_tm.reshape(total_samples, max_terrain)
+        for i in range(total_samples):
+            nt = int(flat_tm_2d[i].sum())
             if nt > 0:
-                flat_thb[i, :nt] = self.terrain_normalizer.normalize(flat_thb[i, :nt])
+                flat_thb_2d[i, :nt] = self.terrain_normalizer.normalize(flat_thb_2d[i, :nt])
+        flat_thb = flat_thb_2d.reshape(T_used, N, max_terrain, cfg.terrain_feature_dim)
+
+        # --- Chunk observations: (T_used, N, ...) -> (total_chunks, L, ...) ---
+        def chunk_obs(arr):
+            rest = arr.shape[2:]
+            x = arr.reshape(n_chunks_per_env, L, N, *rest)
+            x = np.moveaxis(x, 2, 1)  # (n_chunks, N, L, ...)
+            return x.reshape(total_chunks, L, *rest)
+
+        chb_chunks = chunk_obs(flat_chb)
+        cm_chunks = chunk_obs(flat_cm)
+        thb_chunks = chunk_obs(flat_thb)
+        tm_chunks = chunk_obs(flat_tm)
+        gs_chunks = chunk_obs(flat_gs)
+
+        # Normalize advantages
+        flat_adv = adv_chunks.reshape(-1)
+        flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
+        adv_chunks = flat_adv.reshape(total_chunks, L)
 
         # Move to device
-        adv_t = torch.from_numpy(flat_adv).float().to(self.device)
-        atk_ret_t = torch.from_numpy(flat_atk_ret).float().to(self.device)
-        def_ret_t = torch.from_numpy(flat_def_ret).float().to(self.device)
-        old_lp_t = torch.from_numpy(flat_lp).float().to(self.device)
-        act_t = {k: torch.from_numpy(v).long().to(self.device) for k, v in flat_act.items()}
-        chb_t = torch.from_numpy(flat_chb).to(self.device)
-        cm_t = torch.from_numpy(flat_cm).to(self.device)
-        thb_t = torch.from_numpy(flat_thb).to(self.device)
-        tm_t = torch.from_numpy(flat_tm).to(self.device)
-        gs_t = torch.from_numpy(flat_gs).to(self.device)
+        adv_t = torch.from_numpy(adv_chunks).float().to(self.device)
+        atk_ret_t = torch.from_numpy(atk_ret_chunks).float().to(self.device)
+        def_ret_t = torch.from_numpy(def_ret_chunks).float().to(self.device)
+        old_lp_t = torch.from_numpy(lp_chunks).float().to(self.device)
+        act_t = {k: torch.from_numpy(v).long().to(self.device) for k, v in act_chunks.items()}
+        chb_t = torch.from_numpy(chb_chunks).to(self.device)
+        cm_t = torch.from_numpy(cm_chunks).to(self.device)
+        thb_t = torch.from_numpy(thb_chunks).to(self.device)
+        tm_t = torch.from_numpy(tm_chunks).to(self.device)
+        gs_t = torch.from_numpy(gs_chunks).to(self.device)
+        hx_t = torch.from_numpy(hx_chunks).float().to(self.device)
 
+        # --- Training loop: shuffle chunks, process in minibatches ---
+        CPB = cfg.chunks_per_batch
         total_metrics = {"surrogate": 0, "value_atk": 0, "value_def": 0, "entropy": 0, "kl": 0}
         n_updates = 0
 
         for _ in range(cfg.train_iters):
-            indices = np.random.permutation(total_samples)
+            chunk_indices = np.random.permutation(total_chunks)
             early_stop = False
 
-            for start in range(0, total_samples, cfg.batch_size):
-                idx = indices[start:start + cfg.batch_size]
+            for start in range(0, total_chunks, CPB):
+                idx = chunk_indices[start:start + CPB]
 
-                _, new_lp, entropy, v_atk, v_def = self.policy.get_action_and_value(
+                hx_mb = hx_t[idx].detach()
+
+                new_lp, entropy, v_atk, v_def = self.policy.forward_sequence(
                     chb_t[idx], cm_t[idx], thb_t[idx], tm_t[idx], gs_t[idx],
-                    actions={k: v[idx] for k, v in act_t.items()},
+                    hx_mb, {k: v[idx] for k, v in act_t.items()},
                 )
 
-                log_ratio = new_lp - old_lp_t[idx]
+                # Flatten (B, L) -> (B*L,) for loss
+                new_lp_flat = new_lp.reshape(-1)
+                entropy_flat = entropy.reshape(-1)
+                v_atk_flat = v_atk.reshape(-1)
+                v_def_flat = v_def.reshape(-1)
+                adv_flat = adv_t[idx].reshape(-1)
+                atk_ret_flat = atk_ret_t[idx].reshape(-1)
+                def_ret_flat = def_ret_t[idx].reshape(-1)
+                old_lp_flat = old_lp_t[idx].reshape(-1)
+
+                log_ratio = new_lp_flat - old_lp_flat
                 ratio = torch.exp(log_ratio)
                 clipped = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps)
-                surrogate = -torch.min(ratio * adv_t[idx], clipped * adv_t[idx]).mean()
+                surrogate = -torch.min(ratio * adv_flat, clipped * adv_flat).mean()
 
-                # Per-element value clamp (preserves gradient)
-                atk_vloss = (v_atk - atk_ret_t[idx]).pow(2)
-                def_vloss = (v_def - def_ret_t[idx]).pow(2)
+                atk_vloss = (v_atk_flat - atk_ret_flat).pow(2)
+                def_vloss = (v_def_flat - def_ret_flat).pow(2)
                 value_loss = (
                     torch.clamp(atk_vloss, max=cfg.max_value_loss).mean()
                     + torch.clamp(def_vloss, max=cfg.max_value_loss).mean()
                 )
 
-                entropy_loss = -entropy.mean()
+                entropy_loss = -entropy_flat.mean()
 
                 loss = (
                     surrogate
@@ -335,6 +405,7 @@ class PPO:
                 "obs_normalizer": self.obs_normalizer.state_dict(),
                 "combat_normalizer": self.combat_normalizer.state_dict(),
                 "terrain_normalizer": self.terrain_normalizer.state_dict(),
+                "hx": self.hx,
             },
             path,
         )
@@ -351,3 +422,5 @@ class PPO:
             self.combat_normalizer.load_state_dict(ckpt["combat_normalizer"])
         if ckpt.get("terrain_normalizer"):
             self.terrain_normalizer.load_state_dict(ckpt["terrain_normalizer"])
+        if ckpt.get("hx") is not None:
+            self.hx = ckpt["hx"]

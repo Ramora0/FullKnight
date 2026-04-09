@@ -84,7 +84,7 @@ with torch.no_grad():
         t_ = torch.from_numpy(thb_np).float().to(device)
         tm_ = torch.from_numpy(tm_np).float().to(device)
         g = torch.from_numpy(gs_np).float().to(device)
-        actions, lp, _, va, vd = model.get_action_and_value(c, m, t_, tm_, g)
+        actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, t_, tm_, g)
         _ = {k: v.cpu().numpy() for k, v in actions.items()}
         _ = lp.cpu().numpy()
         _ = va.cpu().numpy()
