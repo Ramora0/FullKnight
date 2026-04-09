@@ -114,6 +114,8 @@ namespace FullKnight.Environment
 				data.global_state = new float[19];
 				data.damage_landed = 0;
 				data.hits_taken = 0;
+				data.step_game_time = 0;
+				data.step_real_time = 0;
 				SendMessage(new Message { type = "step", data = data });
 				yield break;
 			}
@@ -126,15 +128,21 @@ namespace FullKnight.Environment
 			if (!_evalMode)
 				PlayerData.instance.health = _knightMaxHP;
 
+			float gameTimeElapsed = 0f;
+			float realTimeElapsed = 0f;
 			for (int i = 0; i < _frameSkipCount; i++)
 			{
 				yield return null;
+				gameTimeElapsed += Time.deltaTime;
+				realTimeElapsed += Time.unscaledDeltaTime;
 				// In eval mode, break early on death
 				if (_evalMode && (_bossDied || PlayerData.instance.health <= 0))
 					break;
 			}
 
 			Time.timeScale = 0;
+			data.step_game_time = gameTimeElapsed;
+			data.step_real_time = realTimeElapsed;
 
 			// Check for episode end in eval mode
 			if (_evalMode && !_episodeDone)
