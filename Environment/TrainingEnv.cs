@@ -85,6 +85,11 @@ namespace FullKnight.Environment
 			_episodeResult = null;
 			_combatStarted = false;
 
+			// Release any inputs held over from the previous episode before the
+			// scene transition unfreezes time — otherwise a stuck "left" or "jump"
+			// runs the knight for the entire transition + intro-skip window.
+			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 });
+
 			// Unpause so scene transition and WaitForSeconds can proceed
 			Time.timeScale = _timeScaleValue;
 
