@@ -60,18 +60,6 @@ async def train(config: Config):
         if vis is not None:
             vis.vocab = vec_env.vocab
 
-        agent = PPO(config)
-        if config.resume:
-            agent.load_checkpoint(config.resume, vocab=vec_env.vocab)
-            print(f"Resumed from: {config.resume}")
-        print(f"Using device: {agent.device}")
-        print(f"Model parameters: {sum(p.numel() for p in agent.policy.parameters()):,}")
-
-        os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
-        if config.time_budget:
-            os.environ["WANDB_MODE"] = "disabled"
-        wandb.init(project=config.wandb_project, config=vars(config))
-
         bosses = config.boss_levels_list
         assert len(bosses) > 0, "config.boss_levels must list at least one scene"
         boss_state = {b: {
@@ -83,6 +71,18 @@ async def train(config: Config):
         env_boss = [bosses[int(rng.integers(len(bosses)))] for _ in range(config.n_envs)]
         print(f"Boss pool: {bosses}")
         print(f"Initial env_boss: {env_boss}")
+
+        agent = PPO(config)
+        if config.resume:
+            agent.load_checkpoint(config.resume, vocab=vec_env.vocab, boss_state=boss_state)
+            print(f"Resumed from: {config.resume}")
+        print(f"Using device: {agent.device}")
+        print(f"Model parameters: {sum(p.numel() for p in agent.policy.parameters()):,}")
+
+        os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
+        if config.time_budget:
+            os.environ["WANDB_MODE"] = "disabled"
+        wandb.init(project=config.wandb_project, config=vars(config))
 
         time_budget = config.time_budget
         t_start = time.perf_counter()
@@ -383,7 +383,7 @@ async def train(config: Config):
 
             if epoch % config.save_every == 0:
                 path = f"{config.save_path}_{epoch}.pth"
-                agent.save_checkpoint(path, vocab=vec_env.vocab)
+                agent.save_checkpoint(path, vocab=vec_env.vocab, boss_state=boss_state)
                 print(f"  Saved checkpoint: {path}")
 
         # Print summary (used by autoresearch pipeline)
@@ -405,7 +405,7 @@ async def train(config: Config):
             print(f"epochs_completed:    {epoch + 1}")
             print(f"training_seconds:    {elapsed:.1f}")
 
-        agent.save_checkpoint(f"{config.save_path}_final.pth", vocab=vec_env.vocab)
+        agent.save_checkpoint(f"{config.save_path}_final.pth", vocab=vec_env.vocab, boss_state=boss_state)
         wandb.finish()
 
         if vis is not None:
