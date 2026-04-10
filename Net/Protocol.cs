@@ -27,7 +27,7 @@ namespace FullKnight.Net
 		public string info;
 
 		// Raw reward signals (for Python-side reward computation)
-		public float? damage_landed;  // normalized to nail-hit equivalents
+		public float? damage_landed;  // % of boss max HP dealt this step
 		public int? hits_taken;
 
 		// Diagnostic: time elapsed during frame skip

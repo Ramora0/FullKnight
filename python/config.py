@@ -46,10 +46,9 @@ class Config:
     action_n: int = 8     # attack_tap, nail_charge, spell_tap, focus, dash, dream_nail, super_dash, none
     jump_n: int = 2       # yes, no
 
-    # Adaptive reward scaling (nail-hit-equivalent units)
-    D_min: float = 0.05       # floor
-    D_max: float = 100.0      # ceiling: near-perfect play
-    D_initial: float = 0.6    # starting difficulty (nail-equivalent damage landed per hit taken)
+    # Adaptive reward scaling: D = % of boss HP dealt per hit taken
+    D_min: float = 0.01       # floor (0.01% boss HP per hit) — prevents reward blowup early
+    D_initial: float = 2.0    # starting difficulty (% boss HP dealt per hit taken)
     D_ema: float = 0.9        # smoothing: D moves 10% toward new value each epoch
     D_max_delta: float = 0.03 # max relative change per epoch (3%)
     D_window: int = 4         # rolling window of epochs for D_raw computation

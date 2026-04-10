@@ -285,11 +285,9 @@ namespace FullKnight.Environment
 			return _evalMode ? damage : 1;
 		}
 
-		private const float NailDamage = 21f;
-
 		private void OnBossDamaged(On.HealthManager.orig_TakeDamage orig, HealthManager self, HitInstance hitInstance)
 		{
-			_damageLandedInStep += hitInstance.DamageDealt / NailDamage;
+			_damageLandedInStep += hitInstance.DamageDealt / (float)_bossMaxHP * 100f;
 
 			if (!_evalMode)
 			{

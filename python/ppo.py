@@ -72,7 +72,8 @@ class PPO:
         """GAE with decomposed value heads and curriculum scaling.
 
         Values are trained on stationary rewards, D scales at advantage time.
-        damage_landed is normalized to nail-hit equivalents (1.0 = one nail hit).
+        damage_landed is % of boss max HP dealt (1.0 = 1% of boss HP).
+        D is % boss HP we deal per hit taken against us.
         δ_t = δ_attack_t / D - δ_defense_t
         """
         T = len(damage_landed)

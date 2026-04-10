@@ -199,7 +199,7 @@ async def train(config: Config):
             window_taken = sum(taken_window)
             if window_taken > 0 and window_landed > 0:
                 D_raw = window_landed / window_taken
-                D_raw = np.clip(D_raw, config.D_min, config.D_max)
+                D_raw = max(D_raw, config.D_min)
                 if epoch == 0:
                     D = D_raw
                 else:
