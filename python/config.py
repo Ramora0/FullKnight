@@ -36,6 +36,7 @@ class Config:
     hidden_dim: int = 256
 
     # GRU (temporal memory)
+    gru_dim: int = 64           # bottleneck dimension for GRU (hidden_dim -> gru_dim -> hidden_dim)
     seq_len: int = 16           # truncated BPTT chunk length
     chunks_per_batch: int = 8   # chunks per minibatch (effective batch = chunks_per_batch * seq_len)
 

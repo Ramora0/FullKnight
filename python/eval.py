@@ -60,7 +60,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
 
     # Reset with eval mode
     obs = await env.reset(eval_mode=True)
-    hx = np.zeros((1, config.hidden_dim), dtype=np.float32)
+    hx = np.zeros((1, config.gru_dim), dtype=np.float32)
 
     # Start screen recording
     recorder = None

@@ -127,7 +127,7 @@ class PPO:
 
     def reset_hidden(self, n_envs):
         """Zero the GRU hidden state. Call at epoch start."""
-        self.hx = np.zeros((n_envs, self.config.hidden_dim), dtype=np.float32)
+        self.hx = np.zeros((n_envs, self.config.gru_dim), dtype=np.float32)
 
     def reset_hidden_for(self, indices):
         """Zero the GRU hidden state for specific envs only."""
@@ -252,8 +252,8 @@ class PPO:
 
         # Hidden states at chunk boundaries
         chunk_starts = np.arange(n_chunks_per_env) * L
-        hx_at_starts = buf_hx[chunk_starts]  # (n_chunks_per_env, N, hidden_dim)
-        hx_chunks = hx_at_starts.reshape(-1, cfg.hidden_dim)  # (total_chunks, hidden_dim)
+        hx_at_starts = buf_hx[chunk_starts]  # (n_chunks_per_env, N, gru_dim)
+        hx_chunks = hx_at_starts.reshape(-1, cfg.gru_dim)  # (total_chunks, gru_dim)
 
         # --- Build (T_used, N, ...) observation arrays with global-max padding ---
         max_combat = max(buf_combat_hb[t].shape[1] for t in range(T))

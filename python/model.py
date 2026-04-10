@@ -87,8 +87,11 @@ class FullKnightActorCritic(nn.Module):
             nn.ReLU(),
         )
 
-        # GRU for temporal memory (between trunk and heads)
-        self.gru = nn.GRUCell(config.hidden_dim, config.hidden_dim)
+        # GRU for temporal memory (bottleneck: hidden_dim -> gru_dim -> hidden_dim)
+        gru_dim = config.gru_dim
+        self.gru_proj_in = nn.Linear(config.hidden_dim, gru_dim)
+        self.gru = nn.GRUCell(gru_dim, gru_dim)
+        self.gru_proj_out = nn.Linear(gru_dim, config.hidden_dim)
         self.gru_ln = nn.LayerNorm(config.hidden_dim)
 
         # Actor heads
@@ -127,6 +130,8 @@ class FullKnightActorCritic(nn.Module):
         nn.init.orthogonal_(self.gru.weight_hh, gain=0.1)
         nn.init.constant_(self.gru.bias_ih, 0.0)
         nn.init.constant_(self.gru.bias_hh, 0.0)
+        nn.init.orthogonal_(self.gru_proj_out.weight, gain=0.1)
+        nn.init.constant_(self.gru_proj_out.bias, 0.0)
 
         # Bias action head toward attack_tap (idx 0) at init
         with torch.no_grad():
@@ -139,13 +144,16 @@ class FullKnightActorCritic(nn.Module):
         combined = torch.cat([combat_emb, terrain_emb, global_emb], dim=-1)
         trunk_out = self.trunk(combined)
 
-        # GRU with residual connection
+        # Bottleneck GRU with residual connection
+        gru_in = self.gru_proj_in(trunk_out)
         if hx is None:
-            hx = torch.zeros_like(trunk_out)
-        gru_out = self.gru(trunk_out, hx)
+            hx = torch.zeros(trunk_out.shape[0], self.gru.hidden_size,
+                             device=trunk_out.device)
+        hx_new = self.gru(gru_in, hx)
+        gru_out = self.gru_proj_out(hx_new)
         features = trunk_out + self.gru_ln(gru_out)
 
-        return features, gru_out
+        return features, hx_new
 
     def _extract_validity(self, global_state):
         """Extract the 9 validity flags from global_state."""
