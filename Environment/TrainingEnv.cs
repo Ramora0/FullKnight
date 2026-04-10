@@ -7,7 +7,6 @@ using HutongGames.PlayMaker;
 using InControl;
 using Modding;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 
 namespace FullKnight.Environment
 {
@@ -278,7 +277,7 @@ namespace FullKnight.Environment
 			sb.Append("[DIAG ").Append(tag).Append("]\n");
 			try
 			{
-				var scene = SceneManager.GetActiveScene();
+				var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
 				sb.Append("  scene=").Append(scene.name)
 				  .Append(" loaded=").Append(scene.isLoaded)
 				  .Append(" time=").Append(Time.timeScale.ToString("0.00"))
