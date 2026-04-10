@@ -76,6 +76,20 @@ class VecEnv:
         step_real_times = np.array(step_real_times, dtype=np.float32)
         return *obs_batch, damage_landed, hits_taken, step_game_times, step_real_times
 
+    async def reset_and_resume(self, reset_indices):
+        """Reset specified envs, resume the rest. Returns observations for reset envs only."""
+        reset_set = set(reset_indices)
+        tasks = []
+        for i in range(self.n_envs):
+            if i in reset_set:
+                tasks.append(self.envs[i].reset())
+            else:
+                tasks.append(self.envs[i].resume())
+        results = await asyncio.gather(*tasks)
+        # Extract observations only for reset envs
+        reset_obs = [results[i] for i in reset_indices]
+        return reset_indices, self._batch_observations(reset_obs)
+
     async def pause_all(self):
         await asyncio.gather(*[env.pause() for env in self.envs])
 

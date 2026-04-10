@@ -25,6 +25,9 @@ namespace FullKnight.Environment
 		private string _episodeResult;
 		private HealthManager _bossHM;
 
+		// Boss intro skip: keep simulating internally until combat starts
+		private bool _combatStarted;
+
 		private HitboxObserver _hitboxObserver = new();
 		private InputDeviceShim _inputShim = new();
 		private Game.TimeScale _timeManager;
@@ -78,6 +81,7 @@ namespace FullKnight.Environment
 			_bossDied = false;
 			_episodeDone = false;
 			_episodeResult = null;
+			_combatStarted = false;
 
 			yield return SceneHooks.LoadBossScene(_level);
 
@@ -138,6 +142,22 @@ namespace FullKnight.Environment
 				// In eval mode, break early on death
 				if (_evalMode && (_bossDied || PlayerData.instance.health <= 0))
 					break;
+			}
+
+			// If boss intro is still playing, fast-forward until combat starts
+			if (!_combatStarted)
+			{
+				Time.timeScale = 20f;
+				while (!HasActiveCombatHitboxes())
+					yield return null;
+				_combatStarted = true;
+				// Clear any accidental reward signals from intro
+				_hitsTakenInStep = 0;
+				_damageLandedInStep = 0;
+				// Run one normal frame skip at real speed so first obs is clean
+				Time.timeScale = _timeScaleValue;
+				for (int i = 0; i < _frameSkipCount; i++)
+					yield return null;
 			}
 
 			Time.timeScale = 0;
@@ -264,6 +284,17 @@ namespace FullKnight.Environment
 				if (wouldDie)
 					_bossDied = true;
 			}
+		}
+
+		private bool HasActiveCombatHitboxes()
+		{
+			var hitboxes = _hitboxObserver.GetHitboxes();
+			foreach (var col in hitboxes[HitboxType.Enemy])
+			{
+				if (col != null && col.isActiveAndEnabled)
+					return true;
+			}
+			return false;
 		}
 
 		private void InitBossRefs()

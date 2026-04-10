@@ -129,6 +129,11 @@ class PPO:
         """Zero the GRU hidden state. Call at epoch start."""
         self.hx = np.zeros((n_envs, self.config.hidden_dim), dtype=np.float32)
 
+    def reset_hidden_for(self, indices):
+        """Zero the GRU hidden state for specific envs only."""
+        for i in indices:
+            self.hx[i] = 0.0
+
     def get_hx_snapshot(self):
         """Return a copy of the current hidden state for buffering."""
         return self.hx.copy()
@@ -326,7 +331,8 @@ class PPO:
 
         # --- Training loop: shuffle chunks, process in minibatches ---
         CPB = cfg.chunks_per_batch
-        total_metrics = {"surrogate": 0, "value_atk": 0, "value_def": 0, "entropy": 0, "kl": 0}
+        total_metrics = {"surrogate": 0, "value_atk": 0, "value_def": 0, "entropy": 0, "kl": 0,
+                         "gru_norm": 0}
         n_updates = 0
 
         for _ in range(cfg.train_iters):
@@ -338,7 +344,7 @@ class PPO:
 
                 hx_mb = hx_t[idx].detach()
 
-                new_lp, entropy, v_atk, v_def = self.policy.forward_sequence(
+                new_lp, entropy, v_atk, v_def, gru_info = self.policy.forward_sequence(
                     chb_t[idx], cm_t[idx], thb_t[idx], tm_t[idx], gs_t[idx],
                     hx_mb, {k: v[idx] for k, v in act_t.items()},
                 )
@@ -383,6 +389,7 @@ class PPO:
                 total_metrics["value_atk"] += atk_vloss.mean().item()
                 total_metrics["value_def"] += def_vloss.mean().item()
                 total_metrics["entropy"] += entropy_loss.item()
+                total_metrics["gru_norm"] += gru_info["gru_norm"]
 
                 with torch.no_grad():
                     kl = ((ratio - 1) - log_ratio).mean().item()
@@ -412,7 +419,14 @@ class PPO:
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.policy.load_state_dict(ckpt["model"])
+        # strict=False allows loading pre-GRU checkpoints (missing GRU keys
+        # stay at their init values, which are near-zero so the residual
+        # connection makes the model behave identically to the old one)
+        missing, unexpected = self.policy.load_state_dict(ckpt["model"], strict=False)
+        if missing:
+            print(f"  Checkpoint missing keys (using init): {missing}")
+        if unexpected:
+            print(f"  Checkpoint unexpected keys (ignored): {unexpected}")
         self.optimizer.load_state_dict(ckpt["optimizer"])
         if self.config.anneal_lr and ckpt.get("scheduler"):
             self.scheduler.load_state_dict(ckpt["scheduler"])

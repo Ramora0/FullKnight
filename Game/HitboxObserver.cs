@@ -40,6 +40,12 @@ namespace FullKnight.Game
 			}
 		}
 
+		public void PruneDestroyed()
+		{
+			foreach (var kvp in colliders)
+				kvp.Value.RemoveWhere(c => c == null);
+		}
+
 		private void AddHitbox(Collider2D collider2D)
 		{
 			if (collider2D == null) return;
@@ -135,6 +141,7 @@ namespace FullKnight.Game
 
 		public void Load() => _hook.Load();
 		public void Unload() => _hook.Unload();
+		public SortedDictionary<HitboxType, HashSet<Collider2D>> GetHitboxes() => _hook.GetHitboxes();
 
 		public struct SplitObservation
 		{
@@ -153,6 +160,9 @@ namespace FullKnight.Game
 		public SplitObservation GetSplitFeatures()
 		{
 			var hitboxes = _hook.GetHitboxes();
+			// Prune destroyed colliders to prevent set growth over long episodes
+			foreach (var kvp in hitboxes)
+				kvp.Value.RemoveWhere(c => c == null);
 			var knightPos = HeroController.instance.transform.position;
 
 			var combat = new List<float[]>();

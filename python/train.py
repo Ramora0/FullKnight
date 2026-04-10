@@ -12,6 +12,18 @@ from ppo import PPO
 from instance_manager import InstanceManager
 
 
+def merge_padded(old, new, indices, fill=0.0):
+    """Overwrite rows in old with rows from new, expanding padding dims if needed."""
+    if old.shape[1:] != new.shape[1:]:
+        pad = [(0, 0)] + [(0, max(0, n - o)) for o, n in zip(old.shape[1:], new.shape[1:])]
+        old = np.pad(old, pad, constant_values=fill)
+    for local_i, env_i in enumerate(indices):
+        old[env_i] = fill
+        idx = tuple([env_i] + [slice(0, s) for s in new.shape[1:]])
+        old[idx] = new[local_i]
+    return old
+
+
 def seed_everything(seed: int):
     """Seed all RNGs for deterministic model init and action sampling."""
     torch.manual_seed(seed)
@@ -59,15 +71,21 @@ async def train(config: Config):
         wandb.init(project=config.wandb_project, config=vars(config))
 
         D = config.D_initial
+        landed_window = deque(maxlen=config.D_window)
+        taken_window = deque(maxlen=config.D_window)
         time_budget = config.time_budget
         t_start = time.perf_counter()
         recent = deque(maxlen=20)
 
+        # First epoch: full reset to load boss scenes
+        combat_hb, combat_mask, terrain_hb, terrain_mask, global_state = \
+            await vec_env.reset_all()
+        agent.reset_hidden(config.n_envs)
+
+        # Staggered reset: cycle through envs, resetting n_envs/4 per epoch
+        envs_per_reset = max(1, config.n_envs // 4)
+
         for epoch in range(config.epochs):
-            # Reset scene each epoch so the knight doesn't get stuck
-            combat_hb, combat_mask, terrain_hb, terrain_mask, global_state = \
-                await vec_env.reset_all()
-            agent.reset_hidden(config.n_envs)
 
             # Rollout buffers
             buf_combat_hb = []
@@ -148,42 +166,39 @@ async def train(config: Config):
             actions_arr = {k: np.stack(v) for k, v in buf_actions.items()}
             buf_hx_arr = np.stack(buf_hx)  # (T, N, hidden_dim)
 
-            # Diagnostic: measure per-env warmup (steps before first combat event)
+            # Diagnostic: first combat event per env, step timing
             any_event = (damage_landed_arr > 0) | (hits_taken_arr > 0)  # (T, N)
-            active_steps = any_event.sum()
+            active_steps = int(any_event.sum())
             total_steps_epoch = damage_landed_arr.shape[0] * damage_landed_arr.shape[1]
             first_event_steps = []
             for env_i in range(damage_landed_arr.shape[1]):
                 col = any_event[:, env_i]
                 idxs = np.where(col)[0]
                 first_event_steps.append(int(idxs[0]) if len(idxs) > 0 else damage_landed_arr.shape[0])
-            avg_warmup = np.mean(first_event_steps)
-
-            # Diagnostic: game time per step (detects graphical vs batchmode FPS difference)
-            game_time_arr = np.stack(buf_step_game_times)  # (T, N)
-            real_time_arr = np.stack(buf_step_real_times)  # (T, N)
-            wall_time_arr = np.array(buf_step_wall_times)  # (T,) — Python wall clock per step_all
-            avg_game_time = game_time_arr.mean()
-            avg_real_time = real_time_arr.mean()
-            avg_wall_time = wall_time_arr.mean()
+            wall_time_arr = np.array(buf_step_wall_times)  # (T,)
+            # First step may include intro skip — show it separately
+            step0_ms = wall_time_arr[0] * 1000 if len(wall_time_arr) > 0 else 0
+            avg_wall_ms = wall_time_arr[1:].mean() * 1000 if len(wall_time_arr) > 1 else 0
+            # Which envs will be reset after this epoch's training
+            reset_offset = (epoch * envs_per_reset) % config.n_envs
+            reset_indices = list(range(reset_offset, reset_offset + envs_per_reset))
             print(
-                f"  diag | active_steps {active_steps}/{total_steps_epoch} "
+                f"  diag | active {active_steps}/{total_steps_epoch} "
                 f"({100*active_steps/total_steps_epoch:.1f}%) | "
-                f"avg_warmup {avg_warmup:.0f} steps | "
-                f"per_env_warmup {first_event_steps}"
-            )
-            print(
-                f"  diag | wall_dt/step {avg_wall_time*1000:.1f}ms | "
-                f"implied_fps {config.frames_per_wait / max(avg_wall_time, 1e-9):.0f} | "
-                f"game_dt(c#) {avg_game_time:.4f}s | "
-                f"real_dt(c#) {avg_real_time:.4f}s"
+                f"first_event {first_event_steps} | "
+                f"step0 {step0_ms:.0f}ms | avg_step {avg_wall_ms:.1f}ms | "
+                f"reset_envs {reset_indices}"
             )
 
-            # Compute adaptive D from this rollout
+            # Compute adaptive D from rolling window of epochs
             total_landed = damage_landed_arr.sum()
             total_taken = hits_taken_arr.sum()
-            if total_taken > 0 and total_landed > 0:
-                D_raw = total_landed / total_taken
+            landed_window.append(total_landed)
+            taken_window.append(total_taken)
+            window_landed = sum(landed_window)
+            window_taken = sum(taken_window)
+            if window_taken > 0 and window_landed > 0:
+                D_raw = window_landed / window_taken
                 D_raw = np.clip(D_raw, config.D_min, config.D_max)
                 if epoch == 0:
                     D = D_raw
@@ -225,7 +240,18 @@ async def train(config: Config):
             if config.anneal_lr:
                 agent.scheduler.step()
 
-            await vec_env.resume_all()
+            # Staggered reset: reset a subset of envs, resume the rest
+            _, reset_obs = await vec_env.reset_and_resume(reset_indices)
+            r_chb, r_cm, r_thb, r_tm, r_gs = reset_obs
+
+            # Merge reset obs into carried-over obs (handle padding mismatch)
+            combat_hb = merge_padded(combat_hb, r_chb, reset_indices)
+            combat_mask = merge_padded(combat_mask, r_cm, reset_indices)
+            terrain_hb = merge_padded(terrain_hb, r_thb, reset_indices)
+            terrain_mask = merge_padded(terrain_mask, r_tm, reset_indices)
+            for local_i, env_i in enumerate(reset_indices):
+                global_state[env_i] = r_gs[local_i]
+            agent.reset_hidden_for(reset_indices)
 
             # Logging
             curriculum_reward = (damage_landed_arr / D - hits_taken_arr).mean()
@@ -243,9 +269,10 @@ async def train(config: Config):
                 "rollout/total_hits_taken": total_taken,
                 "rollout/hit_ratio": total_landed / max(total_taken, 1),
                 "diag/active_step_pct": 100 * active_steps / total_steps_epoch,
-                "diag/avg_warmup_steps": avg_warmup,
-                "diag/avg_game_time_per_step": avg_game_time,
-                "diag/avg_wall_time_per_step": avg_wall_time,
+                "diag/first_event_avg": np.mean(first_event_steps),
+                "diag/step0_ms": step0_ms,
+                "diag/avg_step_ms": avg_wall_ms,
+                "diag/gru_norm": metrics["gru_norm"],
                 "epoch": epoch,
             }, step=total_steps)
 

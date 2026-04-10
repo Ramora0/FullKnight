@@ -268,10 +268,12 @@ class FullKnightActorCritic(nn.Module):
             hx:           (B, hidden_dim) initial hidden state
             actions:      dict of (B, L) LongTensors
 
-        Returns: log_probs (B,L), entropies (B,L), values_atk (B,L), values_def (B,L)
+        Returns: log_probs (B,L), entropies (B,L), values_atk (B,L), values_def (B,L),
+                 gru_info dict with 'gru_norm' and 'trunk_norm' scalars
         """
         L = global_state.shape[1]
         all_lp, all_ent, all_vatk, all_vdef = [], [], [], []
+        gru_norms = []
 
         for t in range(L):
             step_actions = {k: v[:, t] for k, v in actions.items()}
@@ -284,10 +286,14 @@ class FullKnightActorCritic(nn.Module):
             all_ent.append(ent)
             all_vatk.append(vatk)
             all_vdef.append(vdef)
+            gru_norms.append(hx.detach().norm(dim=-1).mean())
+
+        gru_info = {'gru_norm': torch.stack(gru_norms).mean().item()}
 
         return (
             torch.stack(all_lp, dim=1),
             torch.stack(all_ent, dim=1),
             torch.stack(all_vatk, dim=1),
             torch.stack(all_vdef, dim=1),
+            gru_info,
         )

@@ -49,8 +49,9 @@ class Config:
     D_min: float = 0.05       # floor
     D_max: float = 100.0      # ceiling: near-perfect play
     D_initial: float = 0.6    # starting difficulty (nail-equivalent damage landed per hit taken)
-    D_ema: float = 0.8        # smoothing: D moves 20% toward new value each epoch
-    D_max_delta: float = 0.1  # max relative change per epoch (10%)
+    D_ema: float = 0.9        # smoothing: D moves 10% toward new value each epoch
+    D_max_delta: float = 0.03 # max relative change per epoch (3%)
+    D_window: int = 4         # rolling window of epochs for D_raw computation
 
 
     # PPO
