@@ -87,6 +87,10 @@ namespace FullKnight.Game
 			loaded = true;
 		}
 
+		/// <summary>Force-recreate the reader for the current scene
+		/// (workaround for missed activeSceneChanged events under multi-instance load).</summary>
+		public void RecreateReader() => CreateHitboxReader();
+
 		public void Unload()
 		{
 			UnityEngine.SceneManagement.SceneManager.activeSceneChanged -= CreateHitboxReader;
@@ -141,6 +145,7 @@ namespace FullKnight.Game
 
 		public void Load() => _hook.Load();
 		public void Unload() => _hook.Unload();
+		public void RecreateReader() => _hook.RecreateReader();
 		public SortedDictionary<HitboxType, HashSet<Collider2D>> GetHitboxes() => _hook.GetHitboxes();
 
 		public struct SplitObservation

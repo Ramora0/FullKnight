@@ -1,4 +1,5 @@
 import asyncio
+import time
 import numpy as np
 import websockets
 
@@ -38,7 +39,6 @@ class VecEnv:
         self.envs[idx] = HKEnv(websocket, self.config)
         print(f"Instance {idx} connected.")
 
-        # Send init and wait for ack
         await self.envs[idx].init()
         self.connected[idx].set()
 
@@ -51,9 +51,24 @@ class VecEnv:
             self.envs[idx] = None
             self.connected[idx].clear()
 
+    async def _timed_op(self, label, idx, coro, loud=False):
+        """Wrap a coroutine with per-env timing. Prints immediately on completion."""
+        t0 = time.perf_counter()
+        result = await coro
+        dt = time.perf_counter() - t0
+        if loud or dt > 2.0:
+            print(f"  {label} env {idx}: done in {dt:.1f}s", flush=True)
+        return idx, dt, result
+
     async def reset_all(self):
         """Reset all envs. Returns batched (combat_hb, combat_mask, terrain_hb, terrain_mask, global_states)."""
-        results = await asyncio.gather(*[env.reset() for env in self.envs])
+        t0 = time.perf_counter()
+        timed = await asyncio.gather(*[
+            self._timed_op("reset", i, env.reset()) for i, env in enumerate(self.envs)
+        ])
+        total = time.perf_counter() - t0
+        print(f"reset_all: {self.n_envs} envs in {total:.1f}s", flush=True)
+        results = [r for _, _, r in sorted(timed, key=lambda x: x[0])]
         return self._batch_observations(results)
 
     async def step_all(self, actions):
@@ -61,9 +76,14 @@ class VecEnv:
         actions: list of N action_vecs, each [movement, direction, action, jump].
         Returns (combat_hb, combat_mask, terrain_hb, terrain_mask, global_states, damage_landed, hits_taken, step_game_times).
         """
-        results = await asyncio.gather(*[
-            self.envs[i].step(actions[i]) for i in range(self.n_envs)
+        t0 = time.perf_counter()
+        timed = await asyncio.gather(*[
+            self._timed_op("step", i, self.envs[i].step(actions[i])) for i in range(self.n_envs)
         ])
+        total = time.perf_counter() - t0
+
+        sorted_timed = sorted(timed, key=lambda x: x[0])
+        results = [r for _, _, r in sorted_timed]
         combat_lists, terrain_lists, gs_list, damage_landed, hits_taken, step_game_times, step_real_times = zip(*results)
 
         obs_batch = self._batch_observations(list(zip(combat_lists, terrain_lists, gs_list)))
@@ -79,12 +99,11 @@ class VecEnv:
         tasks = []
         for i in range(self.n_envs):
             if i in reset_set:
-                tasks.append(self.envs[i].reset())
+                tasks.append(self._timed_op("reset", i, self.envs[i].reset()))
             else:
-                tasks.append(self.envs[i].resume())
+                tasks.append(self._timed_op("resume", i, self.envs[i].resume()))
         results = await asyncio.gather(*tasks)
-        # Extract observations only for reset envs
-        reset_obs = [results[i] for i in reset_indices]
+        reset_obs = [results[i][2] for i in reset_indices]
         return reset_indices, self._batch_observations(reset_obs)
 
     async def pause_all(self):

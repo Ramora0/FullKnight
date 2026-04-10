@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from tqdm import tqdm
 
 from model import FullKnightActorCritic
 
@@ -225,6 +226,17 @@ class PPO:
         n_chunks_per_env = T // L
         T_used = n_chunks_per_env * L
         total_chunks = n_chunks_per_env * N
+        max_combat_dim = max(buf_combat_hb[t].shape[1] for t in range(T))
+        max_terrain_dim = max(buf_terrain_hb[t].shape[1] for t in range(T))
+        rollout_samples = T_used * N
+        total_passes = rollout_samples * cfg.train_iters
+        print(
+            f"  train | T={T} N={N} L={L} chunks={total_chunks} "
+            f"chunks/batch={cfg.chunks_per_batch} iters={cfg.train_iters} "
+            f"| max combat hb={max_combat_dim} terrain hb={max_terrain_dim} "
+            f"| samples={rollout_samples:,} × iters={cfg.train_iters} = {total_passes:,} passes",
+            flush=True,
+        )
 
         # Compute decomposed GAE per-env
         all_advantages = np.empty((T, N), dtype=np.float32)
@@ -335,6 +347,8 @@ class PPO:
                          "gru_norm": 0}
         n_updates = 0
 
+        pbar = tqdm(total=total_passes, unit="pass", unit_scale=True,
+                    desc="  train", leave=False, dynamic_ncols=True)
         for _ in range(cfg.train_iters):
             chunk_indices = np.random.permutation(total_chunks)
             early_stop = False
@@ -394,13 +408,18 @@ class PPO:
                 with torch.no_grad():
                     kl = ((ratio - 1) - log_ratio).mean().item()
                     total_metrics["kl"] += kl
-                    if cfg.target_kl and kl > cfg.target_kl:
-                        early_stop = True
-                        break
+
+                pbar.update(len(idx) * L)
+                pbar.set_postfix_str(f"surr={surrogate.item():+.3f} kl={kl:.3f}")
+
+                if cfg.target_kl and kl > cfg.target_kl:
+                    early_stop = True
+                    break
 
             if early_stop:
                 break
 
+        pbar.close()
         return {k: v / max(n_updates, 1) for k, v in total_metrics.items()}
 
     def save_checkpoint(self, path):
@@ -419,7 +438,19 @@ class PPO:
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        missing, unexpected = self.policy.load_state_dict(ckpt["model"], strict=False)
+        state = ckpt["model"]
+        # Remap old nn.GRUCell parameter names → new nn.GRU names so checkpoints
+        # saved before the GRUCell→GRU swap still load. Same shapes, same convention.
+        gru_remap = {
+            "gru.weight_ih": "gru.weight_ih_l0",
+            "gru.weight_hh": "gru.weight_hh_l0",
+            "gru.bias_ih":   "gru.bias_ih_l0",
+            "gru.bias_hh":   "gru.bias_hh_l0",
+        }
+        for old, new in gru_remap.items():
+            if old in state and new not in state:
+                state[new] = state.pop(old)
+        missing, unexpected = self.policy.load_state_dict(state, strict=False)
         if missing:
             print(f"  Checkpoint missing keys (using init): {missing}")
         if unexpected:
