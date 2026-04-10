@@ -62,13 +62,16 @@ class VecEnv:
             print(f"  {label} env {idx}: done in {dt:.1f}s", flush=True)
         return idx, dt, result
 
-    async def reset_all(self):
+    async def reset_all(self, levels=None):
         """Reset all envs. Returns batched
         (combat_hb, combat_mask, combat_kinds, combat_parents,
-         terrain_hb, terrain_mask, global_states)."""
+         terrain_hb, terrain_mask, global_states).
+        levels: optional list of N scene names, one per env."""
         t0 = time.perf_counter()
         timed = await asyncio.gather(*[
-            self._timed_op("reset", i, env.reset()) for i, env in enumerate(self.envs)
+            self._timed_op("reset", i,
+                           env.reset(level=(levels[i] if levels is not None else None)))
+            for i, env in enumerate(self.envs)
         ])
         total = time.perf_counter() - t0
         print(f"reset_all: {self.n_envs} envs in {total:.1f}s", flush=True)
@@ -100,13 +103,17 @@ class VecEnv:
         step_real_times = np.array(step_real_times, dtype=np.float32)
         return *obs_batch, damage_landed, hits_taken, step_game_times, step_real_times
 
-    async def reset_and_resume(self, reset_indices):
-        """Reset specified envs, resume the rest. Returns observations for reset envs only."""
+    async def reset_and_resume(self, reset_indices, levels=None):
+        """Reset specified envs, resume the rest. Returns observations for reset envs only.
+        levels: optional list aligned with reset_indices giving the new scene per reset env."""
         reset_set = set(reset_indices)
+        level_for = {env_i: levels[k] for k, env_i in enumerate(reset_indices)} \
+            if levels is not None else {}
         tasks = []
         for i in range(self.n_envs):
             if i in reset_set:
-                tasks.append(self._timed_op("reset", i, self.envs[i].reset()))
+                tasks.append(self._timed_op("reset", i,
+                                            self.envs[i].reset(level=level_for.get(i))))
             else:
                 tasks.append(self._timed_op("resume", i, self.envs[i].resume()))
         results = await asyncio.gather(*tasks)

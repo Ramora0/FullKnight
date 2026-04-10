@@ -72,16 +72,25 @@ async def train(config: Config):
             os.environ["WANDB_MODE"] = "disabled"
         wandb.init(project=config.wandb_project, config=vars(config))
 
-        D = config.D_initial
-        landed_window = deque(maxlen=config.D_window)
-        taken_window = deque(maxlen=config.D_window)
+        bosses = config.boss_levels_list
+        assert len(bosses) > 0, "config.boss_levels must list at least one scene"
+        boss_state = {b: {
+            "D": config.D_initial,
+            "landed_window": deque(maxlen=config.D_window),
+            "taken_window":  deque(maxlen=config.D_window),
+        } for b in bosses}
+        rng = np.random.default_rng(config.seed or None)
+        env_boss = [bosses[int(rng.integers(len(bosses)))] for _ in range(config.n_envs)]
+        print(f"Boss pool: {bosses}")
+        print(f"Initial env_boss: {env_boss}")
+
         time_budget = config.time_budget
         t_start = time.perf_counter()
         recent = deque(maxlen=20)
 
         # First epoch: full reset to load boss scenes
         combat_hb, combat_mask, combat_kind_ids, combat_parent_ids, terrain_hb, terrain_mask, global_state = \
-            await vec_env.reset_all()
+            await vec_env.reset_all(levels=env_boss)
         agent.reset_hidden(config.n_envs)
 
         # Staggered reset: cycle through envs, resetting n_envs/4 per epoch
@@ -201,21 +210,34 @@ async def train(config: Config):
                 f"reset_envs {reset_indices}"
             )
 
-            # Compute adaptive D from rolling window of epochs
-            total_landed = damage_landed_arr.sum()
-            total_taken = hits_taken_arr.sum()
-            landed_window.append(total_landed)
-            taken_window.append(total_taken)
-            window_landed = sum(landed_window)
-            window_taken = sum(taken_window)
-            if window_taken > 0 and window_landed > 0:
-                D_raw = window_landed / window_taken
-                D_raw = max(D_raw, config.D_min)
-                if epoch == 0:
-                    D = D_raw
-                else:
-                    D_new = config.D_ema * D + (1 - config.D_ema) * D_raw
-                    D = np.clip(D_new, D * (1 - config.D_max_delta), D * (1 + config.D_max_delta))
+            # Per-boss adaptive D update. Only bosses represented in env_boss
+            # this epoch contribute; bosses with no envs are left untouched.
+            total_landed = float(damage_landed_arr.sum())
+            total_taken = float(hits_taken_arr.sum())
+            per_boss_landed = {}
+            per_boss_taken = {}
+            for boss in set(env_boss):
+                env_mask = np.array([b == boss for b in env_boss])
+                per_boss_landed[boss] = float(damage_landed_arr[:, env_mask].sum())
+                per_boss_taken[boss] = float(hits_taken_arr[:, env_mask].sum())
+                bs = boss_state[boss]
+                bs["landed_window"].append(per_boss_landed[boss])
+                bs["taken_window"].append(per_boss_taken[boss])
+                window_landed = sum(bs["landed_window"])
+                window_taken = sum(bs["taken_window"])
+                if window_taken > 0 and window_landed > 0:
+                    D_raw = max(window_landed / window_taken, config.D_min)
+                    if len(bs["landed_window"]) == 1:
+                        bs["D"] = D_raw
+                    else:
+                        D_new = config.D_ema * bs["D"] + (1 - config.D_ema) * D_raw
+                        bs["D"] = float(np.clip(
+                            D_new,
+                            bs["D"] * (1 - config.D_max_delta),
+                            bs["D"] * (1 + config.D_max_delta),
+                        ))
+
+            D_per_env = np.array([boss_state[b]["D"] for b in env_boss], dtype=np.float32)
 
             # Pause game during training
             await vec_env.pause_all()
@@ -231,7 +253,7 @@ async def train(config: Config):
                 buf_terrain_hb, buf_terrain_mask,
                 buf_global, actions_arr, log_probs_arr,
                 damage_landed_arr, hits_taken_arr,
-                values_atk_arr, values_def_arr, D, buf_hx_arr,
+                values_atk_arr, values_def_arr, D_per_env, buf_hx_arr,
             )
             torch.cuda.synchronize()
             t_train = time.perf_counter() - t0
@@ -252,8 +274,12 @@ async def train(config: Config):
             if config.anneal_lr:
                 agent.scheduler.step()
 
-            # Staggered reset: reset a subset of envs, resume the rest
-            _, reset_obs = await vec_env.reset_and_resume(reset_indices)
+            # Staggered reset: reset a subset of envs (randomly reassigning
+            # their boss from the pool) and resume the rest.
+            new_bosses = [bosses[int(rng.integers(len(bosses)))] for _ in reset_indices]
+            for env_i, b in zip(reset_indices, new_bosses):
+                env_boss[env_i] = b
+            _, reset_obs = await vec_env.reset_and_resume(reset_indices, levels=new_bosses)
             r_chb, r_cm, r_ckid, r_cpid, r_thb, r_tm, r_gs = reset_obs
 
             # Merge reset obs into carried-over obs (handle padding mismatch)
@@ -267,17 +293,27 @@ async def train(config: Config):
                 global_state[env_i] = r_gs[local_i]
             agent.reset_hidden_for(reset_indices)
 
-            # Logging
-            curriculum_reward = (damage_landed_arr / D - hits_taken_arr).mean()
+            # Logging — per-env curriculum reward uses per-env D.
+            curriculum_reward = float(
+                (damage_landed_arr / D_per_env[None, :] - hits_taken_arr).mean()
+            )
             total_steps = (epoch + 1) * config.n_envs * config.rollout_len
-            wandb.log({
+            Ds = np.array([boss_state[b]["D"] for b in bosses], dtype=np.float64)
+            D_geomean = float(np.exp(np.log(np.maximum(Ds, 1e-6)).mean()))
+            # "Expected hits to clear the roster" under steady-state.
+            # D is % boss HP dealt per hit taken, so hits_b = 100 / D_b. Clamp each
+            # term so a single collapsed boss can't swamp the total.
+            HITS_CAP = 500.0
+            hits_to_clear = float(np.minimum(100.0 / np.maximum(Ds, 1e-6), HITS_CAP).sum())
+            log = {
                 "loss/surrogate": metrics["surrogate"],
                 "loss/value_atk": metrics["value_atk"],
                 "loss/value_def": metrics["value_def"],
                 "loss/entropy": metrics["entropy"],
                 "metrics/kl": metrics["kl"],
                 "metrics/lr": agent.optimizer.param_groups[0]["lr"],
-                "curriculum/D": D,
+                "curriculum/D_geomean": D_geomean,
+                "curriculum/hits_to_clear": hits_to_clear,
                 "rollout/curriculum_reward": curriculum_reward,
                 "rollout/total_damage_landed": total_landed,
                 "rollout/total_hits_taken": total_taken,
@@ -288,12 +324,23 @@ async def train(config: Config):
                 "diag/avg_step_ms": avg_wall_ms,
                 "diag/gru_norm": metrics["gru_norm"],
                 "epoch": epoch,
-            }, step=total_steps)
+            }
+            for boss in bosses:
+                log[f"curriculum/D/{boss}"] = boss_state[boss]["D"]
+                lb = per_boss_landed.get(boss, 0.0)
+                tb = per_boss_taken.get(boss, 0.0)
+                log[f"rollout/hit_ratio/{boss}"] = lb / max(tb, 1)
+                log[f"rollout/damage_landed/{boss}"] = lb
+                log[f"rollout/hits_taken/{boss}"] = tb
+            wandb.log(log, step=total_steps)
 
+            boss_ds = " ".join(f"{b.split('_')[-1]}:{boss_state[b]['D']:.2f}" for b in bosses)
             print(
                 f"epoch {epoch:4d} | "
                 f"steps {total_steps:8d} | "
-                f"D {D:7.1f} | "
+                f"D[{boss_ds}] | "
+                f"D_geo {D_geomean:6.2f} | "
+                f"hits {hits_to_clear:6.1f} | "
                 f"curr_rew {curriculum_reward:7.4f} | "
                 f"landed {total_landed:5.0f} | "
                 f"taken {total_taken:5.0f} | "
@@ -303,12 +350,13 @@ async def train(config: Config):
 
             recent.append({
                 'hit_ratio': float(total_landed / max(total_taken, 1)),
-                'curriculum_reward': float(curriculum_reward),
+                'curriculum_reward': curriculum_reward,
                 'damage_landed': float(total_landed),
                 'damage_taken': float(total_taken),
                 'entropy': metrics['entropy'],
                 'kl': metrics['kl'],
-                'D': float(D),
+                'D_geomean': D_geomean,
+                'hits_to_clear': hits_to_clear,
                 'surrogate': metrics['surrogate'],
             })
 
@@ -331,7 +379,10 @@ async def train(config: Config):
             print(f"curriculum_reward:   {avg['curriculum_reward']:.6f}")
             print(f"avg_damage_landed:   {avg['damage_landed']:.2f}")
             print(f"avg_damage_taken:    {avg['damage_taken']:.2f}")
-            print(f"final_D:             {avg['D']:.2f}")
+            print(f"final_D_geomean:     {avg['D_geomean']:.2f}")
+            print(f"final_hits_to_clear: {avg['hits_to_clear']:.1f}")
+            for boss in bosses:
+                print(f"final_D/{boss}: {boss_state[boss]['D']:.2f}")
             print(f"final_entropy:       {avg['entropy']:.6f}")
             print(f"final_kl:            {avg['kl']:.6f}")
             print(f"final_surrogate:     {avg['surrogate']:.6f}")

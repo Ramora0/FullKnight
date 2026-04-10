@@ -293,6 +293,10 @@ namespace FullKnight.Environment
 
 		private void OnBossDamaged(On.HealthManager.orig_TakeDamage orig, HealthManager self, HitInstance hitInstance)
 		{
+			// Only track the one designated boss. Minions, summons, and ambient
+			// HealthManagers in the arena pass through unmodified.
+			if (self != _bossHM) { orig(self, hitInstance); return; }
+
 			_damageLandedInStep += hitInstance.DamageDealt / (float)_bossMaxHP * 100f;
 
 			if (!_evalMode)

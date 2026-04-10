@@ -8,11 +8,16 @@ class Config:
     def rollout_len(self) -> int:
         return self.total_steps_per_epoch // self.n_envs
 
+    @property
+    def boss_levels_list(self) -> list:
+        return [s.strip() for s in self.boss_levels.split(",") if s.strip()]
+
     # Environment
     server_host: str = "localhost"
     server_port: int = 8765
     n_envs: int = 1
-    level: str = "GG_Mega_Moss_Charger"
+    level: str = "GG_Mega_Moss_Charger"  # used by eval
+    boss_levels: str = "GG_Mega_Moss_Charger"  # comma-separated pool for training
     frames_per_wait: int = 5
     time_scale: int = 3
 

@@ -214,7 +214,7 @@ class PPO:
                          buf_combat_parent_ids, buf_terrain_hb, buf_terrain_mask,
                          buf_global, actions_arr, log_probs_arr,
                          damage_landed_arr, hits_taken_arr,
-                         values_atk_arr, values_def_arr, D, buf_hx):
+                         values_atk_arr, values_def_arr, D_per_env, buf_hx):
         """Train on a collected rollout with chunked truncated BPTT.
 
         buf_*: lists of length T, each element is (N, ...) numpy array
@@ -222,7 +222,7 @@ class PPO:
         log_probs_arr: (T, N)
         damage_landed_arr, hits_taken_arr: (T, N)
         values_atk_arr, values_def_arr: (T+1, N)
-        D: current curriculum scaling factor
+        D_per_env: (N,) per-env curriculum scaling factor (one D per boss assignment)
         buf_hx: (T, N, hidden_dim) GRU hidden states at each timestep
         """
         T, N = damage_landed_arr.shape
@@ -250,7 +250,8 @@ class PPO:
         for env_i in range(N):
             adv, atk_ret, def_ret = self.get_advantages(
                 damage_landed_arr[:, env_i], hits_taken_arr[:, env_i],
-                values_atk_arr[:, env_i], values_def_arr[:, env_i], D,
+                values_atk_arr[:, env_i], values_def_arr[:, env_i],
+                float(D_per_env[env_i]),
             )
             all_advantages[:, env_i] = adv
             all_atk_returns[:, env_i] = atk_ret

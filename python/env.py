@@ -22,11 +22,12 @@ class HKEnv:
         await self.ws.send(pack_init())
         await self.ws.recv()
 
-    async def reset(self, eval_mode=False):
+    async def reset(self, eval_mode=False, level=None):
         """Reset environment.
         Returns (combat_hb, terrain_hb, global_state, combat_kinds, combat_parents)."""
         await self.ws.send(pack_reset(
-            self.config.level, self.config.frames_per_wait,
+            level if level is not None else self.config.level,
+            self.config.frames_per_wait,
             self.config.time_scale, eval_mode=eval_mode,
         ))
         data = await self.ws.recv()
