@@ -26,9 +26,14 @@ class Config:
     hk_data_dir: str = "hollow_knight_Data"
 
     # Observation dims
-    combat_feature_dim: int = 7  # [rel_x, rel_y, w, h, is_trigger, hurts_knight, is_target]
+    # Combat: [rel_x, rel_y, w, h, is_trigger, gives_damage, takes_damage, is_target, hp_raw]
+    # The last column (hp_raw) is intentionally left out of the running normalizer
+    # so the agent reads raw HP values and can recognize "1-2 nail hits from death"
+    # vs "beefy" in absolute terms.
+    combat_feature_dim: int = 9
+    combat_normalized_dims: int = 8  # first N combat columns get normalized; the rest pass through
     terrain_feature_dim: int = 5 # [rel_x, rel_y, w, h, is_trigger]
-    global_state_dim: int = 23   # vel, hp, soul, boss_hp, knight_bounds, 7 ability flags, 9 validity flags
+    global_state_dim: int = 22   # vel(2), hp, soul, knight_bounds(2), 7 ability flags, 9 validity flags
     n_binary_flags: int = 16     # 7 ability unlock + 9 action validity (not normalized)
 
     # Encoder dims

@@ -100,8 +100,7 @@ async def train(config: Config):
         slow_count_by_env = [0] * config.n_envs
 
         # First epoch: full reset to load boss scenes
-        combat_hb, combat_mask, combat_kind_ids, combat_parent_ids, terrain_hb, terrain_mask, global_state = \
-            await vec_env.reset_all(levels=env_boss)
+        obs = await vec_env.reset_all(levels=env_boss)
         agent.reset_hidden(config.n_envs)
 
         # Staggered reset: cycle through envs, resetting n_envs/4 per epoch
@@ -113,13 +112,7 @@ async def train(config: Config):
         for epoch in range(start_epoch, config.epochs):
 
             # Rollout buffers
-            buf_combat_hb = []
-            buf_combat_mask = []
-            buf_combat_kind_ids = []
-            buf_combat_parent_ids = []
-            buf_terrain_hb = []
-            buf_terrain_mask = []
-            buf_global = []
+            buf_obs = []  # list of per-step Observations
             buf_actions = {k: [] for k in ["movement", "direction", "action", "jump"]}
             buf_log_probs = []
             buf_values_atk = []
@@ -135,10 +128,7 @@ async def train(config: Config):
 
             for t in range(config.rollout_len):
                 buf_hx.append(agent.get_hx_snapshot())
-                actions_np, log_probs, values_atk, values_def = agent.collect_action(
-                    combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-                    terrain_hb, terrain_mask, global_state
-                )
+                actions_np, log_probs, values_atk, values_def = agent.collect_action(obs)
 
                 action_vecs = [
                     [
@@ -151,18 +141,11 @@ async def train(config: Config):
                 ]
 
                 t_step = time.perf_counter()
-                (next_chb, next_cm, next_ckid, next_cpid, next_thb, next_tm, next_gs,
-                 damage_landed, hits_taken, step_game_times, step_real_times,
+                (next_obs, damage_landed, hits_taken, step_game_times, step_real_times,
                  step_wall_per_env) = await vec_env.step_all(action_vecs)
                 wall_dt = time.perf_counter() - t_step
 
-                buf_combat_hb.append(combat_hb)
-                buf_combat_mask.append(combat_mask)
-                buf_combat_kind_ids.append(combat_kind_ids)
-                buf_combat_parent_ids.append(combat_parent_ids)
-                buf_terrain_hb.append(terrain_hb)
-                buf_terrain_mask.append(terrain_mask)
-                buf_global.append(global_state)
+                buf_obs.append(obs)
                 for k in buf_actions:
                     buf_actions[k].append(actions_np[k])
                 buf_log_probs.append(log_probs)
@@ -174,21 +157,13 @@ async def train(config: Config):
                 buf_step_real_times.append(step_real_times)
                 buf_step_wall_times.append(step_wall_per_env)
 
-                combat_hb, combat_mask = next_chb, next_cm
-                combat_kind_ids = next_ckid
-                combat_parent_ids = next_cpid
-                terrain_hb, terrain_mask = next_thb, next_tm
-                global_state = next_gs
+                obs = next_obs
 
                 if vis is not None:
-                    vis.update(combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-                               terrain_hb, terrain_mask, global_state)
+                    vis.update(obs)
 
             # Bootstrap final values
-            _, _, final_vatk, final_vdef = agent.collect_action(
-                combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-                terrain_hb, terrain_mask, global_state
-            )
+            _, _, final_vatk, final_vdef = agent.collect_action(obs)
             buf_values_atk.append(final_vatk)
             buf_values_def.append(final_vdef)
 
@@ -304,9 +279,7 @@ async def train(config: Config):
 
             t0 = time.perf_counter()
             metrics = agent.train_on_rollout(
-                buf_combat_hb, buf_combat_mask, buf_combat_kind_ids, buf_combat_parent_ids,
-                buf_terrain_hb, buf_terrain_mask,
-                buf_global, actions_arr, log_probs_arr,
+                buf_obs, actions_arr, log_probs_arr,
                 damage_landed_arr, hits_taken_arr,
                 values_atk_arr, values_def_arr, D_per_env, buf_hx_arr,
             )
@@ -335,17 +308,19 @@ async def train(config: Config):
             for env_i, b in zip(reset_indices, new_bosses):
                 env_boss[env_i] = b
             _, reset_obs = await vec_env.reset_and_resume(reset_indices, levels=new_bosses)
-            r_chb, r_cm, r_ckid, r_cpid, r_thb, r_tm, r_gs = reset_obs
 
-            # Merge reset obs into carried-over obs (handle padding mismatch)
-            combat_hb = merge_padded(combat_hb, r_chb, reset_indices)
-            combat_mask = merge_padded(combat_mask, r_cm, reset_indices)
-            combat_kind_ids = merge_padded(combat_kind_ids, r_ckid, reset_indices)
-            combat_parent_ids = merge_padded(combat_parent_ids, r_cpid, reset_indices)
-            terrain_hb = merge_padded(terrain_hb, r_thb, reset_indices)
-            terrain_mask = merge_padded(terrain_mask, r_tm, reset_indices)
+            # Merge reset obs into carried-over obs (handle padding mismatch).
+            # Each field gets the same merge_padded treatment driven by reset_indices.
+            obs = obs.replace(
+                combat_hb=merge_padded(obs.combat_hb, reset_obs.combat_hb, reset_indices),
+                combat_mask=merge_padded(obs.combat_mask, reset_obs.combat_mask, reset_indices),
+                combat_kind_ids=merge_padded(obs.combat_kind_ids, reset_obs.combat_kind_ids, reset_indices),
+                combat_parent_ids=merge_padded(obs.combat_parent_ids, reset_obs.combat_parent_ids, reset_indices),
+                terrain_hb=merge_padded(obs.terrain_hb, reset_obs.terrain_hb, reset_indices),
+                terrain_mask=merge_padded(obs.terrain_mask, reset_obs.terrain_mask, reset_indices),
+            )
             for local_i, env_i in enumerate(reset_indices):
-                global_state[env_i] = r_gs[local_i]
+                obs.global_state[env_i] = reset_obs.global_state[local_i]
             agent.reset_hidden_for(reset_indices)
 
             # Logging — per-env curriculum reward uses per-env D.

@@ -15,9 +15,9 @@ MSG_PAUSE  = 4
 MSG_RESUME = 5
 MSG_CLOSE  = 6
 
-COMBAT_FEAT  = 7   # must match config.combat_feature_dim
+COMBAT_FEAT  = 9   # must match config.combat_feature_dim
 TERRAIN_FEAT = 5   # must match config.terrain_feature_dim
-GLOBAL_DIM   = 23  # must match config.global_state_dim
+GLOBAL_DIM   = 22  # must match config.global_state_dim
 
 # --- Pack (Python -> C#) ---
 

@@ -46,7 +46,8 @@ The Python side is the **server**. Each game instance connects as a client. `Vec
 ### Observation Space
 
 - **Hitboxes** (variable-length sets): Each hitbox is `[rel_x, rel_y, width, height, is_trigger]` relative to the knight. Split into combat (enemy + attack colliders) and terrain. Padded and masked for batching.
-- **Global state** (23 floats): `[vel_x, vel_y, hp, soul, boss_hp, knight_w, knight_h, has_dash, has_wall_jump, has_double_jump, has_super_dash, has_dream_nail, has_acid_armour, has_nail_art, can_jump, can_double_jump, can_wall_jump, can_dash, can_attack, can_cast, can_nail_charge, can_dream_nail, can_super_dash]`
+- **Global state** (22 floats): `[vel_x, vel_y, hp, soul, knight_w, knight_h, has_dash, has_wall_jump, has_double_jump, has_super_dash, has_dream_nail, has_acid_armour, has_nail_art, can_jump, can_double_jump, can_wall_jump, can_dash, can_attack, can_cast, can_nail_charge, can_dream_nail, can_super_dash]`. Boss HP is no longer global; it lives per-hitbox in the `hp_raw` column of combat features.
+- **Combat hitbox features** (9 floats): `[rel_x, rel_y, w, h, is_trigger, gives_damage, takes_damage, is_target, hp_raw]` plus parallel kind/parent vocab IDs. `gives_damage`=hurts knight on contact, `takes_damage`=has reachable HealthManager (can be attacked), `is_target`=its HealthManager is in `BossSceneController.bosses` (the canonical objective). `hp_raw` is the HealthManager's current HP, raw — intentionally excluded from the running normalizer so the agent reads absolute "1-2 nail hits from death" vs "beefy" semantics.
 
 ### Action Space (Factored)
 

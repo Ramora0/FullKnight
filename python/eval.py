@@ -15,6 +15,7 @@ from ppo import PPO
 from instance_manager import InstanceManager
 from env import HKEnv
 from vocab import KindVocab
+from observation import Observation, GS, CB
 
 
 async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
@@ -67,11 +68,15 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     await connected.wait()
     print("Game connected!")
 
-    # Reset with eval mode (real HP, boss can die)
-    obs = await env.reset(eval_mode=True)  # (combat_hb, terrain_hb, gs, combat_kinds, combat_parents)
-    # Capture max HP/boss_hp from first obs (right after reset = full health)
-    max_knight_hp = obs[2][2]   # global_state index 2
-    max_boss_hp = obs[2][4]     # global_state index 4
+    # Reset with eval mode (real HP, boss can die). raw_obs is the per-env tuple
+    # straight from the wire: (combat_hb_list, terrain_hb_list, gs, kinds, parents).
+    raw_obs = await env.reset(eval_mode=True)
+    # Capture max knight HP from first obs (right after reset = full health).
+    # Boss HP is now per-hitbox (hp_raw column); we record the per-target max
+    # on first sight so we can spoof targets back to full each step (matching the
+    # infinite-fight training distribution where boss HP is restored every frame).
+    max_knight_hp = raw_obs[2][GS.HP]
+    target_max_hp = {}          # kind string -> max hp_raw seen
     hx = np.zeros((1, config.gru_dim), dtype=np.float32)
 
     # Start screen recording
@@ -93,10 +98,20 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
 
     try:
         while True:
-            # Spoof HP so agent sees max values like during training
-            obs[2][2] = max_knight_hp
-            obs[2][4] = max_boss_hp
-            action_vec, hx = get_action(agent, obs, config, deterministic, hx, vocab)
+            # Spoof knight HP so agent sees max like during training.
+            raw_obs[2][GS.HP] = max_knight_hp
+            # Spoof every is_target hitbox's hp_raw back to its observed max.
+            combat_hb_now = raw_obs[0]
+            combat_kinds_now = raw_obs[3]
+            for hb_i in range(len(combat_hb_now)):
+                row = combat_hb_now[hb_i]
+                if row[CB.IS_TARGET] > 0.5:
+                    key = combat_kinds_now[hb_i] if hb_i < len(combat_kinds_now) else ""
+                    cur = float(row[CB.HP_RAW])
+                    if cur > target_max_hp.get(key, 0.0):
+                        target_max_hp[key] = cur
+                    row[CB.HP_RAW] = target_max_hp.get(key, cur)
+            action_vec, hx = get_action(agent, raw_obs, config, deterministic, hx, vocab)
 
             (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
              damage, hits, _, _, done) = await env.step_eval(action_vec)
@@ -130,7 +145,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
                     await asyncio.sleep(15)
                 break
 
-            obs = (combat_hb, terrain_hb, gs, combat_kinds, combat_parents)
+            raw_obs = (combat_hb, terrain_hb, gs, combat_kinds, combat_parents)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
@@ -157,8 +172,8 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
         await server.wait_closed()
 
 
-def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_parent_ids_arr, config):
-    """Convert single-env obs into batched numpy arrays (B=1)."""
+def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_parent_ids_arr, config) -> Observation:
+    """Pack single-env raw obs into a batched (B=1) Observation."""
     n_combat = max(len(combat_hb_arr), 1)
     n_terrain = max(len(terrain_hb_arr), 1)
 
@@ -178,54 +193,69 @@ def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_par
         thb[0, :len(terrain_hb_arr)] = terrain_hb_arr
         tm[0, :len(terrain_hb_arr)] = 1.0
 
-    gs_batch = gs.reshape(1, -1)
-    return chb, cm, ckid, cpid, thb, tm, gs_batch
+    return Observation(
+        combat_hb=chb,
+        combat_mask=cm,
+        combat_kind_ids=ckid,
+        combat_parent_ids=cpid,
+        terrain_hb=thb,
+        terrain_mask=tm,
+        global_state=gs.reshape(1, -1),
+    )
 
 
 @torch.no_grad()
-def get_action(agent, obs, config, deterministic, hx, vocab):
+def get_action(agent, raw_obs, config, deterministic, hx, vocab):
     """Get action from the policy using frozen normalizers (no stats update).
-    Returns (action_vec, hx_new).
-    """
-    combat_hb_list, terrain_hb_list, gs, combat_kinds, combat_parents = obs
+    Returns (action_vec, hx_new). raw_obs is the per-env wire tuple."""
+    combat_hb_list, terrain_hb_list, gs, combat_kinds, combat_parents = raw_obs
     kind_ids = vocab.encode_list(combat_kinds)
     parent_ids = vocab.encode_list(combat_parents)
-    chb, cm, ckid, cpid, thb, tm, gs_batch = batch_obs(
+    np_obs = batch_obs(
         combat_hb_list, terrain_hb_list, gs, kind_ids, parent_ids, config)
 
     # Normalize global state (continuous features only, flags pass through)
     n_cont = config.global_state_dim - config.n_binary_flags
-    gs_norm = np.empty_like(gs_batch)
-    gs_norm[..., :n_cont] = agent.obs_normalizer.normalize(gs_batch[..., :n_cont])
-    gs_norm[..., n_cont:] = gs_batch[..., n_cont:]
+    gs_norm = np.empty_like(np_obs.global_state)
+    gs_norm[..., :n_cont] = agent.obs_normalizer.normalize(np_obs.global_state[..., :n_cont])
+    gs_norm[..., n_cont:] = np_obs.global_state[..., n_cont:]
+    np_obs = np_obs.replace(global_state=gs_norm)
 
-    # Normalize hitboxes
+    # Normalize hitboxes — combat normalizer covers only the leading
+    # combat_normalized_dims columns; the trailing hp_raw column passes through raw.
+    n_norm_c = config.combat_normalized_dims
+    chb = np_obs.combat_hb
+    cm = np_obs.combat_mask
     for i in range(chb.shape[0]):
         nc = int(cm[i].sum())
         if nc > 0:
-            chb[i, :nc] = agent.combat_normalizer.normalize(chb[i, :nc])
+            chb[i, :nc, :n_norm_c] = agent.combat_normalizer.normalize(chb[i, :nc, :n_norm_c])
+    thb = np_obs.terrain_hb
+    tm = np_obs.terrain_mask
     for i in range(thb.shape[0]):
         nt = int(tm[i].sum())
         if nt > 0:
             thb[i, :nt] = agent.terrain_normalizer.normalize(thb[i, :nt])
 
     device = agent.device
-    chb_t = torch.from_numpy(chb).float().to(device)
-    cm_t = torch.from_numpy(cm).float().to(device)
-    ckid_t = torch.from_numpy(ckid).long().to(device)
-    cpid_t = torch.from_numpy(cpid).long().to(device)
-    thb_t = torch.from_numpy(thb).float().to(device)
-    tm_t = torch.from_numpy(tm).float().to(device)
-    gs_t = torch.from_numpy(gs_norm).float().to(device)
+    obs_t = Observation(
+        combat_hb=torch.from_numpy(np_obs.combat_hb).float().to(device),
+        combat_mask=torch.from_numpy(np_obs.combat_mask).float().to(device),
+        combat_kind_ids=torch.from_numpy(np_obs.combat_kind_ids).long().to(device),
+        combat_parent_ids=torch.from_numpy(np_obs.combat_parent_ids).long().to(device),
+        terrain_hb=torch.from_numpy(np_obs.terrain_hb).float().to(device),
+        terrain_mask=torch.from_numpy(np_obs.terrain_mask).float().to(device),
+        global_state=torch.from_numpy(np_obs.global_state).float().to(device),
+    )
     hx_t = torch.from_numpy(hx).float().to(device)
 
     if deterministic:
-        h, hx_new = agent.policy._encode(chb_t, cm_t, ckid_t, cpid_t, thb_t, tm_t, gs_t, hx=hx_t)
+        h, hx_new = agent.policy._encode(obs_t, hx=hx_t)
         logits_m = agent.policy.head_movement(h)
         logits_d = agent.policy.head_direction(h)
         logits_a = agent.policy.head_action(h).clone()
         logits_j = agent.policy.head_jump(h).clone()
-        logits_a, logits_j = agent.policy._mask_logits(logits_a, logits_j, gs_t)
+        logits_a, logits_j = agent.policy._mask_logits(logits_a, logits_j, obs_t.global_state)
 
         a_m = logits_m.argmax(-1).item()
         a_d = logits_d.argmax(-1).item()
@@ -233,7 +263,7 @@ def get_action(agent, obs, config, deterministic, hx, vocab):
         a_j = logits_j.argmax(-1).item()
     else:
         actions, _, _, _, _, hx_new = agent.policy.get_action_and_value(
-            chb_t, cm_t, ckid_t, cpid_t, thb_t, tm_t, gs_t, hx=hx_t
+            obs_t, hx=hx_t
         )
         a_m = actions["movement"].item()
         a_d = actions["direction"].item()

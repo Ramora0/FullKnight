@@ -3,6 +3,8 @@ import torch.nn as nn
 import numpy as np
 from torch.distributions import Categorical
 
+from observation import Observation, GS
+
 
 class HitboxEncoder(nn.Module):
     """Single-head attention pooling over hitboxes, queried by global state.
@@ -151,17 +153,16 @@ class FullKnightActorCritic(nn.Module):
         with torch.no_grad():
             self.head_action.bias[0] = 1.0
 
-    def _encode(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-                terrain_hb, terrain_mask, global_state, hx=None):
-        global_emb = self.global_encoder(global_state)
+    def _encode(self, obs: Observation, hx=None):
+        global_emb = self.global_encoder(obs.global_state)
         # Factored identity: leaf-kind embedding ‖ parent-name embedding (concat).
         # padding_idx=0 means absent parents (e.g. detached projectiles) get a zero parent slot.
         kind_emb = torch.cat(
-            [self.kind_embed(combat_kind_ids), self.kind_embed(combat_parent_ids)],
+            [self.kind_embed(obs.combat_kind_ids), self.kind_embed(obs.combat_parent_ids)],
             dim=-1,
         )
-        combat_emb = self.combat_encoder(combat_hb, combat_mask, global_emb, extra=kind_emb)
-        terrain_emb = self.terrain_encoder(terrain_hb, terrain_mask, global_emb)
+        combat_emb = self.combat_encoder(obs.combat_hb, obs.combat_mask, global_emb, extra=kind_emb)
+        terrain_emb = self.terrain_encoder(obs.terrain_hb, obs.terrain_mask, global_emb)
         combined = torch.cat([combat_emb, terrain_emb, global_emb], dim=-1)
         trunk_out = self.trunk(combined)  # (B, hidden)
 
@@ -182,25 +183,18 @@ class FullKnightActorCritic(nn.Module):
         return features, hx_new
 
     def _extract_validity(self, global_state):
-        """Extract the 9 validity flags from global_state."""
-        # global_state layout: [vel_x, vel_y, hp, soul, boss_hp,
-        #                       knight_w, knight_h,
-        #                       has_dash, has_wall_jump, has_double_jump,
-        #                       has_super_dash, has_dream_nail, has_acid_armour, has_nail_art,
-        #                       can_jump, can_double_jump, can_wall_jump,
-        #                       can_dash, can_attack, can_cast,
-        #                       can_nail_charge, can_dream_nail, can_super_dash]
-        can_jump = global_state[..., 14]
-        can_double_jump = global_state[..., 15]
-        can_wall_jump = global_state[..., 16]
-        can_dash = global_state[..., 17]
-        can_attack = global_state[..., 18]
-        can_cast = global_state[..., 19]
-        can_nail_charge = global_state[..., 20]
-        can_dream_nail = global_state[..., 21]
-        can_super_dash = global_state[..., 22]
-        return (can_jump, can_double_jump, can_wall_jump, can_dash,
-                can_attack, can_cast, can_nail_charge, can_dream_nail, can_super_dash)
+        """Extract the 9 validity flags from global_state via named GS indices."""
+        return (
+            global_state[..., GS.CAN_JUMP],
+            global_state[..., GS.CAN_DOUBLE_JUMP],
+            global_state[..., GS.CAN_WALL_JUMP],
+            global_state[..., GS.CAN_DASH],
+            global_state[..., GS.CAN_ATTACK],
+            global_state[..., GS.CAN_CAST],
+            global_state[..., GS.CAN_NAIL_CHARGE],
+            global_state[..., GS.CAN_DREAM_NAIL],
+            global_state[..., GS.CAN_SUPER_DASH],
+        )
 
     def _mask_logits(self, logits_action, logits_jump, global_state):
         """Apply action validity masking to logits."""
@@ -224,14 +218,11 @@ class FullKnightActorCritic(nn.Module):
 
         return logits_action, logits_jump
 
-    def get_value(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-                  terrain_hb, terrain_mask, global_state, hx=None):
-        h, hx_new = self._encode(combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-                                 terrain_hb, terrain_mask, global_state, hx)
+    def get_value(self, obs: Observation, hx=None):
+        h, hx_new = self._encode(obs, hx)
         return self.critic_attack(h).squeeze(-1), self.critic_defense(h).squeeze(-1), hx_new
 
-    def get_action_and_value(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-                             terrain_hb, terrain_mask, global_state, hx=None, actions=None):
+    def get_action_and_value(self, obs: Observation, hx=None, actions=None):
         """
         If actions is None: sample new actions.
         If actions is provided: compute log_probs and entropy for given actions.
@@ -240,8 +231,7 @@ class FullKnightActorCritic(nn.Module):
                  each (B,) LongTensor.
         Returns: actions_dict, log_prob (B,), entropy (B,), value_atk (B,), value_def (B,), hx_new (B, hidden_dim)
         """
-        h, hx_new = self._encode(combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-                                 terrain_hb, terrain_mask, global_state, hx)
+        h, hx_new = self._encode(obs, hx)
 
         logits_m = self.head_movement(h)
         logits_d = self.head_direction(h)
@@ -249,7 +239,7 @@ class FullKnightActorCritic(nn.Module):
         logits_j = self.head_jump(h).clone()
 
         # Apply validity masking
-        logits_a, logits_j = self._mask_logits(logits_a, logits_j, global_state)
+        logits_a, logits_j = self._mask_logits(logits_a, logits_j, obs.global_state)
 
         dist_m = Categorical(logits=logits_m)
         dist_d = Categorical(logits=logits_d)
@@ -292,8 +282,7 @@ class FullKnightActorCritic(nn.Module):
         }
         return actions_dict, log_prob, entropy, value_atk, value_def, hx_new
 
-    def forward_sequence(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-                         terrain_hb, terrain_mask, global_state, hx, actions):
+    def forward_sequence(self, obs: Observation, hx, actions):
         """Truncated BPTT over a chunk of L timesteps.
 
         Vectorized: encoders/trunk/heads/critic all process (B*L) in one shot,
@@ -301,28 +290,23 @@ class FullKnightActorCritic(nn.Module):
         retains a temporal dependency.
 
         Args:
-            combat_hb:       (B, L, max_combat, feat)
-            combat_mask:     (B, L, max_combat)
-            combat_kind_ids: (B, L, max_combat) int64
-            terrain_hb:      (B, L, max_terrain, feat)
-            terrain_mask:    (B, L, max_terrain)
-            global_state:    (B, L, global_dim)
-            hx:              (B, hidden_dim) initial hidden state
-            actions:         dict of (B, L) LongTensors
+            obs:     Observation with leading dims (B, L, ...).
+            hx:      (B, hidden_dim) initial hidden state.
+            actions: dict of (B, L) LongTensors keyed by movement/direction/action/jump.
 
         Returns: log_probs (B,L), entropies (B,L), values_atk (B,L), values_def (B,L),
                  gru_info dict
         """
-        B, L = global_state.shape[:2]
+        B, L = obs.global_state.shape[:2]
 
         # --- Phase 1: encoders + trunk vectorized over (B*L) ---
-        flat_combat_hb = combat_hb.reshape(B * L, *combat_hb.shape[2:])
-        flat_combat_mask = combat_mask.reshape(B * L, combat_mask.shape[-1])
-        flat_combat_kind_ids = combat_kind_ids.reshape(B * L, combat_kind_ids.shape[-1])
-        flat_combat_parent_ids = combat_parent_ids.reshape(B * L, combat_parent_ids.shape[-1])
-        flat_terrain_hb = terrain_hb.reshape(B * L, *terrain_hb.shape[2:])
-        flat_terrain_mask = terrain_mask.reshape(B * L, terrain_mask.shape[-1])
-        flat_global = global_state.reshape(B * L, global_state.shape[-1])
+        flat_combat_hb = obs.combat_hb.reshape(B * L, *obs.combat_hb.shape[2:])
+        flat_combat_mask = obs.combat_mask.reshape(B * L, obs.combat_mask.shape[-1])
+        flat_combat_kind_ids = obs.combat_kind_ids.reshape(B * L, obs.combat_kind_ids.shape[-1])
+        flat_combat_parent_ids = obs.combat_parent_ids.reshape(B * L, obs.combat_parent_ids.shape[-1])
+        flat_terrain_hb = obs.terrain_hb.reshape(B * L, *obs.terrain_hb.shape[2:])
+        flat_terrain_mask = obs.terrain_mask.reshape(B * L, obs.terrain_mask.shape[-1])
+        flat_global = obs.global_state.reshape(B * L, obs.global_state.shape[-1])
 
         flat_global_emb = self.global_encoder(flat_global)
         flat_kind_emb = torch.cat(

@@ -26,6 +26,11 @@ namespace FullKnight.Environment
 		private bool _episodeDone;
 		private string _episodeResult;
 		private HealthManager _bossHM;
+		// Set of HealthManagers considered the "true target(s)" for is_target.
+		// Populated from BossSceneController.bosses on each reset; used by
+		// HitboxObserver.GetSplitFeatures to flag which combat hitboxes the
+		// agent should actually try to kill (vs. minions / projectiles).
+		private readonly HashSet<HealthManager> _bossHMs = new();
 
 		// Boss intro skip: keep simulating internally until combat starts
 		private bool _combatStarted;
@@ -125,7 +130,7 @@ namespace FullKnight.Environment
 			if (_timeManager != null) _timeManager.Dispose();
 			_timeManager = new Game.TimeScale(_timeScaleValue);
 
-			var obs = _hitboxObserver.GetSplitFeatures();
+			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs);
 			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
 
 			data.combat_hitboxes = obs.CombatHitboxes;
@@ -148,7 +153,7 @@ namespace FullKnight.Environment
 				data.info = _episodeResult;
 				data.combat_hitboxes = new List<float[]>();
 				data.terrain_hitboxes = new List<float[]>();
-				data.global_state = new float[19];
+				data.global_state = new float[22];
 				data.damage_landed = 0;
 				data.hits_taken = 0;
 				data.step_game_time = 0;
@@ -246,13 +251,13 @@ namespace FullKnight.Environment
 				data.info = _episodeResult;
 				data.combat_hitboxes = new List<float[]>();
 				data.terrain_hitboxes = new List<float[]>();
-				data.global_state = new float[19];
+				data.global_state = new float[22];
 				SendMessage(new Message { type = "step", data = data });
 				yield break;
 			}
 
 			// Build observation
-			var obs = _hitboxObserver.GetSplitFeatures();
+			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs);
 			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
 
 			data.combat_hitboxes = obs.CombatHitboxes;
@@ -488,14 +493,24 @@ namespace FullKnight.Environment
 		{
 			_bossHM = null;
 			_bossMaxHP = 1;
+			_bossHMs.Clear();
 			try
 			{
 				if (BossSceneController.Instance?.bosses != null
 					&& BossSceneController.Instance.bosses.Length > 0)
 				{
+					// Primary boss for damage tracking / death detection.
 					_bossHM = BossSceneController.Instance.bosses[0]
 						.gameObject.GetComponent<HealthManager>();
 					if (_bossHM != null) _bossMaxHP = _bossHM.hp;
+					// Full set for is_target tagging — handles multi-boss scenes
+					// (Mantis Lords, etc.) where every entry is a "real" target.
+					foreach (var b in BossSceneController.Instance.bosses)
+					{
+						if (b == null) continue;
+						var hm = b.gameObject.GetComponent<HealthManager>();
+						if (hm != null) _bossHMs.Add(hm);
+					}
 				}
 			}
 			catch { }

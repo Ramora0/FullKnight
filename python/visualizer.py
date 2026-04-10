@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 
+from observation import Observation, GS, CB
+
 
 class Visualizer:
     """Live visualization of the exact observations the model receives.
@@ -18,22 +20,20 @@ class Visualizer:
         self.fig.canvas.manager.set_window_title("FullKnight Observation Viewer")
         self.vocab = vocab
 
-    def update(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
-               terrain_hb, terrain_mask, global_state):
-        """Redraw with current observations (all batched numpy arrays, shows index 0)."""
+    def update(self, obs: Observation):
+        """Redraw with the current Observation (env 0 only)."""
         ax = self.ax
         ax.clear()
 
-        gs = global_state[0]
-        vel_x, vel_y = gs[0], gs[1]
-        hp = gs[2]
-        boss_hp = gs[4]
-        knight_w = gs[5]
-        knight_h = gs[6]
+        gs = obs.global_state[0]
+        vel_x, vel_y = gs[GS.VEL_X], gs[GS.VEL_Y]
+        hp = gs[GS.HP]
+        knight_w = gs[GS.KNIGHT_W]
+        knight_h = gs[GS.KNIGHT_H]
 
         # Terrain hitboxes (gray)
-        t_hb = terrain_hb[0]
-        t_mask = terrain_mask[0]
+        t_hb = obs.terrain_hb[0]
+        t_mask = obs.terrain_mask[0]
         for i in range(len(t_mask)):
             if t_mask[i] < 0.5:
                 continue
@@ -44,17 +44,33 @@ class Visualizer:
             )
             ax.add_patch(rect)
 
-        # Combat hitboxes: green = target (boss), red = hurts knight, yellow = knight's attack
-        c_hb = combat_hb[0]
-        c_mask = combat_mask[0]
-        c_kid = combat_kind_ids[0]
-        c_pid = combat_parent_ids[0]
+        # Combat hitboxes — colors encode the three behavioral flags:
+        #   red    = boss target (gives + takes + is_target)
+        #   orange = damageable enemy that's not the goal (gives + takes, no target)
+        #   magenta = pure projectile / hazard (gives, no takes)
+        #   green  = peaceful target (takes / target, no gives) — chests, exits, future
+        #   yellow = knight's own attack (no gives, no takes)
+        c_hb = obs.combat_hb[0]
+        c_mask = obs.combat_mask[0]
+        c_kid = obs.combat_kind_ids[0]
+        c_pid = obs.combat_parent_ids[0]
         for i in range(len(c_mask)):
             if c_mask[i] < 0.5:
                 continue
-            rx, ry, w, h, is_trig, hurts_knight, is_target = c_hb[i]
+            row = c_hb[i]
+            rx, ry, w, h = row[CB.REL_X], row[CB.REL_Y], row[CB.W], row[CB.H]
+            gives = row[CB.GIVES_DAMAGE]
+            takes = row[CB.TAKES_DAMAGE]
+            is_target = row[CB.IS_TARGET]
+            hp_raw = row[CB.HP_RAW]
             if is_target > 0.5:
-                color = "red" if hurts_knight > 0.5 else "green"
+                color = "red"
+            elif gives > 0.5 and takes > 0.5:
+                color = "orange"
+            elif gives > 0.5:
+                color = "magenta"
+            elif takes > 0.5:
+                color = "green"
             else:
                 color = "yellow"
             rect = patches.Rectangle(
@@ -63,7 +79,7 @@ class Visualizer:
             )
             ax.add_patch(rect)
 
-            # Kind+parent id label, anchored to top-left of the box
+            # Kind+parent id label + raw HP if damageable, anchored to top-left of the box.
             kid = int(c_kid[i])
             pid = int(c_pid[i])
             if self.vocab is not None:
@@ -72,6 +88,8 @@ class Visualizer:
                 label = f"{kname}<{pname}>" if pid > 0 else kname
             else:
                 label = f"{kid}<{pid}>" if pid > 0 else f"{kid}"
+            if takes > 0.5:
+                label += f" hp={int(hp_raw)}"
             ax.text(
                 rx - w / 2, ry + h / 2, label,
                 fontsize=7, color="black",
@@ -92,7 +110,7 @@ class Visualizer:
                      fc="blue", ec="blue", alpha=0.6)
 
         ax.set_title(
-            f"HP: {hp:.0f}  Boss HP: {boss_hp:.1f}  "
+            f"HP: {hp:.0f}  "
             f"Combat: {int(c_mask.sum())}  Terrain: {int(t_mask.sum())}  "
             f"Vel: ({vel_x:.1f}, {vel_y:.1f})"
         )

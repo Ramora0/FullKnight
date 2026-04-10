@@ -5,6 +5,7 @@ import websockets
 
 from env import HKEnv
 from vocab import KindVocab
+from observation import Observation
 
 
 class VecEnv:
@@ -67,10 +68,8 @@ class VecEnv:
             print(f"  {label} env {idx} ({boss}): done in {dt:.1f}s", flush=True)
         return idx, dt, result
 
-    async def reset_all(self, levels=None):
-        """Reset all envs. Returns batched
-        (combat_hb, combat_mask, combat_kinds, combat_parents,
-         terrain_hb, terrain_mask, global_states).
+    async def reset_all(self, levels=None) -> Observation:
+        """Reset all envs. Returns the batched Observation.
         levels: optional list of N scene names, one per env."""
         if levels is not None:
             for i, lv in enumerate(levels):
@@ -90,11 +89,10 @@ class VecEnv:
     async def step_all(self, actions):
         """Step all envs in parallel.
         actions: list of N action_vecs, each [movement, direction, action, jump].
-        Returns (combat_hb, combat_mask, combat_kinds, terrain_hb, terrain_mask,
-                 global_states, damage_landed, hits_taken, step_game_times, step_real_times,
-                 step_wall_times).
-        step_wall_times: (N,) float32 — per-env wall-clock seconds for this step, so
-        callers can localize slow steps to a specific env/boss.
+        Returns (Observation, damage_landed, hits_taken, step_game_times,
+                 step_real_times, step_wall_times).
+        step_wall_times: (N,) float32 — per-env wall-clock seconds, so callers
+        can localize slow steps to a specific env/boss.
         """
         t0 = time.perf_counter()
         timed = await asyncio.gather(*[
@@ -108,14 +106,13 @@ class VecEnv:
         (combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists,
          damage_landed, hits_taken, step_game_times, step_real_times) = zip(*results)
 
-        obs_batch = self._batch_observations(list(zip(
+        obs = self._batch_observations(list(zip(
             combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists)))
         damage_landed = np.array(damage_landed, dtype=np.float32)
         hits_taken = np.array(hits_taken, dtype=np.float32)
         step_game_times = np.array(step_game_times, dtype=np.float32)
         step_real_times = np.array(step_real_times, dtype=np.float32)
-        return (*obs_batch, damage_landed, hits_taken, step_game_times, step_real_times,
-                step_wall_times)
+        return obs, damage_landed, hits_taken, step_game_times, step_real_times, step_wall_times
 
     async def reset_and_resume(self, reset_indices, levels=None):
         """Reset specified envs, resume the rest. Returns observations for reset envs only.
@@ -193,5 +190,12 @@ class VecEnv:
 
         gs_batch = np.stack(gs_list, axis=0)
 
-        return (combat_batch, combat_mask, combat_kind_ids, combat_parent_ids,
-                terrain_batch, terrain_mask, gs_batch)
+        return Observation(
+            combat_hb=combat_batch,
+            combat_mask=combat_mask,
+            combat_kind_ids=combat_kind_ids,
+            combat_parent_ids=combat_parent_ids,
+            terrain_hb=terrain_batch,
+            terrain_mask=terrain_mask,
+            global_state=gs_batch,
+        )

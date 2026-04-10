@@ -24,11 +24,12 @@ namespace FullKnight.Game
 			{HitboxType.Terrain, new HashSet<Collider2D>()}
 		};
 
-		// Cached per-collider kind/parent strings. Computed once on first
-		// classification (cheap parent walk) and reused thereafter, since HK
-		// reparents rarely.
+		// Cached per-collider kind/parent strings + HealthManager ref. Computed
+		// once on first classification (cheap parent walk) and reused thereafter,
+		// since HK reparents rarely.
 		public readonly Dictionary<Collider2D, string> kindCache = new();
 		public readonly Dictionary<Collider2D, string> parentCache = new();
+		public readonly Dictionary<Collider2D, HealthManager> hmCache = new();
 
 		private void Start()
 		{
@@ -52,7 +53,7 @@ namespace FullKnight.Game
 				kvp.Value.RemoveWhere(c => c == null);
 			var dead = new List<Collider2D>();
 			foreach (var k in kindCache.Keys) if (k == null) dead.Add(k);
-			foreach (var k in dead) { kindCache.Remove(k); parentCache.Remove(k); }
+			foreach (var k in dead) { kindCache.Remove(k); parentCache.Remove(k); hmCache.Remove(k); }
 		}
 
 		private void AddHitbox(Collider2D collider2D)
@@ -84,16 +85,16 @@ namespace FullKnight.Game
 		/// <summary>
 		/// Return a stable class-level kind string for a combat collider, computed
 		/// from what HK already stores. Rule (first match wins):
-		///   1. DamageHero component on the collider → stripped GameObject name.
-		///      This is the prefab that defines "what hurts the knight" — projectiles,
-		///      per-attack damage volumes, area hazards. Shared across bosses when
-		///      the prefab is shared (e.g. "Needle", "Fireball").
-		///   2. DamageEnemies component → stripped GameObject name. Knight attacks:
-		///      "Slash", "AltSlash", "Fireball(Clone)" → "Fireball", etc.
+		///   1. DamageEnemies on the collider → stripped GameObject name (knight attacks).
+		///   2. DamageHero on the collider → stripped GameObject name (enemy projectiles,
+		///      attack volumes, hazards).
 		///   3. Walk parents to the nearest HealthManager → that root's stripped name.
-		///      Catches enemy body colliders (the boss collider itself).
+		///      Catches enemy body colliders, AND uses the same string ClassifyParent
+		///      returns so the body's leaf id and an attack's parent id collapse to one
+		///      vocab row (and one shared embedding).
 		///   4. Fallback: stripped own name, or "unknown".
-		/// Namespaced with a prefix so knight/enemy/terrain keys never collide.
+		/// No role prefix (knight/enemy/other): hurts_knight already separates knight
+		/// from enemy hitboxes, and prefixes would prevent the body↔parent merge.
 		/// </summary>
 		public string GetKind(Collider2D col)
 		{
@@ -117,58 +118,65 @@ namespace FullKnight.Game
 			if (col == null) return "";
 			if (parentCache.TryGetValue(col, out string cached)) return cached;
 
-			string result = ClassifyParent(col);
-			parentCache[col] = result;
-			return result;
+			ClassifyParent(col, out string name, out HealthManager hm);
+			parentCache[col] = name;
+			hmCache[col] = hm;  // may be null
+			return name;
 		}
 
-		private string ClassifyParent(Collider2D col)
+		/// <summary>Returns the cached HealthManager (or null) for a collider.
+		/// Populated by GetParentKind on first lookup.</summary>
+		public HealthManager GetParentHm(Collider2D col)
+		{
+			if (col == null) return null;
+			if (hmCache.TryGetValue(col, out HealthManager cached)) return cached;
+			// Force population.
+			GetParentKind(col);
+			return hmCache.TryGetValue(col, out cached) ? cached : null;
+		}
+
+		private void ClassifyParent(Collider2D col, out string name, out HealthManager hm)
 		{
 			Transform t = col.transform;
 			int depth = 0;
 			while (t != null && depth < 8)
 			{
-				if (t.GetComponent<HealthManager>() != null)
-					return Strip(t.gameObject.name);
+				var found = t.GetComponent<HealthManager>();
+				if (found != null)
+				{
+					name = Strip(t.gameObject.name);
+					hm = found;
+					return;
+				}
 				t = t.parent;
 				depth++;
 			}
-			return "";
+			name = "";
+			hm = null;
 		}
 
 		private string ClassifyKind(Collider2D col)
 		{
 			GameObject go = col.gameObject;
 
-			// Knight-owned attack: DamageEnemies sits on the prefab that dealt damage.
 			if (go.GetComponent<DamageEnemies>() != null)
-			{
-				return "knight/" + Strip(go.name);
-			}
+				return Strip(go.name);
 
-			// Enemy-owned damage: DamageHero identifies the hurting prefab (projectile,
-			// attack volume, hazard). Named after the prefab — "Needle", "Fireball".
 			if (go.GetComponent<DamageHero>() != null)
-			{
-				return "enemy/" + Strip(go.name);
-			}
+				return Strip(go.name);
 
-			// Enemy body: walk up to the nearest HealthManager, use its root name.
-			// This is where "which boss is this" lives — on the boss's own collider,
-			// distinct from any projectile it fires.
 			Transform t = go.transform;
 			int depth = 0;
 			while (t != null && depth < 8)
 			{
 				var hm = t.GetComponent<HealthManager>();
-				if (hm != null) return "enemy/" + Strip(t.gameObject.name);
+				if (hm != null) return Strip(t.gameObject.name);
 				t = t.parent;
 				depth++;
 			}
 
-			// Nothing identifying. Use own name so at least identical unknowns group.
 			string n = Strip(go.name);
-			return string.IsNullOrEmpty(n) ? "unknown" : "other/" + n;
+			return string.IsNullOrEmpty(n) ? "unknown" : n;
 		}
 
 		private static string Strip(string name)
@@ -269,12 +277,20 @@ namespace FullKnight.Game
 
 		/// <summary>
 		/// Extract hitbox features split by type.
-		/// Combat (Enemy + Attack): [rel_x, rel_y, width, height, is_trigger, hurts_knight, is_target]
-		/// CombatKinds: parallel string list, one kind-id per combat hitbox.
+		/// Combat (Enemy + Attack): 9 floats per hitbox —
+		///   [rel_x, rel_y, width, height, is_trigger,
+		///    gives_damage, takes_damage, is_target, hp_raw]
+		///   gives_damage = collider hurts the knight on contact (Enemy bucket).
+		///   takes_damage = a HealthManager is reachable from this collider.
+		///   is_target    = that HealthManager is in the supplied bossHms set.
+		///   hp_raw       = current HP of the reached HealthManager (0 if none).
+		///                  Raw value, NOT normalized — the agent should be able to
+		///                  read "1-2 nail hits from death" vs "beefy".
+		/// CombatKinds / CombatParents: parallel string lists.
 		/// Terrain: [rel_x, rel_y, width, height, is_trigger]
 		/// Knight: bounds only (width, height), folded into global state.
 		/// </summary>
-		public SplitObservation GetSplitFeatures()
+		public SplitObservation GetSplitFeatures(System.Collections.Generic.HashSet<HealthManager> bossHms = null)
 		{
 			var hitboxes = _hook.GetHitboxes();
 			var reader = _hook.GetReader();
@@ -312,11 +328,20 @@ namespace FullKnight.Game
 
 					if (kvp.Key == HitboxType.Enemy || kvp.Key == HitboxType.Attack)
 					{
-						float hurtsKnight = kvp.Key == HitboxType.Enemy ? 1f : 0f;
-						float isTarget = kvp.Key == HitboxType.Enemy ? 1f : 0f;
-						combat.Add(new float[] { relX, relY, w, h, isTrigger, hurtsKnight, isTarget });
+						string parent = reader != null ? reader.GetParentKind(col) : "";
+						HealthManager hm = reader != null ? reader.GetParentHm(col) : null;
+
+						float givesDamage = kvp.Key == HitboxType.Enemy ? 1f : 0f;
+						float takesDamage = hm != null ? 1f : 0f;
+						float isTarget = (hm != null && bossHms != null && bossHms.Contains(hm)) ? 1f : 0f;
+						float hpRaw = hm != null ? (float)hm.hp : 0f;
+
+						combat.Add(new float[] {
+							relX, relY, w, h, isTrigger,
+							givesDamage, takesDamage, isTarget, hpRaw
+						});
 						combatKinds.Add(reader != null ? reader.GetKind(col) : "unknown");
-						combatParents.Add(reader != null ? reader.GetParentKind(col) : "");
+						combatParents.Add(parent);
 					}
 					else if (kvp.Key == HitboxType.Terrain)
 					{
