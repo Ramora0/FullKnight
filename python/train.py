@@ -221,7 +221,9 @@ async def train(config: Config):
                 bs["taken_window"].append(taken_b)
                 window_landed = sum(bs["landed_window"])
                 window_taken = sum(bs["taken_window"])
-                if window_taken > 0 and window_landed > 0:
+
+                if window_landed > 0 and window_taken > 0:
+                    # Normal case: EMA toward the raw ratio, clamped.
                     D_raw = max(window_landed / window_taken, config.D_min)
                     if len(bs["landed_window"]) == 1:
                         bs["D"] = D_raw
@@ -232,6 +234,22 @@ async def train(config: Config):
                             bs["D"] * (1 - config.D_max_delta),
                             bs["D"] * (1 + config.D_max_delta),
                         ))
+                elif window_landed == 0 and window_taken > 0:
+                    # Strong signal: policy is taking hits but landing nothing.
+                    # Curriculum is too hard — drop D aggressively (2x clamp rate).
+                    bs["D"] = float(max(
+                        bs["D"] * (1 - 2 * config.D_max_delta),
+                        config.D_min,
+                    ))
+                elif window_landed > 0 and window_taken == 0:
+                    # Weaker signal: policy is landing damage without getting hit.
+                    # Push D up at the normal clamp rate.
+                    bs["D"] = float(min(
+                        bs["D"] * (1 + config.D_max_delta),
+                        config.D_max,
+                    ))
+                # else: both zero — no knight/boss interaction at all. Leave D
+                # alone; this usually means the arena is broken, not a signal.
 
             D_per_env = np.array([boss_state[b]["D"] for b in env_boss], dtype=np.float32)
 
@@ -296,8 +314,8 @@ async def train(config: Config):
             total_steps = (epoch + 1) * config.n_envs * config.rollout_len
             Ds = np.array([boss_state[b]["D"] for b in bosses], dtype=np.float64)
             D_geomean = float(np.exp(np.log(np.maximum(Ds, 1e-6)).mean()))
-            # Expected masks to kill one boss, averaged across the roster.
-            # Equivalent to 100 / harmonic_mean(D_b). Dominated by the worst boss.
+            # Harmonic mean of D expressed in hits units. Dominated by the worst
+            # boss — distinct from D_geomean (AM ≥ GM ≥ HM).
             avg_hits_per_boss = float((100.0 / np.maximum(Ds, 1e-6)).mean())
 
             # Balanced sample means: per-boss mean first, then average across
