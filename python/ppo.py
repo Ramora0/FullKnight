@@ -163,7 +163,8 @@ class PPO:
         return result
 
     @torch.no_grad()
-    def collect_action(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state):
+    def collect_action(self, combat_hb, combat_mask, combat_kind_ids,
+                       terrain_hb, terrain_mask, global_state):
         """Get actions for a batch of observations during rollout collection.
         All inputs are numpy arrays. Returns numpy arrays.
         """
@@ -180,6 +181,7 @@ class PPO:
 
         chb = torch.from_numpy(chb_norm).float().to(self.device)
         cm = torch.from_numpy(combat_mask).float().to(self.device)
+        ckid = torch.from_numpy(combat_kind_ids).long().to(self.device)
         thb = torch.from_numpy(thb_norm).float().to(self.device)
         tm = torch.from_numpy(terrain_mask).float().to(self.device)
         gs = torch.from_numpy(gs_norm).float().to(self.device)
@@ -193,7 +195,7 @@ class PPO:
 
         fwd_start.record()
         actions, log_prob, _, value_atk, value_def, hx_new = self.policy.get_action_and_value(
-            chb, cm, thb, tm, gs, hx=hx_t
+            chb, cm, ckid, thb, tm, gs, hx=hx_t
         )
         fwd_end.record()
 
@@ -207,8 +209,8 @@ class PPO:
         self._event_log.append((fwd_start, fwd_end, (xfer_start, xfer_end)))
         return result
 
-    def train_on_rollout(self, buf_combat_hb, buf_combat_mask, buf_terrain_hb,
-                         buf_terrain_mask, buf_global, actions_arr,
+    def train_on_rollout(self, buf_combat_hb, buf_combat_mask, buf_combat_kind_ids,
+                         buf_terrain_hb, buf_terrain_mask, buf_global, actions_arr,
                          log_probs_arr, damage_landed_arr, hits_taken_arr,
                          values_atk_arr, values_def_arr, D, buf_hx):
         """Train on a collected rollout with chunked truncated BPTT.
@@ -276,6 +278,7 @@ class PPO:
 
         flat_chb = np.zeros((T_used, N, max_combat, cfg.combat_feature_dim), dtype=np.float32)
         flat_cm = np.zeros((T_used, N, max_combat), dtype=np.float32)
+        flat_ckid = np.zeros((T_used, N, max_combat), dtype=np.int64)
         flat_thb = np.zeros((T_used, N, max_terrain, cfg.terrain_feature_dim), dtype=np.float32)
         flat_tm = np.zeros((T_used, N, max_terrain), dtype=np.float32)
         flat_gs = np.zeros((T_used, N, cfg.global_state_dim), dtype=np.float32)
@@ -284,6 +287,7 @@ class PPO:
             nc = buf_combat_hb[t].shape[1]
             flat_chb[t, :, :nc] = buf_combat_hb[t]
             flat_cm[t, :, :nc] = buf_combat_mask[t]
+            flat_ckid[t, :, :nc] = buf_combat_kind_ids[t]
             nt = buf_terrain_hb[t].shape[1]
             flat_thb[t, :, :nt] = buf_terrain_hb[t]
             flat_tm[t, :, :nt] = buf_terrain_mask[t]
@@ -320,6 +324,7 @@ class PPO:
 
         chb_chunks = chunk_obs(flat_chb)
         cm_chunks = chunk_obs(flat_cm)
+        ckid_chunks = chunk_obs(flat_ckid)
         thb_chunks = chunk_obs(flat_thb)
         tm_chunks = chunk_obs(flat_tm)
         gs_chunks = chunk_obs(flat_gs)
@@ -337,6 +342,7 @@ class PPO:
         act_t = {k: torch.from_numpy(v).long().to(self.device) for k, v in act_chunks.items()}
         chb_t = torch.from_numpy(chb_chunks).to(self.device)
         cm_t = torch.from_numpy(cm_chunks).to(self.device)
+        ckid_t = torch.from_numpy(ckid_chunks).long().to(self.device)
         thb_t = torch.from_numpy(thb_chunks).to(self.device)
         tm_t = torch.from_numpy(tm_chunks).to(self.device)
         gs_t = torch.from_numpy(gs_chunks).to(self.device)
@@ -360,7 +366,7 @@ class PPO:
                 hx_mb = hx_t[idx].detach()
 
                 new_lp, entropy, v_atk, v_def, gru_info = self.policy.forward_sequence(
-                    chb_t[idx], cm_t[idx], thb_t[idx], tm_t[idx], gs_t[idx],
+                    chb_t[idx], cm_t[idx], ckid_t[idx], thb_t[idx], tm_t[idx], gs_t[idx],
                     hx_mb, {k: v[idx] for k, v in act_t.items()},
                 )
 
@@ -423,7 +429,7 @@ class PPO:
         pbar.close()
         return {k: v / max(n_updates, 1) for k, v in total_metrics.items()}
 
-    def save_checkpoint(self, path):
+    def save_checkpoint(self, path, vocab=None):
         torch.save(
             {
                 "model": self.policy.state_dict(),
@@ -433,11 +439,12 @@ class PPO:
                 "combat_normalizer": self.combat_normalizer.state_dict(),
                 "terrain_normalizer": self.terrain_normalizer.state_dict(),
                 "hx": self.hx,
+                "kind_vocab": vocab.state_dict() if vocab is not None else None,
             },
             path,
         )
 
-    def load_checkpoint(self, path):
+    def load_checkpoint(self, path, vocab=None):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         state = ckpt["model"]
         # Remap old nn.GRUCell parameter names → new nn.GRU names so checkpoints
@@ -476,3 +483,6 @@ class PPO:
             self.terrain_normalizer.load_state_dict(ckpt["terrain_normalizer"])
         if ckpt.get("hx") is not None:
             self.hx = ckpt["hx"]
+        if vocab is not None and ckpt.get("kind_vocab") is not None:
+            vocab.load_state_dict(ckpt["kind_vocab"])
+            print(f"  Loaded kind vocab: {len(vocab)} entries")

@@ -12,12 +12,13 @@ class Visualizer:
     terrain in gray, with global state info in the title.
     """
 
-    def __init__(self):
+    def __init__(self, vocab=None):
         plt.ion()
         self.fig, self.ax = plt.subplots(1, 1, figsize=(10, 8))
         self.fig.canvas.manager.set_window_title("FullKnight Observation Viewer")
+        self.vocab = vocab
 
-    def update(self, combat_hb, combat_mask, terrain_hb, terrain_mask, global_state):
+    def update(self, combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state):
         """Redraw with current observations (all batched numpy arrays, shows index 0)."""
         ax = self.ax
         ax.clear()
@@ -45,6 +46,7 @@ class Visualizer:
         # Combat hitboxes: green = target (boss), red = hurts knight, yellow = knight's attack
         c_hb = combat_hb[0]
         c_mask = combat_mask[0]
+        c_kid = combat_kind_ids[0]
         for i in range(len(c_mask)):
             if c_mask[i] < 0.5:
                 continue
@@ -58,6 +60,19 @@ class Visualizer:
                 linewidth=2, edgecolor=color, facecolor=color, alpha=0.3,
             )
             ax.add_patch(rect)
+
+            # Kind id label, anchored to top-left of the box
+            kid = int(c_kid[i])
+            if self.vocab is not None and 0 <= kid < len(self.vocab):
+                label = f"{kid}:{self.vocab._i2s[kid]}"
+            else:
+                label = f"{kid}"
+            ax.text(
+                rx - w / 2, ry + h / 2, label,
+                fontsize=7, color="black",
+                bbox=dict(facecolor=color, alpha=0.7, edgecolor="none", pad=1),
+                verticalalignment="bottom", horizontalalignment="left",
+            )
 
         # Knight at origin
         knight_rect = patches.Rectangle(

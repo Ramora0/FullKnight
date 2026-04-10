@@ -23,7 +23,7 @@ class HKEnv:
         await self.ws.recv()
 
     async def reset(self, eval_mode=False):
-        """Reset environment. Returns (combat_hb, terrain_hb, global_state)."""
+        """Reset environment. Returns (combat_hb, terrain_hb, global_state, combat_kinds)."""
         await self.ws.send(pack_reset(
             self.config.level, self.config.frames_per_wait,
             self.config.time_scale, eval_mode=eval_mode,
@@ -33,13 +33,13 @@ class HKEnv:
 
     async def step(self, action_vec):
         """Take a step. action_vec = [movement, direction, action, jump].
-        Returns (combat_hb, terrain_hb, global_state, damage_landed, hits_taken,
-                 step_game_time, step_real_time).
+        Returns (combat_hb, terrain_hb, global_state, combat_kinds, damage_landed,
+                 hits_taken, step_game_time, step_real_time).
         """
         await self.ws.send(pack_action(action_vec))
         data = await self.ws.recv()
-        combat_hb, terrain_hb, gs, damage_landed, hits_taken, game_time, real_time, done = unpack_step(data)
-        return combat_hb, terrain_hb, gs, damage_landed, hits_taken, game_time, real_time
+        combat_hb, terrain_hb, gs, combat_kinds, damage_landed, hits_taken, game_time, real_time, done = unpack_step(data)
+        return combat_hb, terrain_hb, gs, combat_kinds, damage_landed, hits_taken, game_time, real_time
 
     async def step_eval(self, action_vec):
         """Like step() but also returns done flag. For eval mode."""

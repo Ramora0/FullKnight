@@ -42,6 +42,7 @@ namespace FullKnight.Net
 				var combat = d.combat_hitboxes ?? new List<float[]>();
 				var terrain = d.terrain_hitboxes ?? new List<float[]>();
 				var gs = d.global_state ?? Array.Empty<float>();
+				var kinds = d.combat_kinds ?? new List<string>();
 
 				w.Write((ushort)combat.Count);
 				w.Write((ushort)terrain.Count);
@@ -64,6 +65,17 @@ namespace FullKnight.Net
 					w.Write(d.step_game_time ?? 0f);
 					w.Write(d.step_real_time ?? 0f);
 					w.Write(d.done == true ? (byte)1 : (byte)0);
+				}
+
+				// Combat kind strings: one per combat hitbox, in the same order.
+				// Format: u8 length + UTF-8 bytes. Length capped at 255 (truncated).
+				for (int i = 0; i < combat.Count; i++)
+				{
+					string k = i < kinds.Count ? (kinds[i] ?? "unknown") : "unknown";
+					var bytes = System.Text.Encoding.UTF8.GetBytes(k);
+					int len = bytes.Length > 255 ? 255 : bytes.Length;
+					w.Write((byte)len);
+					w.Write(bytes, 0, len);
 				}
 			}
 

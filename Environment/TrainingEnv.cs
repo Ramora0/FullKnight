@@ -65,7 +65,9 @@ namespace FullKnight.Environment
 
 		private IEnumerator Resume(MessageData data)
 		{
-			Time.timeScale = _timeScaleValue;
+			// Step() owns freeze/unfreeze (lines 136/184). Unfreezing here opens a gap
+			// where the previous rollout's held inputs tick frames and leak damage into
+			// step 0 before the new action is applied.
 			SendMessage(new Message { type = "resume", data = data });
 			yield break;
 		}
@@ -107,6 +109,7 @@ namespace FullKnight.Environment
 			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
 
 			data.combat_hitboxes = obs.CombatHitboxes;
+			data.combat_kinds = obs.CombatKinds;
 			data.terrain_hitboxes = obs.TerrainHitboxes;
 			data.global_state = gs;
 
@@ -222,6 +225,7 @@ namespace FullKnight.Environment
 			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
 
 			data.combat_hitboxes = obs.CombatHitboxes;
+			data.combat_kinds = obs.CombatKinds;
 			data.terrain_hitboxes = obs.TerrainHitboxes;
 			data.global_state = gs;
 			data.done = false;

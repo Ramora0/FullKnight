@@ -24,6 +24,10 @@ namespace FullKnight.Game
 			{HitboxType.Terrain, new HashSet<Collider2D>()}
 		};
 
+		// Cached per-collider kind string. Computed once on first classification
+		// (cheap parent walk) and reused thereafter, since HK reparents rarely.
+		public readonly Dictionary<Collider2D, string> kindCache = new();
+
 		private void Start()
 		{
 			foreach (Collider2D collider2D in Resources.FindObjectsOfTypeAll<Collider2D>())
@@ -44,6 +48,9 @@ namespace FullKnight.Game
 		{
 			foreach (var kvp in colliders)
 				kvp.Value.RemoveWhere(c => c == null);
+			var dead = new List<Collider2D>();
+			foreach (var k in kindCache.Keys) if (k == null) dead.Add(k);
+			foreach (var k in dead) kindCache.Remove(k);
 		}
 
 		private void AddHitbox(Collider2D collider2D)
@@ -70,6 +77,73 @@ namespace FullKnight.Game
 					colliders[HitboxType.Attack].Add(collider2D);
 				}
 			}
+		}
+
+		/// <summary>
+		/// Return a stable class-level kind string for a combat collider, computed
+		/// from what HK already stores. Rule (first match wins):
+		///   1. DamageHero component on the collider → stripped GameObject name.
+		///      This is the prefab that defines "what hurts the knight" — projectiles,
+		///      per-attack damage volumes, area hazards. Shared across bosses when
+		///      the prefab is shared (e.g. "Needle", "Fireball").
+		///   2. DamageEnemies component → stripped GameObject name. Knight attacks:
+		///      "Slash", "AltSlash", "Fireball(Clone)" → "Fireball", etc.
+		///   3. Walk parents to the nearest HealthManager → that root's stripped name.
+		///      Catches enemy body colliders (the boss collider itself).
+		///   4. Fallback: stripped own name, or "unknown".
+		/// Namespaced with a prefix so knight/enemy/terrain keys never collide.
+		/// </summary>
+		public string GetKind(Collider2D col)
+		{
+			if (col == null) return "unknown";
+			if (kindCache.TryGetValue(col, out string cached)) return cached;
+
+			string result = ClassifyKind(col);
+			kindCache[col] = result;
+			return result;
+		}
+
+		private string ClassifyKind(Collider2D col)
+		{
+			GameObject go = col.gameObject;
+
+			// Knight-owned attack: DamageEnemies sits on the prefab that dealt damage.
+			if (go.GetComponent<DamageEnemies>() != null)
+			{
+				return "knight/" + Strip(go.name);
+			}
+
+			// Enemy-owned damage: DamageHero identifies the hurting prefab (projectile,
+			// attack volume, hazard). Named after the prefab — "Needle", "Fireball".
+			if (go.GetComponent<DamageHero>() != null)
+			{
+				return "enemy/" + Strip(go.name);
+			}
+
+			// Enemy body: walk up to the nearest HealthManager, use its root name.
+			// This is where "which boss is this" lives — on the boss's own collider,
+			// distinct from any projectile it fires.
+			Transform t = go.transform;
+			int depth = 0;
+			while (t != null && depth < 8)
+			{
+				var hm = t.GetComponent<HealthManager>();
+				if (hm != null) return "enemy/" + Strip(t.gameObject.name);
+				t = t.parent;
+				depth++;
+			}
+
+			// Nothing identifying. Use own name so at least identical unknowns group.
+			string n = Strip(go.name);
+			return string.IsNullOrEmpty(n) ? "unknown" : "other/" + n;
+		}
+
+		private static string Strip(string name)
+		{
+			if (string.IsNullOrEmpty(name)) return "";
+			int i = name.IndexOf("(Clone)");
+			if (i >= 0) name = name.Substring(0, i);
+			return name.Trim();
 		}
 	}
 
@@ -137,6 +211,8 @@ namespace FullKnight.Game
 					{ HitboxType.Terrain, new HashSet<Collider2D>() }
 				};
 		}
+
+		public HitboxReader GetReader() => _hitboxReader;
 	}
 
 	public class HitboxObserver
@@ -151,6 +227,7 @@ namespace FullKnight.Game
 		public struct SplitObservation
 		{
 			public List<float[]> CombatHitboxes;
+			public List<string> CombatKinds;
 			public List<float[]> TerrainHitboxes;
 			public float KnightWidth;
 			public float KnightHeight;
@@ -159,18 +236,21 @@ namespace FullKnight.Game
 		/// <summary>
 		/// Extract hitbox features split by type.
 		/// Combat (Enemy + Attack): [rel_x, rel_y, width, height, is_trigger, hurts_knight, is_target]
+		/// CombatKinds: parallel string list, one kind-id per combat hitbox.
 		/// Terrain: [rel_x, rel_y, width, height, is_trigger]
 		/// Knight: bounds only (width, height), folded into global state.
 		/// </summary>
 		public SplitObservation GetSplitFeatures()
 		{
 			var hitboxes = _hook.GetHitboxes();
+			var reader = _hook.GetReader();
 			// Prune destroyed colliders to prevent set growth over long episodes
 			foreach (var kvp in hitboxes)
 				kvp.Value.RemoveWhere(c => c == null);
 			var knightPos = HeroController.instance.transform.position;
 
 			var combat = new List<float[]>();
+			var combatKinds = new List<string>();
 			var terrain = new List<float[]>();
 			float knightW = 0f, knightH = 0f;
 
@@ -200,6 +280,7 @@ namespace FullKnight.Game
 						float hurtsKnight = kvp.Key == HitboxType.Enemy ? 1f : 0f;
 						float isTarget = kvp.Key == HitboxType.Enemy ? 1f : 0f;
 						combat.Add(new float[] { relX, relY, w, h, isTrigger, hurtsKnight, isTarget });
+						combatKinds.Add(reader != null ? reader.GetKind(col) : "unknown");
 					}
 					else if (kvp.Key == HitboxType.Terrain)
 					{
@@ -211,6 +292,7 @@ namespace FullKnight.Game
 			return new SplitObservation
 			{
 				CombatHitboxes = combat,
+				CombatKinds = combatKinds,
 				TerrainHitboxes = terrain,
 				KnightWidth = knightW,
 				KnightHeight = knightH

@@ -4,6 +4,7 @@ import numpy as np
 import websockets
 
 from env import HKEnv
+from vocab import KindVocab
 
 
 class VecEnv:
@@ -16,6 +17,7 @@ class VecEnv:
         self.connected = [asyncio.Event() for _ in range(self.n_envs)]
         self._ws_connections = [None] * self.n_envs
         self._server = None
+        self.vocab = KindVocab(max_size=config.kind_vocab_size)
 
     async def start_server(self):
         """Start WebSocket server and wait for all N connections."""
@@ -61,7 +63,8 @@ class VecEnv:
         return idx, dt, result
 
     async def reset_all(self):
-        """Reset all envs. Returns batched (combat_hb, combat_mask, terrain_hb, terrain_mask, global_states)."""
+        """Reset all envs. Returns batched
+        (combat_hb, combat_mask, combat_kinds, terrain_hb, terrain_mask, global_states)."""
         t0 = time.perf_counter()
         timed = await asyncio.gather(*[
             self._timed_op("reset", i, env.reset()) for i, env in enumerate(self.envs)
@@ -74,7 +77,8 @@ class VecEnv:
     async def step_all(self, actions):
         """Step all envs in parallel.
         actions: list of N action_vecs, each [movement, direction, action, jump].
-        Returns (combat_hb, combat_mask, terrain_hb, terrain_mask, global_states, damage_landed, hits_taken, step_game_times).
+        Returns (combat_hb, combat_mask, combat_kinds, terrain_hb, terrain_mask,
+                 global_states, damage_landed, hits_taken, step_game_times, step_real_times).
         """
         t0 = time.perf_counter()
         timed = await asyncio.gather(*[
@@ -84,9 +88,11 @@ class VecEnv:
 
         sorted_timed = sorted(timed, key=lambda x: x[0])
         results = [r for _, _, r in sorted_timed]
-        combat_lists, terrain_lists, gs_list, damage_landed, hits_taken, step_game_times, step_real_times = zip(*results)
+        (combat_lists, terrain_lists, gs_list, combat_kind_lists,
+         damage_landed, hits_taken, step_game_times, step_real_times) = zip(*results)
 
-        obs_batch = self._batch_observations(list(zip(combat_lists, terrain_lists, gs_list)))
+        obs_batch = self._batch_observations(list(zip(
+            combat_lists, terrain_lists, gs_list, combat_kind_lists)))
         damage_landed = np.array(damage_landed, dtype=np.float32)
         hits_taken = np.array(hits_taken, dtype=np.float32)
         step_game_times = np.array(step_game_times, dtype=np.float32)
@@ -115,13 +121,15 @@ class VecEnv:
     def _batch_observations(self, obs_list):
         """Pad hitbox lists and stack into tensors.
 
-        obs_list: list of (combat_hb, terrain_hb, global_state) tuples.
-        Returns (combat_hb_batch, combat_mask, terrain_hb_batch, terrain_mask, gs_batch)
-        as numpy arrays.
+        obs_list: list of (combat_hb, terrain_hb, global_state, combat_kinds) tuples.
+        Returns (combat_hb_batch, combat_mask, combat_kind_ids,
+                 terrain_hb_batch, terrain_mask, gs_batch).
+        combat_kind_ids: int32 (B, max_combat); padding rows are 0 ("unknown" id).
         """
         combat_lists = [obs[0] for obs in obs_list]
         terrain_lists = [obs[1] for obs in obs_list]
         gs_list = [obs[2] for obs in obs_list]
+        kind_lists = [obs[3] if len(obs) > 3 else [] for obs in obs_list]
 
         B = len(obs_list)
 
@@ -131,11 +139,15 @@ class VecEnv:
 
         combat_batch = np.zeros((B, max_combat, self.config.combat_feature_dim), dtype=np.float32)
         combat_mask = np.zeros((B, max_combat), dtype=np.float32)
+        combat_kind_ids = np.zeros((B, max_combat), dtype=np.int32)
         for i, hb in enumerate(combat_lists):
             n = len(hb)
             if n > 0:
                 combat_batch[i, :n, :] = hb
                 combat_mask[i, :n] = 1.0
+                ks = kind_lists[i]
+                if ks:
+                    combat_kind_ids[i, :n] = self.vocab.encode_list(ks[:n])
 
         # Pad terrain hitboxes
         max_terrain = max((len(t) for t in terrain_lists), default=0)
@@ -151,4 +163,4 @@ class VecEnv:
 
         gs_batch = np.stack(gs_list, axis=0)
 
-        return combat_batch, combat_mask, terrain_batch, terrain_mask, gs_batch
+        return combat_batch, combat_mask, combat_kind_ids, terrain_batch, terrain_mask, gs_batch

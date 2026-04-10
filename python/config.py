@@ -40,6 +40,10 @@ class Config:
     seq_len: int = 16           # truncated BPTT chunk length
     chunks_per_batch: int = 8   # chunks per minibatch (effective batch = chunks_per_batch * seq_len)
 
+    # Kind-id embedding (per-hitbox semantic identity, fed into combat encoder)
+    kind_vocab_size: int = 512  # cap on distinct kind strings; overflow → "unknown" (loud warning)
+    kind_embed_dim: int = 16    # embedding dim concatenated into each combat hitbox feature
+
     # Action dims
     movement_n: int = 3   # left, right, none
     direction_n: int = 3  # up, down, none

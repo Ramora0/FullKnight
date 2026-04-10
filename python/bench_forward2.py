@@ -34,6 +34,7 @@ def bench(label, fn):
 print("=== Test 1: Baseline (pre-allocated, fixed shape, no sync) ===")
 combat_hb = torch.randn(B, 20, config.combat_feature_dim, device=device)
 combat_mask = torch.ones(B, 20, device=device)
+combat_kind_ids = torch.zeros(B, 20, dtype=torch.long, device=device)
 terrain_hb = torch.randn(B, 30, config.terrain_feature_dim, device=device)
 terrain_mask = torch.ones(B, 30, device=device)
 gs = torch.randn(B, config.global_state_dim, device=device)
@@ -41,13 +42,13 @@ gs[:, 7:] = (gs[:, 7:] > 0).float()
 
 with torch.no_grad():
     bench("pre-alloc fixed", lambda: model.get_action_and_value(
-        combat_hb, combat_mask, terrain_hb, terrain_mask, gs))
+        combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, gs))
 
 
 print("\n=== Test 2: Pre-allocated, fixed shape, WITH .cpu().numpy() sync each call ===")
 def test2():
     actions, lp, _, va, vd, _ = model.get_action_and_value(
-        combat_hb, combat_mask, terrain_hb, terrain_mask, gs)
+        combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, gs)
     {k: v.cpu().numpy() for k, v in actions.items()}
     lp.cpu().numpy()
     va.cpu().numpy()
@@ -67,10 +68,11 @@ gs_np = gs.cpu().numpy()
 def test3():
     c = torch.from_numpy(chb_np).float().to(device)
     m = torch.from_numpy(cm_np).float().to(device)
+    ckid = torch.zeros_like(m, dtype=torch.long)
     t = torch.from_numpy(thb_np).float().to(device)
     tm_ = torch.from_numpy(tm_np).float().to(device)
     g = torch.from_numpy(gs_np).float().to(device)
-    actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, t, tm_, g)
+    actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, ckid, t, tm_, g)
     {k: v.cpu().numpy() for k, v in actions.items()}
     lp.cpu().numpy()
     va.cpu().numpy()
@@ -102,10 +104,11 @@ def test4():
     call_idx[0] += 1
     c = torch.from_numpy(chb).float().to(device)
     m = torch.from_numpy(cm).float().to(device)
+    ckid = torch.zeros_like(m, dtype=torch.long)
     t = torch.from_numpy(thb).float().to(device)
     tm2 = torch.from_numpy(tm_).float().to(device)
     g2 = torch.from_numpy(g).float().to(device)
-    actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, t, tm2, g2)
+    actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, ckid, t, tm2, g2)
     {k: v.cpu().numpy() for k, v in actions.items()}
     lp.cpu().numpy()
     va.cpu().numpy()
@@ -124,10 +127,11 @@ def test5_iter():
     call_idx[0] += 1
     c = torch.from_numpy(chb).float().to(device)
     m = torch.from_numpy(cm).float().to(device)
+    ckid = torch.zeros_like(m, dtype=torch.long)
     t = torch.from_numpy(thb).float().to(device)
     tm2 = torch.from_numpy(tm_).float().to(device)
     g2 = torch.from_numpy(g).float().to(device)
-    actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, t, tm2, g2)
+    actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, ckid, t, tm2, g2)
     {k: v.cpu().numpy() for k, v in actions.items()}
     lp.cpu().numpy()
     va.cpu().numpy()
@@ -150,11 +154,12 @@ with torch.no_grad():
         chb, cm, thb, tm_, g = make_numpy_obs(i)
         c = torch.from_numpy(chb).float().to(device)
         m = torch.from_numpy(cm).float().to(device)
+        ckid = torch.zeros_like(m, dtype=torch.long)
         t = torch.from_numpy(thb).float().to(device)
         tm2 = torch.from_numpy(tm_).float().to(device)
         g2 = torch.from_numpy(g).float().to(device)
         s.record()
-        actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, t, tm2, g2)
+        actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, ckid, t, tm2, g2)
         e.record()
         {k: v.cpu().numpy() for k, v in actions.items()}
         lp.cpu().numpy()

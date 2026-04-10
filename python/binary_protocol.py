@@ -43,8 +43,9 @@ def pack_resume():
 # --- Unpack (C# -> Python) ---
 
 def unpack_obs(data, offset=1):
-    """Unpack observation fields (combat_hb, terrain_hb, global_state) from binary.
-    Returns (combat_hb, terrain_hb, global_state, new_offset)."""
+    """Unpack observation float fields (combat_hb, terrain_hb, global_state).
+    Returns (combat_hb, terrain_hb, global_state, n_combat, new_offset).
+    Kind strings are appended after step metadata; use unpack_kinds to read them."""
     n_combat, n_terrain = struct.unpack_from('<HH', data, offset)
     offset += 4
 
@@ -59,17 +60,32 @@ def unpack_obs(data, offset=1):
     global_state = np.frombuffer(data, dtype='<f4', count=GLOBAL_DIM, offset=offset).copy()
     offset += GLOBAL_DIM * 4
 
-    return combat_hb, terrain_hb, global_state, offset
+    return combat_hb, terrain_hb, global_state, n_combat, offset
+
+def unpack_kinds(data, offset, n):
+    """Read n kind strings (u8 length + UTF-8 bytes each)."""
+    kinds = []
+    for _ in range(n):
+        ln = data[offset]
+        offset += 1
+        kinds.append(bytes(data[offset:offset + ln]).decode('utf-8'))
+        offset += ln
+    return kinds, offset
 
 def unpack_step(data):
-    """Unpack a step response. Returns (combat_hb, terrain_hb, gs, damage_landed, hits_taken, game_time, real_time, done)."""
-    combat_hb, terrain_hb, gs, offset = unpack_obs(data)
+    """Unpack a step response.
+    Returns (combat_hb, terrain_hb, gs, combat_kinds, damage_landed, hits_taken,
+             game_time, real_time, done)."""
+    combat_hb, terrain_hb, gs, n_combat, offset = unpack_obs(data)
     damage_landed, hits_taken, game_time, real_time = struct.unpack_from('<ffff', data, offset)
     offset += 16
     done = data[offset] != 0
-    return combat_hb, terrain_hb, gs, damage_landed, hits_taken, game_time, real_time, done
+    offset += 1
+    combat_kinds, offset = unpack_kinds(data, offset, n_combat)
+    return combat_hb, terrain_hb, gs, combat_kinds, damage_landed, hits_taken, game_time, real_time, done
 
 def unpack_reset(data):
-    """Unpack a reset response. Returns (combat_hb, terrain_hb, gs)."""
-    combat_hb, terrain_hb, gs, _ = unpack_obs(data)
-    return combat_hb, terrain_hb, gs
+    """Unpack a reset response. Returns (combat_hb, terrain_hb, gs, combat_kinds)."""
+    combat_hb, terrain_hb, gs, n_combat, offset = unpack_obs(data)
+    combat_kinds, _ = unpack_kinds(data, offset, n_combat)
+    return combat_hb, terrain_hb, gs, combat_kinds

@@ -14,6 +14,7 @@ from config import Config
 from ppo import PPO
 from instance_manager import InstanceManager
 from env import HKEnv
+from vocab import KindVocab
 
 
 async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
@@ -27,9 +28,10 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     config.time_scale = time_scale
     config.frames_per_wait = train_game_time // time_scale
 
-    # Load agent
+    # Load agent (vocab loaded from checkpoint to keep embedding rows aligned)
     agent = PPO(config)
-    agent.load_checkpoint(checkpoint_path)
+    vocab = KindVocab(max_size=config.kind_vocab_size)
+    agent.load_checkpoint(checkpoint_path, vocab=vocab)
     agent.policy.eval()
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Level: {level} | Time scale: {time_scale}x | frames_per_wait: {config.frames_per_wait} | Deterministic: {deterministic}")
@@ -66,7 +68,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     print("Game connected!")
 
     # Reset with eval mode (real HP, boss can die)
-    obs = await env.reset(eval_mode=True)
+    obs = await env.reset(eval_mode=True)  # (combat_hb, terrain_hb, gs, combat_kinds)
     # Capture max HP/boss_hp from first obs (right after reset = full health)
     max_knight_hp = obs[2][2]   # global_state index 2
     max_boss_hp = obs[2][4]     # global_state index 4
@@ -94,9 +96,9 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
             # Spoof HP so agent sees max values like during training
             obs[2][2] = max_knight_hp
             obs[2][4] = max_boss_hp
-            action_vec, hx = get_action(agent, obs, config, deterministic, hx)
+            action_vec, hx = get_action(agent, obs, config, deterministic, hx, vocab)
 
-            combat_hb, terrain_hb, gs, damage, hits, _, _, done = await env.step_eval(action_vec)
+            combat_hb, terrain_hb, gs, combat_kinds, damage, hits, _, _, done = await env.step_eval(action_vec)
 
             total_damage += damage
             total_hits += int(hits)
@@ -127,7 +129,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
                     await asyncio.sleep(15)
                 break
 
-            obs = (combat_hb, terrain_hb, gs)
+            obs = (combat_hb, terrain_hb, gs, combat_kinds)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
@@ -154,16 +156,18 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
         await server.wait_closed()
 
 
-def batch_obs(combat_hb_arr, terrain_hb_arr, gs, config):
+def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, config):
     """Convert single-env obs into batched numpy arrays (B=1)."""
     n_combat = max(len(combat_hb_arr), 1)
     n_terrain = max(len(terrain_hb_arr), 1)
 
     chb = np.zeros((1, n_combat, config.combat_feature_dim), dtype=np.float32)
     cm = np.zeros((1, n_combat), dtype=np.float32)
+    ckid = np.zeros((1, n_combat), dtype=np.int64)
     if len(combat_hb_arr) > 0:
         chb[0, :len(combat_hb_arr)] = combat_hb_arr
         cm[0, :len(combat_hb_arr)] = 1.0
+        ckid[0, :len(combat_hb_arr)] = combat_kind_ids_arr
 
     thb = np.zeros((1, n_terrain, config.terrain_feature_dim), dtype=np.float32)
     tm = np.zeros((1, n_terrain), dtype=np.float32)
@@ -172,16 +176,18 @@ def batch_obs(combat_hb_arr, terrain_hb_arr, gs, config):
         tm[0, :len(terrain_hb_arr)] = 1.0
 
     gs_batch = gs.reshape(1, -1)
-    return chb, cm, thb, tm, gs_batch
+    return chb, cm, ckid, thb, tm, gs_batch
 
 
 @torch.no_grad()
-def get_action(agent, obs, config, deterministic, hx):
+def get_action(agent, obs, config, deterministic, hx, vocab):
     """Get action from the policy using frozen normalizers (no stats update).
     Returns (action_vec, hx_new).
     """
-    combat_hb_list, terrain_hb_list, gs = obs
-    chb, cm, thb, tm, gs_batch = batch_obs(combat_hb_list, terrain_hb_list, gs, config)
+    combat_hb_list, terrain_hb_list, gs, combat_kinds = obs
+    kind_ids = vocab.encode_list(combat_kinds)
+    chb, cm, ckid, thb, tm, gs_batch = batch_obs(
+        combat_hb_list, terrain_hb_list, gs, kind_ids, config)
 
     # Normalize global state (continuous features only, flags pass through)
     n_cont = config.global_state_dim - config.n_binary_flags
@@ -202,13 +208,14 @@ def get_action(agent, obs, config, deterministic, hx):
     device = agent.device
     chb_t = torch.from_numpy(chb).float().to(device)
     cm_t = torch.from_numpy(cm).float().to(device)
+    ckid_t = torch.from_numpy(ckid).long().to(device)
     thb_t = torch.from_numpy(thb).float().to(device)
     tm_t = torch.from_numpy(tm).float().to(device)
     gs_t = torch.from_numpy(gs_norm).float().to(device)
     hx_t = torch.from_numpy(hx).float().to(device)
 
     if deterministic:
-        h, hx_new = agent.policy._encode(chb_t, cm_t, thb_t, tm_t, gs_t, hx=hx_t)
+        h, hx_new = agent.policy._encode(chb_t, cm_t, ckid_t, thb_t, tm_t, gs_t, hx=hx_t)
         logits_m = agent.policy.head_movement(h)
         logits_d = agent.policy.head_direction(h)
         logits_a = agent.policy.head_action(h).clone()
@@ -221,7 +228,7 @@ def get_action(agent, obs, config, deterministic, hx):
         a_j = logits_j.argmax(-1).item()
     else:
         actions, _, _, _, _, hx_new = agent.policy.get_action_and_value(
-            chb_t, cm_t, thb_t, tm_t, gs_t, hx=hx_t
+            chb_t, cm_t, ckid_t, thb_t, tm_t, gs_t, hx=hx_t
         )
         a_m = actions["movement"].item()
         a_d = actions["direction"].item()
