@@ -88,6 +88,12 @@ namespace FullKnight.Environment
 
 			yield return SceneHooks.LoadBossScene(_level);
 
+			// Force-recreate the hitbox reader for the boss scene. The activeSceneChanged
+			// event is unreliable under multi-instance load (some instances miss it), so
+			// we explicitly rebuild the reader here and yield a frame for Start() to scan.
+			_hitboxObserver.RecreateReader();
+			yield return null;
+
 			InitBossRefs();
 			_knightMaxHP = PlayerData.instance.maxHealth;
 
@@ -151,8 +157,20 @@ namespace FullKnight.Environment
 			if (!_combatStarted)
 			{
 				Time.timeScale = 20f;
+				int introFrames = 0;
 				while (!HasActiveCombatHitboxes())
+				{
+					introFrames++;
+					if (introFrames > 5000)
+					{
+						var hb = _hitboxObserver.GetHitboxes();
+						Log($"IntroSkip: TIMEOUT after {introFrames} frames — "
+							+ $"enemy={hb[HitboxType.Enemy].Count} terrain={hb[HitboxType.Terrain].Count} "
+							+ $"scene={UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}");
+						break;
+					}
 					yield return null;
+				}
 				_combatStarted = true;
 				// Clear any accidental reward signals from intro
 				_hitsTakenInStep = 0;
@@ -212,6 +230,8 @@ namespace FullKnight.Environment
 			yield break;
 		}
 
+		private void Log(string msg) => FullKnight.Instance.Log($"[TrainingEnv] {msg}");
+
 		protected override IEnumerator Setup()
 		{
 			Connect();
@@ -219,6 +239,7 @@ namespace FullKnight.Environment
 			Message message = socket.UnreadMessages.Dequeue();
 			if (message.type != "init")
 			{
+				Log($"Setup: expected init, got '{message.type}' — retrying");
 				yield return Setup();
 				yield break;
 			}

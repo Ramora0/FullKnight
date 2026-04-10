@@ -87,8 +87,10 @@ class FullKnightActorCritic(nn.Module):
             nn.ReLU(),
         )
 
-        # GRU for temporal memory (between trunk and heads)
-        self.gru = nn.GRUCell(config.hidden_dim, config.hidden_dim)
+        # GRU for temporal memory (between trunk and heads).
+        # Use nn.GRU (cuDNN-fused, processes whole sequence in one kernel)
+        # rather than nn.GRUCell so training over L-step chunks vectorizes.
+        self.gru = nn.GRU(config.hidden_dim, config.hidden_dim, num_layers=1, batch_first=True)
         self.gru_ln = nn.LayerNorm(config.hidden_dim)
 
         # Actor heads
@@ -123,10 +125,10 @@ class FullKnightActorCritic(nn.Module):
                 nn.init.constant_(module.bias, 0.0)
 
         # GRU: small init so residual starts as near-passthrough
-        nn.init.orthogonal_(self.gru.weight_ih, gain=0.1)
-        nn.init.orthogonal_(self.gru.weight_hh, gain=0.1)
-        nn.init.constant_(self.gru.bias_ih, 0.0)
-        nn.init.constant_(self.gru.bias_hh, 0.0)
+        nn.init.orthogonal_(self.gru.weight_ih_l0, gain=0.1)
+        nn.init.orthogonal_(self.gru.weight_hh_l0, gain=0.1)
+        nn.init.constant_(self.gru.bias_ih_l0, 0.0)
+        nn.init.constant_(self.gru.bias_hh_l0, 0.0)
 
         # Bias action head toward attack_tap (idx 0) at init
         with torch.no_grad():
@@ -137,15 +139,20 @@ class FullKnightActorCritic(nn.Module):
         combat_emb = self.combat_encoder(combat_hb, combat_mask, global_emb)
         terrain_emb = self.terrain_encoder(terrain_hb, terrain_mask, global_emb)
         combined = torch.cat([combat_emb, terrain_emb, global_emb], dim=-1)
-        trunk_out = self.trunk(combined)
+        trunk_out = self.trunk(combined)  # (B, hidden)
 
-        # GRU with residual connection
+        # GRU step (seq_len=1) with residual connection.
+        # nn.GRU expects (B, L, D) input and (num_layers, B, D) hidden.
         if hx is None:
             hx = torch.zeros_like(trunk_out)
-        gru_out = self.gru(trunk_out, hx)
+        gru_in = trunk_out.unsqueeze(1)              # (B, 1, hidden)
+        hx_in = hx.unsqueeze(0).contiguous()         # (1, B, hidden)
+        gru_seq, hx_layered = self.gru(gru_in, hx_in)
+        gru_out = gru_seq.squeeze(1)                 # (B, hidden)
+        hx_new = hx_layered.squeeze(0)               # (B, hidden)
         features = trunk_out + self.gru_ln(gru_out)
 
-        return features, gru_out
+        return features, hx_new
 
     def _extract_validity(self, global_state):
         """Extract the 9 validity flags from global_state."""
@@ -259,6 +266,10 @@ class FullKnightActorCritic(nn.Module):
                          global_state, hx, actions):
         """Truncated BPTT over a chunk of L timesteps.
 
+        Vectorized: encoders/trunk/heads/critic all process (B*L) in one shot,
+        and the GRU uses cuDNN's fused sequence kernel. Only the GRU itself
+        retains a temporal dependency.
+
         Args:
             combat_hb:    (B, L, max_combat, feat)
             combat_mask:  (B, L, max_combat)
@@ -269,31 +280,66 @@ class FullKnightActorCritic(nn.Module):
             actions:      dict of (B, L) LongTensors
 
         Returns: log_probs (B,L), entropies (B,L), values_atk (B,L), values_def (B,L),
-                 gru_info dict with 'gru_norm' and 'trunk_norm' scalars
+                 gru_info dict
         """
-        L = global_state.shape[1]
-        all_lp, all_ent, all_vatk, all_vdef = [], [], [], []
-        gru_norms = []
+        B, L = global_state.shape[:2]
 
-        for t in range(L):
-            step_actions = {k: v[:, t] for k, v in actions.items()}
-            _, lp, ent, vatk, vdef, hx = self.get_action_and_value(
-                combat_hb[:, t], combat_mask[:, t],
-                terrain_hb[:, t], terrain_mask[:, t],
-                global_state[:, t], hx=hx, actions=step_actions,
-            )
-            all_lp.append(lp)
-            all_ent.append(ent)
-            all_vatk.append(vatk)
-            all_vdef.append(vdef)
-            gru_norms.append(hx.detach().norm(dim=-1).mean())
+        # --- Phase 1: encoders + trunk vectorized over (B*L) ---
+        flat_combat_hb = combat_hb.reshape(B * L, *combat_hb.shape[2:])
+        flat_combat_mask = combat_mask.reshape(B * L, combat_mask.shape[-1])
+        flat_terrain_hb = terrain_hb.reshape(B * L, *terrain_hb.shape[2:])
+        flat_terrain_mask = terrain_mask.reshape(B * L, terrain_mask.shape[-1])
+        flat_global = global_state.reshape(B * L, global_state.shape[-1])
 
-        gru_info = {'gru_norm': torch.stack(gru_norms).mean().item()}
+        flat_global_emb = self.global_encoder(flat_global)
+        flat_combat_emb = self.combat_encoder(flat_combat_hb, flat_combat_mask, flat_global_emb)
+        flat_terrain_emb = self.terrain_encoder(flat_terrain_hb, flat_terrain_mask, flat_global_emb)
+        flat_combined = torch.cat([flat_combat_emb, flat_terrain_emb, flat_global_emb], dim=-1)
+        flat_trunk = self.trunk(flat_combined)                       # (B*L, hidden)
+        trunk_seq = flat_trunk.view(B, L, -1)                        # (B, L, hidden)
 
-        return (
-            torch.stack(all_lp, dim=1),
-            torch.stack(all_ent, dim=1),
-            torch.stack(all_vatk, dim=1),
-            torch.stack(all_vdef, dim=1),
-            gru_info,
+        # --- Phase 2: GRU over the full sequence in one cuDNN call ---
+        hx_in = hx.unsqueeze(0).contiguous()                         # (1, B, hidden)
+        gru_seq, _ = self.gru(trunk_seq, hx_in)                      # (B, L, hidden)
+        features_seq = trunk_seq + self.gru_ln(gru_seq)              # residual
+
+        # --- Phase 3: heads + critic vectorized over (B*L) ---
+        flat_features = features_seq.reshape(B * L, -1)
+
+        logits_m = self.head_movement(flat_features)
+        logits_d = self.head_direction(flat_features)
+        logits_a = self.head_action(flat_features).clone()
+        logits_j = self.head_jump(flat_features).clone()
+        logits_a, logits_j = self._mask_logits(logits_a, logits_j, flat_global)
+
+        dist_m = Categorical(logits=logits_m)
+        dist_d = Categorical(logits=logits_d)
+        dist_a = Categorical(logits=logits_a)
+        dist_j = Categorical(logits=logits_j)
+
+        flat_a_m = actions["movement"].reshape(-1)
+        flat_a_d = actions["direction"].reshape(-1)
+        flat_a_a = actions["action"].reshape(-1)
+        flat_a_j = actions["jump"].reshape(-1)
+
+        log_prob_flat = (
+            dist_m.log_prob(flat_a_m)
+            + dist_d.log_prob(flat_a_d)
+            + dist_a.log_prob(flat_a_a)
+            + dist_j.log_prob(flat_a_j)
         )
+        entropy_flat = (
+            dist_m.entropy() + dist_d.entropy()
+            + dist_a.entropy() + dist_j.entropy()
+        )
+        v_atk_flat = self.critic_attack(flat_features).squeeze(-1)
+        v_def_flat = self.critic_defense(flat_features).squeeze(-1)
+
+        log_probs = log_prob_flat.view(B, L)
+        entropies = entropy_flat.view(B, L)
+        values_atk = v_atk_flat.view(B, L)
+        values_def = v_def_flat.view(B, L)
+
+        gru_info = {'gru_norm': gru_seq.detach().norm(dim=-1).mean().item()}
+
+        return log_probs, entropies, values_atk, values_def, gru_info
