@@ -1,46 +1,59 @@
-import json
 import numpy as np
+from binary_protocol import (
+    pack_init, pack_reset, pack_action, pack_pause, pack_resume,
+    unpack_reset, unpack_step, MSG_CLOSE,
+)
+import struct
 
 
 class HKEnv:
-    """Wraps a single WebSocket connection to a Hollow Knight game instance."""
+    """Wraps a single WebSocket connection to a Hollow Knight game instance.
+
+    All wire-protocol details (binary packing) are encapsulated here.
+    Callers only see numpy arrays and Python scalars.
+    """
 
     def __init__(self, websocket, config):
         self.ws = websocket
         self.config = config
 
-    async def send_and_recv(self, msg_type, data):
-        message = json.dumps({"type": msg_type, "data": data, "sender": "server"})
-        await self.ws.send(message)
-        response = json.loads(await self.ws.recv())
-        return response
+    async def init(self):
+        """Send init handshake and wait for ack."""
+        await self.ws.send(pack_init())
+        await self.ws.recv()
 
-    async def reset(self):
+    async def reset(self, eval_mode=False):
         """Reset environment. Returns (combat_hb, terrain_hb, global_state)."""
-        resp = await self.send_and_recv("reset", {
-            "level": self.config.level,
-            "frames_per_wait": self.config.frames_per_wait,
-            "time_scale": self.config.time_scale,
-        })
-        return self._parse_obs(resp["data"])
+        await self.ws.send(pack_reset(
+            self.config.level, self.config.frames_per_wait,
+            self.config.time_scale, eval_mode=eval_mode,
+        ))
+        data = await self.ws.recv()
+        return unpack_reset(data)
 
     async def step(self, action_vec):
         """Take a step. action_vec = [movement, direction, action, jump].
-        Returns (combat_hb, terrain_hb, global_state, damage_landed, hits_taken, step_game_time).
+        Returns (combat_hb, terrain_hb, global_state, damage_landed, hits_taken,
+                 step_game_time, step_real_time).
         """
-        resp = await self.send_and_recv("action", {"action_vec": action_vec})
-        d = resp["data"]
-        combat_hb, terrain_hb, gs = self._parse_obs(d)
-        return combat_hb, terrain_hb, gs, d.get("damage_landed", 0), d.get("hits_taken", 0), d.get("step_game_time", 0), d.get("step_real_time", 0)
+        await self.ws.send(pack_action(action_vec))
+        data = await self.ws.recv()
+        combat_hb, terrain_hb, gs, damage_landed, hits_taken, game_time, real_time, done = unpack_step(data)
+        return combat_hb, terrain_hb, gs, damage_landed, hits_taken, game_time, real_time
+
+    async def step_eval(self, action_vec):
+        """Like step() but also returns done flag. For eval mode."""
+        await self.ws.send(pack_action(action_vec))
+        data = await self.ws.recv()
+        return unpack_step(data)
 
     async def pause(self):
-        await self.send_and_recv("pause", {})
+        await self.ws.send(pack_pause())
+        await self.ws.recv()
 
     async def resume(self):
-        await self.send_and_recv("resume", {})
+        await self.ws.send(pack_resume())
+        await self.ws.recv()
 
-    def _parse_obs(self, data):
-        combat_hb = data.get("combat_hitboxes", [])
-        terrain_hb = data.get("terrain_hitboxes", [])
-        gs = np.array(data.get("global_state", [0.0] * self.config.global_state_dim), dtype=np.float32)
-        return combat_hb, terrain_hb, gs
+    async def close(self):
+        await self.ws.send(struct.pack('B', MSG_CLOSE))

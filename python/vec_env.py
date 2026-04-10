@@ -1,5 +1,4 @@
 import asyncio
-import json
 import numpy as np
 import websockets
 
@@ -40,9 +39,7 @@ class VecEnv:
         print(f"Instance {idx} connected.")
 
         # Send init and wait for ack
-        msg = json.dumps({"type": "init", "data": {}, "sender": "server"})
-        await websocket.send(msg)
-        await websocket.recv()  # wait for init ack
+        await self.envs[idx].init()
         self.connected[idx].set()
 
         # Keep connection alive
@@ -115,10 +112,10 @@ class VecEnv:
 
         combat_batch = np.zeros((B, max_combat, self.config.combat_feature_dim), dtype=np.float32)
         combat_mask = np.zeros((B, max_combat), dtype=np.float32)
-        for i, hb_list in enumerate(combat_lists):
-            n = len(hb_list)
+        for i, hb in enumerate(combat_lists):
+            n = len(hb)
             if n > 0:
-                combat_batch[i, :n, :] = np.array(hb_list, dtype=np.float32)
+                combat_batch[i, :n, :] = hb
                 combat_mask[i, :n] = 1.0
 
         # Pad terrain hitboxes
@@ -127,10 +124,10 @@ class VecEnv:
 
         terrain_batch = np.zeros((B, max_terrain, self.config.terrain_feature_dim), dtype=np.float32)
         terrain_mask = np.zeros((B, max_terrain), dtype=np.float32)
-        for i, hb_list in enumerate(terrain_lists):
-            n = len(hb_list)
+        for i, hb in enumerate(terrain_lists):
+            n = len(hb)
             if n > 0:
-                terrain_batch[i, :n, :] = np.array(hb_list, dtype=np.float32)
+                terrain_batch[i, :n, :] = hb
                 terrain_mask[i, :n] = 1.0
 
         gs_batch = np.stack(gs_list, axis=0)

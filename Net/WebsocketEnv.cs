@@ -15,7 +15,11 @@ namespace FullKnight.Net
 		{
 			this.OnMessage += (sender, e) =>
 			{
-				Message m = JsonConvert.DeserializeObject<Message>(e.Data);
+				Message m;
+				if (e.IsBinary)
+					m = BinaryProtocol.Unpack(e.RawData);
+				else
+					m = JsonConvert.DeserializeObject<Message>(e.Data);
 				UnreadMessages.Enqueue(m);
 			};
 		}
@@ -23,16 +27,16 @@ namespace FullKnight.Net
 		public void Send(Message data)
 		{
 			data.sender = "client";
-			string textData = JsonConvert.SerializeObject(data);
-			base.Send(textData);
+			byte[] binaryData = BinaryProtocol.Pack(data);
+			base.Send(binaryData);
 			LastMessageSent = data;
 		}
 
 		public void SendAsync(Message data, System.Action<bool> completed)
 		{
 			data.sender = "client";
-			string textData = JsonConvert.SerializeObject(data);
-			base.SendAsync(textData, completed);
+			byte[] binaryData = BinaryProtocol.Pack(data);
+			base.SendAsync(binaryData, completed);
 			LastMessageSent = data;
 		}
 

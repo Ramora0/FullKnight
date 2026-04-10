@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import json
 import os
 import platform
 import subprocess
@@ -14,6 +13,7 @@ import websockets
 from config import Config
 from ppo import PPO
 from instance_manager import InstanceManager
+from env import HKEnv
 
 
 async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
@@ -40,14 +40,13 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
         print(f"hk_path not found ({launch_path}) — launch Hollow Knight manually.")
 
     # Wait for game to connect
-    game_ws = None
+    env = None
     connected = asyncio.Event()
 
     async def on_connect(websocket):
-        nonlocal game_ws
-        game_ws = websocket
-        await websocket.send(json.dumps({"type": "init", "data": {}, "sender": "server"}))
-        await websocket.recv()
+        nonlocal env
+        env = HKEnv(websocket, config)
+        await env.init()
         connected.set()
         try:
             await asyncio.Future()
@@ -59,19 +58,8 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     await connected.wait()
     print("Game connected!")
 
-    async def send_recv(msg_type, data):
-        await game_ws.send(json.dumps({"type": msg_type, "data": data, "sender": "server"}))
-        return json.loads(await game_ws.recv())
-
     # Reset with eval mode
-    resp = await send_recv("reset", {
-        "level": config.level,
-        "frames_per_wait": config.frames_per_wait,
-        "time_scale": config.time_scale,
-        "eval": True,
-    })
-
-    obs = parse_obs(resp["data"], config)
+    obs = await env.reset(eval_mode=True)
     hx = np.zeros((1, config.hidden_dim), dtype=np.float32)
 
     # Start screen recording
@@ -91,32 +79,24 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
         while True:
             action_vec, hx = get_action(agent, obs, config, deterministic, hx)
 
-            resp = await send_recv("action", {"action_vec": action_vec})
-            d = resp["data"]
+            combat_hb, terrain_hb, gs, damage, hits, _, _, done = await env.step_eval(action_vec)
 
-            damage = d.get("damage_landed", 0) or 0
-            hits = d.get("hits_taken", 0) or 0
             total_damage += damage
-            total_hits += hits
+            total_hits += int(hits)
             step_count += 1
-
-            done = d.get("done", False)
-            info = d.get("info", "")
 
             if step_count % 100 == 0:
                 print(f"  Step {step_count:5d} | Damage dealt: {total_damage:5.1f} | Hits taken: {total_hits}")
 
             if done:
-                result = "WIN" if info == "win" else "LOSS"
                 print(f"\n{'=' * 50}")
-                print(f"  Result:        {result}")
                 print(f"  Steps:         {step_count}")
                 print(f"  Damage dealt:  {total_damage:.1f} nail hits")
                 print(f"  Hits taken:    {total_hits}")
                 print(f"{'=' * 50}")
                 break
 
-            obs = parse_obs(d, config)
+            obs = (combat_hb, terrain_hb, gs)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
@@ -127,7 +107,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
             print(f"Recording saved to: {record}")
 
         try:
-            await game_ws.send(json.dumps({"type": "close", "data": {}, "sender": "server"}))
+            await env.close()
         except Exception:
             pass
         server.close()
@@ -137,29 +117,22 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
             mgr.stop_all()
 
 
-def parse_obs(data, config):
-    combat_hb = data.get("combat_hitboxes", [])
-    terrain_hb = data.get("terrain_hitboxes", [])
-    gs = np.array(data.get("global_state", [0.0] * config.global_state_dim), dtype=np.float32)
-    return combat_hb, terrain_hb, gs
-
-
-def batch_obs(combat_hb_list, terrain_hb_list, gs, config):
+def batch_obs(combat_hb_arr, terrain_hb_arr, gs, config):
     """Convert single-env obs into batched numpy arrays (B=1)."""
-    n_combat = max(len(combat_hb_list), 1)
-    n_terrain = max(len(terrain_hb_list), 1)
+    n_combat = max(len(combat_hb_arr), 1)
+    n_terrain = max(len(terrain_hb_arr), 1)
 
     chb = np.zeros((1, n_combat, config.combat_feature_dim), dtype=np.float32)
     cm = np.zeros((1, n_combat), dtype=np.float32)
-    for i, hb in enumerate(combat_hb_list):
-        chb[0, i] = np.array(hb, dtype=np.float32)
-        cm[0, i] = 1.0
+    if len(combat_hb_arr) > 0:
+        chb[0, :len(combat_hb_arr)] = combat_hb_arr
+        cm[0, :len(combat_hb_arr)] = 1.0
 
     thb = np.zeros((1, n_terrain, config.terrain_feature_dim), dtype=np.float32)
     tm = np.zeros((1, n_terrain), dtype=np.float32)
-    for i, hb in enumerate(terrain_hb_list):
-        thb[0, i] = np.array(hb, dtype=np.float32)
-        tm[0, i] = 1.0
+    if len(terrain_hb_arr) > 0:
+        thb[0, :len(terrain_hb_arr)] = terrain_hb_arr
+        tm[0, :len(terrain_hb_arr)] = 1.0
 
     gs_batch = gs.reshape(1, -1)
     return chb, cm, thb, tm, gs_batch

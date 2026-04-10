@@ -83,6 +83,9 @@ namespace FullKnight.Environment
 			_episodeResult = null;
 			_combatStarted = false;
 
+			// Unpause so scene transition and WaitForSeconds can proceed
+			Time.timeScale = _timeScaleValue;
+
 			yield return SceneHooks.LoadBossScene(_level);
 
 			InitBossRefs();
