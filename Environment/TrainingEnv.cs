@@ -1,10 +1,13 @@
 using System.Collections;
 using System.Collections.Generic;
+using System.Text;
 using FullKnight.Net;
 using FullKnight.Game;
+using HutongGames.PlayMaker;
 using InControl;
 using Modding;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace FullKnight.Environment
 {
@@ -27,6 +30,9 @@ namespace FullKnight.Environment
 
 		// Boss intro skip: keep simulating internally until combat starts
 		private bool _combatStarted;
+
+		// Diagnostics: count resets so logs are correlatable across episodes
+		private int _resetCount;
 
 		private HitboxObserver _hitboxObserver = new();
 		private InputDeviceShim _inputShim = new();
@@ -84,6 +90,9 @@ namespace FullKnight.Environment
 			_episodeDone = false;
 			_episodeResult = null;
 			_combatStarted = false;
+			_resetCount++;
+
+			LogBossDiag($"reset#{_resetCount} PRE-UNLOAD (still in old scene)");
 
 			// Release any inputs held over from the previous episode before the
 			// scene transition unfreezes time — otherwise a stuck "left" or "jump"
@@ -95,6 +104,8 @@ namespace FullKnight.Environment
 
 			yield return SceneHooks.LoadBossScene(_level);
 
+			LogBossDiag($"reset#{_resetCount} POST-SCENELOAD (before reader recreate)");
+
 			// Force-recreate the hitbox reader for the boss scene. The activeSceneChanged
 			// event is unreliable under multi-instance load (some instances miss it), so
 			// we explicitly rebuild the reader here and yield a frame for Start() to scan.
@@ -102,6 +113,7 @@ namespace FullKnight.Environment
 			yield return null;
 
 			InitBossRefs();
+			LogBossDiag($"reset#{_resetCount} POST-INITBOSSREFS");
 			_knightMaxHP = PlayerData.instance.maxHealth;
 
 			UnhookDamage();
@@ -165,21 +177,31 @@ namespace FullKnight.Environment
 			// If boss intro is still playing, fast-forward until combat starts
 			if (!_combatStarted)
 			{
+				LogBossDiag($"reset#{_resetCount} INTRO-SKIP START");
 				Time.timeScale = 20f;
 				int introFrames = 0;
 				while (!HasActiveCombatHitboxes())
 				{
 					introFrames++;
+					// Dense early logging (every 10 frames for first 200, then every 100)
+					// lets us pinpoint the exact frame the boss glitches to the ceiling.
+					bool shouldDiag = introFrames <= 200
+						? (introFrames % 10 == 0)
+						: (introFrames % 100 == 0);
+					if (shouldDiag)
+						LogBossDiag($"reset#{_resetCount} INTRO-SKIP f{introFrames}");
 					if (introFrames > 5000)
 					{
 						var hb = _hitboxObserver.GetHitboxes();
 						Log($"IntroSkip: TIMEOUT after {introFrames} frames — "
 							+ $"enemy={hb[HitboxType.Enemy].Count} terrain={hb[HitboxType.Terrain].Count} "
 							+ $"scene={UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}");
+						LogBossDiag($"reset#{_resetCount} INTRO-SKIP TIMEOUT");
 						break;
 					}
 					yield return null;
 				}
+				LogBossDiag($"reset#{_resetCount} INTRO-SKIP DONE (after {introFrames} frames)");
 				_combatStarted = true;
 				// Clear any accidental reward signals from intro
 				_hitsTakenInStep = 0;
@@ -242,6 +264,131 @@ namespace FullKnight.Environment
 		}
 
 		private void Log(string msg) => FullKnight.Instance.Log($"[TrainingEnv] {msg}");
+
+		/// <summary>
+		/// Dump every piece of state useful for diagnosing boss-reset bugs:
+		/// active scene, knight position, boss GameObject/HealthManager status,
+		/// FSM active state name, enemy hitbox inventory, BossSceneController
+		/// state, key PlayerData flags. Called at multiple points during Reset
+		/// and the intro-skip loop so log timelines tell the whole story.
+		/// </summary>
+		private void LogBossDiag(string tag)
+		{
+			var sb = new StringBuilder();
+			sb.Append("[DIAG ").Append(tag).Append("]\n");
+			try
+			{
+				var scene = SceneManager.GetActiveScene();
+				sb.Append("  scene=").Append(scene.name)
+				  .Append(" loaded=").Append(scene.isLoaded)
+				  .Append(" time=").Append(Time.timeScale.ToString("0.00"))
+				  .Append(" combatStarted=").Append(_combatStarted)
+				  .Append('\n');
+
+				var hc = HeroController.instance;
+				if (hc != null)
+				{
+					var p = hc.transform.position;
+					sb.Append("  knight pos=(").Append(p.x.ToString("0.00")).Append(',')
+					  .Append(p.y.ToString("0.00")).Append(")\n");
+				}
+				else sb.Append("  knight=NULL\n");
+
+				var bsc = BossSceneController.Instance;
+				if (bsc != null)
+				{
+					sb.Append("  BossSceneController: bosses.len=")
+					  .Append(bsc.bosses != null ? bsc.bosses.Length : -1)
+					  .Append(" BossLevel=").Append(bsc.BossLevel)
+					  .Append('\n');
+					if (bsc.bosses != null)
+					{
+						for (int i = 0; i < bsc.bosses.Length; i++)
+						{
+							var b = bsc.bosses[i];
+							if (b == null) { sb.Append("    [").Append(i).Append("] NULL\n"); continue; }
+							var go = b.gameObject;
+							sb.Append("    [").Append(i).Append("] name=").Append(go.name)
+							  .Append(" active=").Append(go.activeInHierarchy)
+							  .Append(" pos=(").Append(go.transform.position.x.ToString("0.00"))
+							  .Append(',').Append(go.transform.position.y.ToString("0.00")).Append(")");
+							var hm = go.GetComponent<HealthManager>();
+							if (hm != null)
+								sb.Append(" hp=").Append(hm.hp).Append(" dead=").Append(hm.isDead)
+								  .Append(" invincible=").Append(hm.IsInvincible);
+							var rb = go.GetComponent<Rigidbody2D>();
+							if (rb != null)
+								sb.Append(" vel=(").Append(rb.velocity.x.ToString("0.00"))
+								  .Append(',').Append(rb.velocity.y.ToString("0.00")).Append(")");
+							sb.Append('\n');
+							// Dump every PlayMakerFSM on boss + its children so we can
+							// see which state the sleep/wake machine is sitting in.
+							var fsms = go.GetComponentsInChildren<PlayMakerFSM>(true);
+							foreach (var fsm in fsms)
+							{
+								sb.Append("      fsm='").Append(fsm.FsmName)
+								  .Append("' state='")
+								  .Append(fsm.ActiveStateName ?? "<none>")
+								  .Append("' on ").Append(fsm.gameObject.name).Append('\n');
+							}
+						}
+					}
+				}
+				else sb.Append("  BossSceneController.Instance=NULL\n");
+
+				// Hitbox inventory: what does the observer currently see?
+				var hitboxes = _hitboxObserver.GetHitboxes();
+				int enemyCount = 0, attackCount = 0, terrainCount = 0;
+				if (hitboxes != null)
+				{
+					if (hitboxes.ContainsKey(HitboxType.Enemy)) enemyCount = hitboxes[HitboxType.Enemy].Count;
+					if (hitboxes.ContainsKey(HitboxType.Attack)) attackCount = hitboxes[HitboxType.Attack].Count;
+					if (hitboxes.ContainsKey(HitboxType.Terrain)) terrainCount = hitboxes[HitboxType.Terrain].Count;
+				}
+				sb.Append("  hitboxes: enemy=").Append(enemyCount)
+				  .Append(" attack=").Append(attackCount)
+				  .Append(" terrain=").Append(terrainCount).Append('\n');
+				// Enumerate live enemy hitboxes with positions — this is the clearest
+				// signal of "where did the boss actually go" independent of FSM guesses.
+				if (hitboxes != null && hitboxes.ContainsKey(HitboxType.Enemy))
+				{
+					int i = 0;
+					foreach (var col in hitboxes[HitboxType.Enemy])
+					{
+						if (col == null) continue;
+						var c = col.bounds.center;
+						sb.Append("    enemy[").Append(i++).Append("] ")
+						  .Append(col.gameObject.name)
+						  .Append(" active=").Append(col.isActiveAndEnabled)
+						  .Append(" pos=(").Append(c.x.ToString("0.00"))
+						  .Append(',').Append(c.y.ToString("0.00"))
+						  .Append(") size=(").Append(col.bounds.size.x.ToString("0.00"))
+						  .Append(',').Append(col.bounds.size.y.ToString("0.00"))
+						  .Append(")\n");
+						if (i >= 12) { sb.Append("    ...\n"); break; }
+					}
+				}
+
+				// PlayerData flags that can influence whether a boss intro plays
+				// (if HK reads them for sleep/wake FSMs in the HoG variant).
+				var pd = PlayerData.instance;
+				if (pd != null)
+				{
+					sb.Append("  pd:");
+					foreach (var key in new[] { "killedBigFly", "killedGruzMother", "newGruzMother" })
+					{
+						try { sb.Append(' ').Append(key).Append('=').Append(pd.GetBool(key)); }
+						catch { sb.Append(' ').Append(key).Append("=?"); }
+					}
+					sb.Append('\n');
+				}
+			}
+			catch (System.Exception e)
+			{
+				sb.Append("  EXCEPTION: ").Append(e.GetType().Name).Append(": ").Append(e.Message).Append('\n');
+			}
+			FullKnight.Instance.Log(sb.ToString());
+		}
 
 		protected override IEnumerator Setup()
 		{
