@@ -212,17 +212,13 @@ async def train(config: Config):
 
             # Per-boss adaptive D update. Only bosses represented in env_boss
             # this epoch contribute; bosses with no envs are left untouched.
-            total_landed = float(damage_landed_arr.sum())
-            total_taken = float(hits_taken_arr.sum())
-            per_boss_landed = {}
-            per_boss_taken = {}
             for boss in set(env_boss):
                 env_mask = np.array([b == boss for b in env_boss])
-                per_boss_landed[boss] = float(damage_landed_arr[:, env_mask].sum())
-                per_boss_taken[boss] = float(hits_taken_arr[:, env_mask].sum())
+                landed_b = float(damage_landed_arr[:, env_mask].sum())
+                taken_b = float(hits_taken_arr[:, env_mask].sum())
                 bs = boss_state[boss]
-                bs["landed_window"].append(per_boss_landed[boss])
-                bs["taken_window"].append(per_boss_taken[boss])
+                bs["landed_window"].append(landed_b)
+                bs["taken_window"].append(taken_b)
                 window_landed = sum(bs["landed_window"])
                 window_taken = sum(bs["taken_window"])
                 if window_taken > 0 and window_landed > 0:
@@ -300,11 +296,21 @@ async def train(config: Config):
             total_steps = (epoch + 1) * config.n_envs * config.rollout_len
             Ds = np.array([boss_state[b]["D"] for b in bosses], dtype=np.float64)
             D_geomean = float(np.exp(np.log(np.maximum(Ds, 1e-6)).mean()))
-            # "Expected hits to clear the roster" under steady-state.
-            # D is % boss HP dealt per hit taken, so hits_b = 100 / D_b. Clamp each
-            # term so a single collapsed boss can't swamp the total.
-            HITS_CAP = 500.0
-            hits_to_clear = float(np.minimum(100.0 / np.maximum(Ds, 1e-6), HITS_CAP).sum())
+            # Expected masks to kill one boss, averaged across the roster.
+            # Equivalent to 100 / harmonic_mean(D_b). Dominated by the worst boss.
+            avg_hits_per_boss = float((100.0 / np.maximum(Ds, 1e-6)).mean())
+
+            # Balanced sample means: per-boss mean first, then average across
+            # represented bosses. Weights each boss equally regardless of how
+            # many envs happened to be assigned to it this epoch.
+            per_boss_landed_mean = []
+            per_boss_taken_mean = []
+            for boss in set(env_boss):
+                env_mask = np.array([b == boss for b in env_boss])
+                per_boss_landed_mean.append(float(damage_landed_arr[:, env_mask].mean()))
+                per_boss_taken_mean.append(float(hits_taken_arr[:, env_mask].mean()))
+            balanced_landed = float(np.mean(per_boss_landed_mean))
+            balanced_taken = float(np.mean(per_boss_taken_mean))
             log = {
                 "loss/surrogate": metrics["surrogate"],
                 "loss/value_atk": metrics["value_atk"],
@@ -313,11 +319,10 @@ async def train(config: Config):
                 "metrics/kl": metrics["kl"],
                 "metrics/lr": agent.optimizer.param_groups[0]["lr"],
                 "curriculum/D_geomean": D_geomean,
-                "curriculum/hits_to_clear": hits_to_clear,
+                "curriculum/avg_hits_per_boss": avg_hits_per_boss,
                 "rollout/curriculum_reward": curriculum_reward,
-                "rollout/total_damage_landed": total_landed,
-                "rollout/total_hits_taken": total_taken,
-                "rollout/hit_ratio": total_landed / max(total_taken, 1),
+                "rollout/damage_landed": balanced_landed,
+                "rollout/hits_taken": balanced_taken,
                 "diag/active_step_pct": 100 * active_steps / total_steps_epoch,
                 "diag/first_event_avg": np.mean(first_event_steps),
                 "diag/step0_ms": step0_ms,
@@ -327,11 +332,6 @@ async def train(config: Config):
             }
             for boss in bosses:
                 log[f"curriculum/D/{boss}"] = boss_state[boss]["D"]
-                lb = per_boss_landed.get(boss, 0.0)
-                tb = per_boss_taken.get(boss, 0.0)
-                log[f"rollout/hit_ratio/{boss}"] = lb / max(tb, 1)
-                log[f"rollout/damage_landed/{boss}"] = lb
-                log[f"rollout/hits_taken/{boss}"] = tb
             wandb.log(log, step=total_steps)
 
             boss_ds = " ".join(f"{b.split('_')[-1]}:{boss_state[b]['D']:.2f}" for b in bosses)
@@ -340,23 +340,22 @@ async def train(config: Config):
                 f"steps {total_steps:8d} | "
                 f"D[{boss_ds}] | "
                 f"D_geo {D_geomean:6.2f} | "
-                f"hits {hits_to_clear:6.1f} | "
+                f"hits/boss {avg_hits_per_boss:6.1f} | "
                 f"curr_rew {curriculum_reward:7.4f} | "
-                f"landed {total_landed:5.0f} | "
-                f"taken {total_taken:5.0f} | "
+                f"dmg {balanced_landed:6.3f} | "
+                f"taken {balanced_taken:6.3f} | "
                 f"surr {metrics['surrogate']:7.4f} | "
                 f"kl {metrics['kl']:6.4f}"
             )
 
             recent.append({
-                'hit_ratio': float(total_landed / max(total_taken, 1)),
                 'curriculum_reward': curriculum_reward,
-                'damage_landed': float(total_landed),
-                'damage_taken': float(total_taken),
+                'damage_landed': balanced_landed,
+                'hits_taken': balanced_taken,
                 'entropy': metrics['entropy'],
                 'kl': metrics['kl'],
                 'D_geomean': D_geomean,
-                'hits_to_clear': hits_to_clear,
+                'avg_hits_per_boss': avg_hits_per_boss,
                 'surrogate': metrics['surrogate'],
             })
 
@@ -375,12 +374,11 @@ async def train(config: Config):
             avg = {k: sum(m[k] for m in recent) / n for k in recent[0]}
             elapsed = time.perf_counter() - t_start
             print("\n---")
-            print(f"hit_ratio:          {avg['hit_ratio']:.6f}")
-            print(f"curriculum_reward:   {avg['curriculum_reward']:.6f}")
-            print(f"avg_damage_landed:   {avg['damage_landed']:.2f}")
-            print(f"avg_damage_taken:    {avg['damage_taken']:.2f}")
-            print(f"final_D_geomean:     {avg['D_geomean']:.2f}")
-            print(f"final_hits_to_clear: {avg['hits_to_clear']:.1f}")
+            print(f"curriculum_reward:      {avg['curriculum_reward']:.6f}")
+            print(f"avg_damage_landed:      {avg['damage_landed']:.4f}")
+            print(f"avg_hits_taken:         {avg['hits_taken']:.4f}")
+            print(f"final_D_geomean:        {avg['D_geomean']:.2f}")
+            print(f"final_avg_hits_per_boss: {avg['avg_hits_per_boss']:.1f}")
             for boss in bosses:
                 print(f"final_D/{boss}: {boss_state[boss]['D']:.2f}")
             print(f"final_entropy:       {avg['entropy']:.6f}")
