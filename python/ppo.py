@@ -437,7 +437,19 @@ class PPO:
         pbar.close()
         return {k: v / max(n_updates, 1) for k, v in total_metrics.items()}
 
-    def save_checkpoint(self, path, vocab=None):
+    def save_checkpoint(self, path, vocab=None, boss_state=None):
+        # Serialize per-boss curriculum state: D plus the raw rolling windows
+        # so resume can continue the EMA without a warm-up gap.
+        ckpt_boss = None
+        if boss_state is not None:
+            ckpt_boss = {
+                b: {
+                    "D": float(s["D"]),
+                    "landed_window": list(s["landed_window"]),
+                    "taken_window": list(s["taken_window"]),
+                }
+                for b, s in boss_state.items()
+            }
         torch.save(
             {
                 "model": self.policy.state_dict(),
@@ -448,11 +460,12 @@ class PPO:
                 "terrain_normalizer": self.terrain_normalizer.state_dict(),
                 "hx": self.hx,
                 "kind_vocab": vocab.state_dict() if vocab is not None else None,
+                "boss_state": ckpt_boss,
             },
             path,
         )
 
-    def load_checkpoint(self, path, vocab=None):
+    def load_checkpoint(self, path, vocab=None, boss_state=None):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         state = ckpt["model"]
         # Remap old nn.GRUCell parameter names → new nn.GRU names so checkpoints
@@ -494,3 +507,25 @@ class PPO:
         if vocab is not None and ckpt.get("kind_vocab") is not None:
             vocab.load_state_dict(ckpt["kind_vocab"])
             print(f"  Loaded kind vocab: {len(vocab)} entries")
+        if boss_state is not None and ckpt.get("boss_state") is not None:
+            ckpt_boss = ckpt["boss_state"]
+            restored, new, dropped = [], [], []
+            for b, s in ckpt_boss.items():
+                if b in boss_state:
+                    boss_state[b]["D"] = float(s["D"])
+                    boss_state[b]["landed_window"].clear()
+                    boss_state[b]["landed_window"].extend(s["landed_window"])
+                    boss_state[b]["taken_window"].clear()
+                    boss_state[b]["taken_window"].extend(s["taken_window"])
+                    restored.append(f"{b}={s['D']:.2f}")
+                else:
+                    dropped.append(b)
+            for b in boss_state:
+                if b not in ckpt_boss:
+                    new.append(b)
+            if restored:
+                print(f"  Restored per-boss D: {', '.join(restored)}")
+            if new:
+                print(f"  New bosses (using D_initial): {new}")
+            if dropped:
+                print(f"  Checkpoint bosses not in current pool (skipped): {dropped}")

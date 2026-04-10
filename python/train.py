@@ -60,18 +60,6 @@ async def train(config: Config):
         if vis is not None:
             vis.vocab = vec_env.vocab
 
-        agent = PPO(config)
-        if config.resume:
-            agent.load_checkpoint(config.resume, vocab=vec_env.vocab)
-            print(f"Resumed from: {config.resume}")
-        print(f"Using device: {agent.device}")
-        print(f"Model parameters: {sum(p.numel() for p in agent.policy.parameters()):,}")
-
-        os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
-        if config.time_budget:
-            os.environ["WANDB_MODE"] = "disabled"
-        wandb.init(project=config.wandb_project, config=vars(config))
-
         bosses = config.boss_levels_list
         assert len(bosses) > 0, "config.boss_levels must list at least one scene"
         boss_state = {b: {
@@ -83,6 +71,18 @@ async def train(config: Config):
         env_boss = [bosses[int(rng.integers(len(bosses)))] for _ in range(config.n_envs)]
         print(f"Boss pool: {bosses}")
         print(f"Initial env_boss: {env_boss}")
+
+        agent = PPO(config)
+        if config.resume:
+            agent.load_checkpoint(config.resume, vocab=vec_env.vocab, boss_state=boss_state)
+            print(f"Resumed from: {config.resume}")
+        print(f"Using device: {agent.device}")
+        print(f"Model parameters: {sum(p.numel() for p in agent.policy.parameters()):,}")
+
+        os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
+        if config.time_budget:
+            os.environ["WANDB_MODE"] = "disabled"
+        wandb.init(project=config.wandb_project, config=vars(config))
 
         time_budget = config.time_budget
         t_start = time.perf_counter()
@@ -256,7 +256,9 @@ async def train(config: Config):
                 bs["taken_window"].append(taken_b)
                 window_landed = sum(bs["landed_window"])
                 window_taken = sum(bs["taken_window"])
-                if window_taken > 0 and window_landed > 0:
+
+                if window_landed > 0 and window_taken > 0:
+                    # Normal case: EMA toward the raw ratio, clamped.
                     D_raw = max(window_landed / window_taken, config.D_min)
                     if len(bs["landed_window"]) == 1:
                         bs["D"] = D_raw
@@ -267,6 +269,22 @@ async def train(config: Config):
                             bs["D"] * (1 - config.D_max_delta),
                             bs["D"] * (1 + config.D_max_delta),
                         ))
+                elif window_landed == 0 and window_taken > 0:
+                    # Strong signal: policy is taking hits but landing nothing.
+                    # Curriculum is too hard — drop D aggressively (2x clamp rate).
+                    bs["D"] = float(max(
+                        bs["D"] * (1 - 2 * config.D_max_delta),
+                        config.D_min,
+                    ))
+                elif window_landed > 0 and window_taken == 0:
+                    # Weaker signal: policy is landing damage without getting hit.
+                    # Push D up at the normal clamp rate.
+                    bs["D"] = float(min(
+                        bs["D"] * (1 + config.D_max_delta),
+                        config.D_max,
+                    ))
+                # else: both zero — no knight/boss interaction at all. Leave D
+                # alone; this usually means the arena is broken, not a signal.
 
             D_per_env = np.array([boss_state[b]["D"] for b in env_boss], dtype=np.float32)
 
@@ -331,8 +349,8 @@ async def train(config: Config):
             total_steps = (epoch + 1) * config.n_envs * config.rollout_len
             Ds = np.array([boss_state[b]["D"] for b in bosses], dtype=np.float64)
             D_geomean = float(np.exp(np.log(np.maximum(Ds, 1e-6)).mean()))
-            # Expected masks to kill one boss, averaged across the roster.
-            # Equivalent to 100 / harmonic_mean(D_b). Dominated by the worst boss.
+            # Harmonic mean of D expressed in hits units. Dominated by the worst
+            # boss — distinct from D_geomean (AM ≥ GM ≥ HM).
             avg_hits_per_boss = float((100.0 / np.maximum(Ds, 1e-6)).mean())
 
             # Balanced sample means: per-boss mean first, then average across
@@ -405,7 +423,7 @@ async def train(config: Config):
 
             if epoch % config.save_every == 0:
                 path = f"{config.save_path}_{epoch}.pth"
-                agent.save_checkpoint(path, vocab=vec_env.vocab)
+                agent.save_checkpoint(path, vocab=vec_env.vocab, boss_state=boss_state)
                 print(f"  Saved checkpoint: {path}")
 
         # Print summary (used by autoresearch pipeline)
@@ -427,7 +445,7 @@ async def train(config: Config):
             print(f"epochs_completed:    {epoch + 1}")
             print(f"training_seconds:    {elapsed:.1f}")
 
-        agent.save_checkpoint(f"{config.save_path}_final.pth", vocab=vec_env.vocab)
+        agent.save_checkpoint(f"{config.save_path}_final.pth", vocab=vec_env.vocab, boss_state=boss_state)
         wandb.finish()
 
         if vis is not None:
