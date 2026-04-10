@@ -437,7 +437,7 @@ class PPO:
         pbar.close()
         return {k: v / max(n_updates, 1) for k, v in total_metrics.items()}
 
-    def save_checkpoint(self, path, vocab=None, boss_state=None):
+    def save_checkpoint(self, path, vocab=None, boss_state=None, epoch=None):
         # Serialize per-boss curriculum state: D plus the raw rolling windows
         # so resume can continue the EMA without a warm-up gap.
         ckpt_boss = None
@@ -461,6 +461,7 @@ class PPO:
                 "hx": self.hx,
                 "kind_vocab": vocab.state_dict() if vocab is not None else None,
                 "boss_state": ckpt_boss,
+                "epoch": epoch,
             },
             path,
         )
@@ -507,6 +508,11 @@ class PPO:
         if vocab is not None and ckpt.get("kind_vocab") is not None:
             vocab.load_state_dict(ckpt["kind_vocab"])
             print(f"  Loaded kind vocab: {len(vocab)} entries")
+        start_epoch = 0
+        ckpt_epoch = ckpt.get("epoch")
+        if ckpt_epoch is not None:
+            start_epoch = int(ckpt_epoch) + 1
+            print(f"  Resuming at epoch {start_epoch} (checkpoint saved at epoch {ckpt_epoch})")
         if boss_state is not None and ckpt.get("boss_state") is not None:
             ckpt_boss = ckpt["boss_state"]
             restored, new, dropped = [], [], []
@@ -529,3 +535,4 @@ class PPO:
                 print(f"  New bosses (using D_initial): {new}")
             if dropped:
                 print(f"  Checkpoint bosses not in current pool (skipped): {dropped}")
+        return start_epoch

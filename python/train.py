@@ -73,8 +73,11 @@ async def train(config: Config):
         print(f"Initial env_boss: {env_boss}")
 
         agent = PPO(config)
+        start_epoch = 0
         if config.resume:
-            agent.load_checkpoint(config.resume, vocab=vec_env.vocab, boss_state=boss_state)
+            start_epoch = agent.load_checkpoint(
+                config.resume, vocab=vec_env.vocab, boss_state=boss_state
+            )
             print(f"Resumed from: {config.resume}")
         print(f"Using device: {agent.device}")
         print(f"Model parameters: {sum(p.numel() for p in agent.policy.parameters()):,}")
@@ -104,7 +107,10 @@ async def train(config: Config):
         # Staggered reset: cycle through envs, resetting n_envs/4 per epoch
         envs_per_reset = max(1, config.n_envs // 4)
 
-        for epoch in range(config.epochs):
+        # Initialized so the post-loop final save and summary have a defined
+        # `epoch` even if the loop never runs (e.g. resuming from a completed run).
+        epoch = start_epoch - 1
+        for epoch in range(start_epoch, config.epochs):
 
             # Rollout buffers
             buf_combat_hb = []
@@ -423,7 +429,7 @@ async def train(config: Config):
 
             if epoch % config.save_every == 0:
                 path = f"{config.save_path}_{epoch}.pth"
-                agent.save_checkpoint(path, vocab=vec_env.vocab, boss_state=boss_state)
+                agent.save_checkpoint(path, vocab=vec_env.vocab, boss_state=boss_state, epoch=epoch)
                 print(f"  Saved checkpoint: {path}")
 
         # Print summary (used by autoresearch pipeline)
@@ -445,7 +451,7 @@ async def train(config: Config):
             print(f"epochs_completed:    {epoch + 1}")
             print(f"training_seconds:    {elapsed:.1f}")
 
-        agent.save_checkpoint(f"{config.save_path}_final.pth", vocab=vec_env.vocab, boss_state=boss_state)
+        agent.save_checkpoint(f"{config.save_path}_final.pth", vocab=vec_env.vocab, boss_state=boss_state, epoch=epoch)
         wandb.finish()
 
         if vis is not None:
