@@ -18,6 +18,10 @@ models/
 logs/
 wandb/
 
+# Recordings
+*.mp4
+*.mp4.log
+
 # IDE
 .vs/
 .idea/

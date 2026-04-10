@@ -419,15 +419,21 @@ class PPO:
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        # strict=False allows loading pre-GRU checkpoints (missing GRU keys
-        # stay at their init values, which are near-zero so the residual
-        # connection makes the model behave identically to the old one)
         missing, unexpected = self.policy.load_state_dict(ckpt["model"], strict=False)
         if missing:
             print(f"  Checkpoint missing keys (using init): {missing}")
         if unexpected:
             print(f"  Checkpoint unexpected keys (ignored): {unexpected}")
-        self.optimizer.load_state_dict(ckpt["optimizer"])
+        # If GRU keys were missing (pre-GRU checkpoint), zero out LayerNorm
+        # weight so the residual connection is a true no-op.
+        if any("gru" in k for k in missing):
+            with torch.no_grad():
+                self.policy.gru_ln.weight.zero_()
+                self.policy.gru_ln.bias.zero_()
+        try:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+        except ValueError:
+            pass  # param group mismatch (e.g. pre-GRU checkpoint); fine for eval
         if self.config.anneal_lr and ckpt.get("scheduler"):
             self.scheduler.load_state_dict(ckpt["scheduler"])
         if ckpt.get("obs_normalizer"):
