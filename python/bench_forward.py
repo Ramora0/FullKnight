@@ -32,7 +32,7 @@ print(f"\nBenchmarking {ITERS} forward passes (batch={B}, combat={N_COMBAT}, ter
 # Warmup
 with torch.no_grad():
     for _ in range(WARMUP):
-        model.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state)
+        model.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, combat_kind_ids, terrain_hb, terrain_mask, global_state)
 torch.cuda.synchronize()
 
 # Benchmark 1: GPU time only (cuda events)
@@ -42,7 +42,7 @@ end_event = torch.cuda.Event(enable_timing=True)
 with torch.no_grad():
     start_event.record()
     for _ in range(ITERS):
-        model.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state)
+        model.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, combat_kind_ids, terrain_hb, terrain_mask, global_state)
     end_event.record()
 torch.cuda.synchronize()
 gpu_ms = start_event.elapsed_time(end_event)
@@ -53,7 +53,7 @@ torch.cuda.synchronize()
 with torch.no_grad():
     t0 = time.perf_counter()
     for _ in range(ITERS):
-        model.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state)
+        model.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, combat_kind_ids, terrain_hb, terrain_mask, global_state)
         torch.cuda.synchronize()
     wall_sync = time.perf_counter() - t0
 print(f"Wall-clock (sync per iter):   {wall_sync*1000:.1f}ms total, {wall_sync/ITERS*1000:.3f}ms per call")
@@ -63,7 +63,7 @@ torch.cuda.synchronize()
 with torch.no_grad():
     t0 = time.perf_counter()
     for _ in range(ITERS):
-        model.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state)
+        model.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, combat_kind_ids, terrain_hb, terrain_mask, global_state)
     torch.cuda.synchronize()
     wall_nosync = time.perf_counter() - t0
 print(f"Wall-clock (no sync per iter):{wall_nosync*1000:.1f}ms total, {wall_nosync/ITERS*1000:.3f}ms per call")
@@ -87,7 +87,7 @@ with torch.no_grad():
         t_ = torch.from_numpy(thb_np).float().to(device)
         tm_ = torch.from_numpy(tm_np).float().to(device)
         g = torch.from_numpy(gs_np).float().to(device)
-        actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, ckid, t_, tm_, g)
+        actions, lp, _, va, vd, _ = model.get_action_and_value(c, m, ckid, ckid, t_, tm_, g)
         _ = {k: v.cpu().numpy() for k, v in actions.items()}
         _ = lp.cpu().numpy()
         _ = va.cpu().numpy()
@@ -102,13 +102,13 @@ try:
     # Warmup compile
     with torch.no_grad():
         for _ in range(WARMUP):
-            compiled.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state)
+            compiled.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, combat_kind_ids, terrain_hb, terrain_mask, global_state)
     torch.cuda.synchronize()
 
     start_event.record()
     with torch.no_grad():
         for _ in range(ITERS):
-            compiled.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state)
+            compiled.get_action_and_value(combat_hb, combat_mask, combat_kind_ids, combat_kind_ids, terrain_hb, terrain_mask, global_state)
     end_event.record()
     torch.cuda.synchronize()
     compiled_ms = start_event.elapsed_time(end_event)

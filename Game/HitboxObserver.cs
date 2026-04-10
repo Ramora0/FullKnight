@@ -24,9 +24,11 @@ namespace FullKnight.Game
 			{HitboxType.Terrain, new HashSet<Collider2D>()}
 		};
 
-		// Cached per-collider kind string. Computed once on first classification
-		// (cheap parent walk) and reused thereafter, since HK reparents rarely.
+		// Cached per-collider kind/parent strings. Computed once on first
+		// classification (cheap parent walk) and reused thereafter, since HK
+		// reparents rarely.
 		public readonly Dictionary<Collider2D, string> kindCache = new();
+		public readonly Dictionary<Collider2D, string> parentCache = new();
 
 		private void Start()
 		{
@@ -50,7 +52,7 @@ namespace FullKnight.Game
 				kvp.Value.RemoveWhere(c => c == null);
 			var dead = new List<Collider2D>();
 			foreach (var k in kindCache.Keys) if (k == null) dead.Add(k);
-			foreach (var k in dead) kindCache.Remove(k);
+			foreach (var k in dead) { kindCache.Remove(k); parentCache.Remove(k); }
 		}
 
 		private void AddHitbox(Collider2D collider2D)
@@ -101,6 +103,37 @@ namespace FullKnight.Game
 			string result = ClassifyKind(col);
 			kindCache[col] = result;
 			return result;
+		}
+
+		/// <summary>
+		/// Walk parents to the nearest HealthManager and return its stripped
+		/// root name (e.g. "Mega Moss Charger"). Empty string if none reachable
+		/// (detached projectiles, knight-owned colliders, terrain). Used as the
+		/// "parent identity" channel in the factored kind embedding: leaf kind
+		/// pools across bosses, parent name specializes per boss.
+		/// </summary>
+		public string GetParentKind(Collider2D col)
+		{
+			if (col == null) return "";
+			if (parentCache.TryGetValue(col, out string cached)) return cached;
+
+			string result = ClassifyParent(col);
+			parentCache[col] = result;
+			return result;
+		}
+
+		private string ClassifyParent(Collider2D col)
+		{
+			Transform t = col.transform;
+			int depth = 0;
+			while (t != null && depth < 8)
+			{
+				if (t.GetComponent<HealthManager>() != null)
+					return Strip(t.gameObject.name);
+				t = t.parent;
+				depth++;
+			}
+			return "";
 		}
 
 		private string ClassifyKind(Collider2D col)
@@ -228,6 +261,7 @@ namespace FullKnight.Game
 		{
 			public List<float[]> CombatHitboxes;
 			public List<string> CombatKinds;
+			public List<string> CombatParents;
 			public List<float[]> TerrainHitboxes;
 			public float KnightWidth;
 			public float KnightHeight;
@@ -251,6 +285,7 @@ namespace FullKnight.Game
 
 			var combat = new List<float[]>();
 			var combatKinds = new List<string>();
+			var combatParents = new List<string>();
 			var terrain = new List<float[]>();
 			float knightW = 0f, knightH = 0f;
 
@@ -281,6 +316,7 @@ namespace FullKnight.Game
 						float isTarget = kvp.Key == HitboxType.Enemy ? 1f : 0f;
 						combat.Add(new float[] { relX, relY, w, h, isTrigger, hurtsKnight, isTarget });
 						combatKinds.Add(reader != null ? reader.GetKind(col) : "unknown");
+						combatParents.Add(reader != null ? reader.GetParentKind(col) : "");
 					}
 					else if (kvp.Key == HitboxType.Terrain)
 					{
@@ -293,6 +329,7 @@ namespace FullKnight.Game
 			{
 				CombatHitboxes = combat,
 				CombatKinds = combatKinds,
+				CombatParents = combatParents,
 				TerrainHitboxes = terrain,
 				KnightWidth = knightW,
 				KnightHeight = knightH

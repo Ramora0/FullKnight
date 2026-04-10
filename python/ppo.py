@@ -163,7 +163,7 @@ class PPO:
         return result
 
     @torch.no_grad()
-    def collect_action(self, combat_hb, combat_mask, combat_kind_ids,
+    def collect_action(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
                        terrain_hb, terrain_mask, global_state):
         """Get actions for a batch of observations during rollout collection.
         All inputs are numpy arrays. Returns numpy arrays.
@@ -182,6 +182,7 @@ class PPO:
         chb = torch.from_numpy(chb_norm).float().to(self.device)
         cm = torch.from_numpy(combat_mask).float().to(self.device)
         ckid = torch.from_numpy(combat_kind_ids).long().to(self.device)
+        cpid = torch.from_numpy(combat_parent_ids).long().to(self.device)
         thb = torch.from_numpy(thb_norm).float().to(self.device)
         tm = torch.from_numpy(terrain_mask).float().to(self.device)
         gs = torch.from_numpy(gs_norm).float().to(self.device)
@@ -195,7 +196,7 @@ class PPO:
 
         fwd_start.record()
         actions, log_prob, _, value_atk, value_def, hx_new = self.policy.get_action_and_value(
-            chb, cm, ckid, thb, tm, gs, hx=hx_t
+            chb, cm, ckid, cpid, thb, tm, gs, hx=hx_t
         )
         fwd_end.record()
 
@@ -210,8 +211,9 @@ class PPO:
         return result
 
     def train_on_rollout(self, buf_combat_hb, buf_combat_mask, buf_combat_kind_ids,
-                         buf_terrain_hb, buf_terrain_mask, buf_global, actions_arr,
-                         log_probs_arr, damage_landed_arr, hits_taken_arr,
+                         buf_combat_parent_ids, buf_terrain_hb, buf_terrain_mask,
+                         buf_global, actions_arr, log_probs_arr,
+                         damage_landed_arr, hits_taken_arr,
                          values_atk_arr, values_def_arr, D, buf_hx):
         """Train on a collected rollout with chunked truncated BPTT.
 
@@ -279,6 +281,7 @@ class PPO:
         flat_chb = np.zeros((T_used, N, max_combat, cfg.combat_feature_dim), dtype=np.float32)
         flat_cm = np.zeros((T_used, N, max_combat), dtype=np.float32)
         flat_ckid = np.zeros((T_used, N, max_combat), dtype=np.int64)
+        flat_cpid = np.zeros((T_used, N, max_combat), dtype=np.int64)
         flat_thb = np.zeros((T_used, N, max_terrain, cfg.terrain_feature_dim), dtype=np.float32)
         flat_tm = np.zeros((T_used, N, max_terrain), dtype=np.float32)
         flat_gs = np.zeros((T_used, N, cfg.global_state_dim), dtype=np.float32)
@@ -288,6 +291,7 @@ class PPO:
             flat_chb[t, :, :nc] = buf_combat_hb[t]
             flat_cm[t, :, :nc] = buf_combat_mask[t]
             flat_ckid[t, :, :nc] = buf_combat_kind_ids[t]
+            flat_cpid[t, :, :nc] = buf_combat_parent_ids[t]
             nt = buf_terrain_hb[t].shape[1]
             flat_thb[t, :, :nt] = buf_terrain_hb[t]
             flat_tm[t, :, :nt] = buf_terrain_mask[t]
@@ -325,6 +329,7 @@ class PPO:
         chb_chunks = chunk_obs(flat_chb)
         cm_chunks = chunk_obs(flat_cm)
         ckid_chunks = chunk_obs(flat_ckid)
+        cpid_chunks = chunk_obs(flat_cpid)
         thb_chunks = chunk_obs(flat_thb)
         tm_chunks = chunk_obs(flat_tm)
         gs_chunks = chunk_obs(flat_gs)
@@ -343,6 +348,7 @@ class PPO:
         chb_t = torch.from_numpy(chb_chunks).to(self.device)
         cm_t = torch.from_numpy(cm_chunks).to(self.device)
         ckid_t = torch.from_numpy(ckid_chunks).long().to(self.device)
+        cpid_t = torch.from_numpy(cpid_chunks).long().to(self.device)
         thb_t = torch.from_numpy(thb_chunks).to(self.device)
         tm_t = torch.from_numpy(tm_chunks).to(self.device)
         gs_t = torch.from_numpy(gs_chunks).to(self.device)
@@ -366,7 +372,8 @@ class PPO:
                 hx_mb = hx_t[idx].detach()
 
                 new_lp, entropy, v_atk, v_def, gru_info = self.policy.forward_sequence(
-                    chb_t[idx], cm_t[idx], ckid_t[idx], thb_t[idx], tm_t[idx], gs_t[idx],
+                    chb_t[idx], cm_t[idx], ckid_t[idx], cpid_t[idx],
+                    thb_t[idx], tm_t[idx], gs_t[idx],
                     hx_mb, {k: v[idx] for k, v in act_t.items()},
                 )
 

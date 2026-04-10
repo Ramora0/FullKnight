@@ -18,7 +18,8 @@ namespace FullKnight.Net
 
 		// Observation (C# -> Python)
 		public List<float[]> combat_hitboxes;
-		public List<string> combat_kinds;  // parallel to combat_hitboxes; one kind-id string per hitbox
+		public List<string> combat_kinds;    // parallel: leaf-kind id string per combat hitbox
+		public List<string> combat_parents;  // parallel: HealthManager-root name per combat hitbox ("" if none)
 		public List<float[]> terrain_hitboxes;
 		public float[] global_state;
 

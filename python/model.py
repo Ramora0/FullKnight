@@ -151,9 +151,12 @@ class FullKnightActorCritic(nn.Module):
         with torch.no_grad():
             self.head_action.bias[0] = 1.0
 
-    def _encode(self, combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state, hx=None):
+    def _encode(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
+                terrain_hb, terrain_mask, global_state, hx=None):
         global_emb = self.global_encoder(global_state)
-        kind_emb = self.kind_embed(combat_kind_ids)  # (B, N, kind_embed_dim)
+        # Factored identity: leaf-kind embedding + parent-name embedding (sum).
+        # padding_idx=0 means absent parents (e.g. detached projectiles) contribute zero.
+        kind_emb = self.kind_embed(combat_kind_ids) + self.kind_embed(combat_parent_ids)
         combat_emb = self.combat_encoder(combat_hb, combat_mask, global_emb, extra=kind_emb)
         terrain_emb = self.terrain_encoder(terrain_hb, terrain_mask, global_emb)
         combined = torch.cat([combat_emb, terrain_emb, global_emb], dim=-1)
@@ -218,12 +221,14 @@ class FullKnightActorCritic(nn.Module):
 
         return logits_action, logits_jump
 
-    def get_value(self, combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state, hx=None):
-        h, hx_new = self._encode(combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state, hx)
+    def get_value(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
+                  terrain_hb, terrain_mask, global_state, hx=None):
+        h, hx_new = self._encode(combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
+                                 terrain_hb, terrain_mask, global_state, hx)
         return self.critic_attack(h).squeeze(-1), self.critic_defense(h).squeeze(-1), hx_new
 
-    def get_action_and_value(self, combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask,
-                             global_state, hx=None, actions=None):
+    def get_action_and_value(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
+                             terrain_hb, terrain_mask, global_state, hx=None, actions=None):
         """
         If actions is None: sample new actions.
         If actions is provided: compute log_probs and entropy for given actions.
@@ -232,7 +237,8 @@ class FullKnightActorCritic(nn.Module):
                  each (B,) LongTensor.
         Returns: actions_dict, log_prob (B,), entropy (B,), value_atk (B,), value_def (B,), hx_new (B, hidden_dim)
         """
-        h, hx_new = self._encode(combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state, hx)
+        h, hx_new = self._encode(combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
+                                 terrain_hb, terrain_mask, global_state, hx)
 
         logits_m = self.head_movement(h)
         logits_d = self.head_direction(h)
@@ -283,8 +289,8 @@ class FullKnightActorCritic(nn.Module):
         }
         return actions_dict, log_prob, entropy, value_atk, value_def, hx_new
 
-    def forward_sequence(self, combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask,
-                         global_state, hx, actions):
+    def forward_sequence(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
+                         terrain_hb, terrain_mask, global_state, hx, actions):
         """Truncated BPTT over a chunk of L timesteps.
 
         Vectorized: encoders/trunk/heads/critic all process (B*L) in one shot,
@@ -310,12 +316,13 @@ class FullKnightActorCritic(nn.Module):
         flat_combat_hb = combat_hb.reshape(B * L, *combat_hb.shape[2:])
         flat_combat_mask = combat_mask.reshape(B * L, combat_mask.shape[-1])
         flat_combat_kind_ids = combat_kind_ids.reshape(B * L, combat_kind_ids.shape[-1])
+        flat_combat_parent_ids = combat_parent_ids.reshape(B * L, combat_parent_ids.shape[-1])
         flat_terrain_hb = terrain_hb.reshape(B * L, *terrain_hb.shape[2:])
         flat_terrain_mask = terrain_mask.reshape(B * L, terrain_mask.shape[-1])
         flat_global = global_state.reshape(B * L, global_state.shape[-1])
 
         flat_global_emb = self.global_encoder(flat_global)
-        flat_kind_emb = self.kind_embed(flat_combat_kind_ids)
+        flat_kind_emb = self.kind_embed(flat_combat_kind_ids) + self.kind_embed(flat_combat_parent_ids)
         flat_combat_emb = self.combat_encoder(flat_combat_hb, flat_combat_mask, flat_global_emb, extra=flat_kind_emb)
         flat_terrain_emb = self.terrain_encoder(flat_terrain_hb, flat_terrain_mask, flat_global_emb)
         flat_combined = torch.cat([flat_combat_emb, flat_terrain_emb, flat_global_emb], dim=-1)

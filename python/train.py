@@ -80,7 +80,7 @@ async def train(config: Config):
         recent = deque(maxlen=20)
 
         # First epoch: full reset to load boss scenes
-        combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state = \
+        combat_hb, combat_mask, combat_kind_ids, combat_parent_ids, terrain_hb, terrain_mask, global_state = \
             await vec_env.reset_all()
         agent.reset_hidden(config.n_envs)
 
@@ -93,6 +93,7 @@ async def train(config: Config):
             buf_combat_hb = []
             buf_combat_mask = []
             buf_combat_kind_ids = []
+            buf_combat_parent_ids = []
             buf_terrain_hb = []
             buf_terrain_mask = []
             buf_global = []
@@ -112,7 +113,7 @@ async def train(config: Config):
             for t in range(config.rollout_len):
                 buf_hx.append(agent.get_hx_snapshot())
                 actions_np, log_probs, values_atk, values_def = agent.collect_action(
-                    combat_hb, combat_mask, combat_kind_ids,
+                    combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
                     terrain_hb, terrain_mask, global_state
                 )
 
@@ -127,13 +128,14 @@ async def train(config: Config):
                 ]
 
                 t_step = time.perf_counter()
-                next_chb, next_cm, next_ckid, next_thb, next_tm, next_gs, damage_landed, hits_taken, step_game_times, step_real_times = \
+                next_chb, next_cm, next_ckid, next_cpid, next_thb, next_tm, next_gs, damage_landed, hits_taken, step_game_times, step_real_times = \
                     await vec_env.step_all(action_vecs)
                 wall_dt = time.perf_counter() - t_step
 
                 buf_combat_hb.append(combat_hb)
                 buf_combat_mask.append(combat_mask)
                 buf_combat_kind_ids.append(combat_kind_ids)
+                buf_combat_parent_ids.append(combat_parent_ids)
                 buf_terrain_hb.append(terrain_hb)
                 buf_terrain_mask.append(terrain_mask)
                 buf_global.append(global_state)
@@ -150,16 +152,17 @@ async def train(config: Config):
 
                 combat_hb, combat_mask = next_chb, next_cm
                 combat_kind_ids = next_ckid
+                combat_parent_ids = next_cpid
                 terrain_hb, terrain_mask = next_thb, next_tm
                 global_state = next_gs
 
                 if vis is not None:
-                    vis.update(combat_hb, combat_mask, combat_kind_ids,
+                    vis.update(combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
                                terrain_hb, terrain_mask, global_state)
 
             # Bootstrap final values
             _, _, final_vatk, final_vdef = agent.collect_action(
-                combat_hb, combat_mask, combat_kind_ids,
+                combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
                 terrain_hb, terrain_mask, global_state
             )
             buf_values_atk.append(final_vatk)
@@ -224,7 +227,7 @@ async def train(config: Config):
 
             t0 = time.perf_counter()
             metrics = agent.train_on_rollout(
-                buf_combat_hb, buf_combat_mask, buf_combat_kind_ids,
+                buf_combat_hb, buf_combat_mask, buf_combat_kind_ids, buf_combat_parent_ids,
                 buf_terrain_hb, buf_terrain_mask,
                 buf_global, actions_arr, log_probs_arr,
                 damage_landed_arr, hits_taken_arr,
@@ -251,12 +254,13 @@ async def train(config: Config):
 
             # Staggered reset: reset a subset of envs, resume the rest
             _, reset_obs = await vec_env.reset_and_resume(reset_indices)
-            r_chb, r_cm, r_ckid, r_thb, r_tm, r_gs = reset_obs
+            r_chb, r_cm, r_ckid, r_cpid, r_thb, r_tm, r_gs = reset_obs
 
             # Merge reset obs into carried-over obs (handle padding mismatch)
             combat_hb = merge_padded(combat_hb, r_chb, reset_indices)
             combat_mask = merge_padded(combat_mask, r_cm, reset_indices)
             combat_kind_ids = merge_padded(combat_kind_ids, r_ckid, reset_indices)
+            combat_parent_ids = merge_padded(combat_parent_ids, r_cpid, reset_indices)
             terrain_hb = merge_padded(terrain_hb, r_thb, reset_indices)
             terrain_mask = merge_padded(terrain_mask, r_tm, reset_indices)
             for local_i, env_i in enumerate(reset_indices):

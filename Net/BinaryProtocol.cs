@@ -43,6 +43,7 @@ namespace FullKnight.Net
 				var terrain = d.terrain_hitboxes ?? new List<float[]>();
 				var gs = d.global_state ?? Array.Empty<float>();
 				var kinds = d.combat_kinds ?? new List<string>();
+				var parents = d.combat_parents ?? new List<string>();
 
 				w.Write((ushort)combat.Count);
 				w.Write((ushort)terrain.Count);
@@ -73,6 +74,17 @@ namespace FullKnight.Net
 				{
 					string k = i < kinds.Count ? (kinds[i] ?? "unknown") : "unknown";
 					var bytes = System.Text.Encoding.UTF8.GetBytes(k);
+					int len = bytes.Length > 255 ? 255 : bytes.Length;
+					w.Write((byte)len);
+					w.Write(bytes, 0, len);
+				}
+
+				// Combat parent strings: same format, also one per combat hitbox.
+				// Empty string means "no parent HealthManager reachable".
+				for (int i = 0; i < combat.Count; i++)
+				{
+					string p = i < parents.Count ? (parents[i] ?? "") : "";
+					var bytes = System.Text.Encoding.UTF8.GetBytes(p);
 					int len = bytes.Length > 255 ? 255 : bytes.Length;
 					w.Write((byte)len);
 					w.Write(bytes, 0, len);

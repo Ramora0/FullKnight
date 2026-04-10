@@ -18,7 +18,8 @@ class Visualizer:
         self.fig.canvas.manager.set_window_title("FullKnight Observation Viewer")
         self.vocab = vocab
 
-    def update(self, combat_hb, combat_mask, combat_kind_ids, terrain_hb, terrain_mask, global_state):
+    def update(self, combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
+               terrain_hb, terrain_mask, global_state):
         """Redraw with current observations (all batched numpy arrays, shows index 0)."""
         ax = self.ax
         ax.clear()
@@ -47,6 +48,7 @@ class Visualizer:
         c_hb = combat_hb[0]
         c_mask = combat_mask[0]
         c_kid = combat_kind_ids[0]
+        c_pid = combat_parent_ids[0]
         for i in range(len(c_mask)):
             if c_mask[i] < 0.5:
                 continue
@@ -61,12 +63,15 @@ class Visualizer:
             )
             ax.add_patch(rect)
 
-            # Kind id label, anchored to top-left of the box
+            # Kind+parent id label, anchored to top-left of the box
             kid = int(c_kid[i])
-            if self.vocab is not None and 0 <= kid < len(self.vocab):
-                label = f"{kid}:{self.vocab._i2s[kid]}"
+            pid = int(c_pid[i])
+            if self.vocab is not None:
+                kname = self.vocab._i2s[kid] if 0 <= kid < len(self.vocab) else str(kid)
+                pname = self.vocab._i2s[pid] if 0 <= pid < len(self.vocab) else str(pid)
+                label = f"{kname}<{pname}>" if pid > 0 else kname
             else:
-                label = f"{kid}"
+                label = f"{kid}<{pid}>" if pid > 0 else f"{kid}"
             ax.text(
                 rx - w / 2, ry + h / 2, label,
                 fontsize=7, color="black",

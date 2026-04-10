@@ -64,7 +64,8 @@ class VecEnv:
 
     async def reset_all(self):
         """Reset all envs. Returns batched
-        (combat_hb, combat_mask, combat_kinds, terrain_hb, terrain_mask, global_states)."""
+        (combat_hb, combat_mask, combat_kinds, combat_parents,
+         terrain_hb, terrain_mask, global_states)."""
         t0 = time.perf_counter()
         timed = await asyncio.gather(*[
             self._timed_op("reset", i, env.reset()) for i, env in enumerate(self.envs)
@@ -88,11 +89,11 @@ class VecEnv:
 
         sorted_timed = sorted(timed, key=lambda x: x[0])
         results = [r for _, _, r in sorted_timed]
-        (combat_lists, terrain_lists, gs_list, combat_kind_lists,
+        (combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists,
          damage_landed, hits_taken, step_game_times, step_real_times) = zip(*results)
 
         obs_batch = self._batch_observations(list(zip(
-            combat_lists, terrain_lists, gs_list, combat_kind_lists)))
+            combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists)))
         damage_landed = np.array(damage_landed, dtype=np.float32)
         hits_taken = np.array(hits_taken, dtype=np.float32)
         step_game_times = np.array(step_game_times, dtype=np.float32)
@@ -121,15 +122,16 @@ class VecEnv:
     def _batch_observations(self, obs_list):
         """Pad hitbox lists and stack into tensors.
 
-        obs_list: list of (combat_hb, terrain_hb, global_state, combat_kinds) tuples.
-        Returns (combat_hb_batch, combat_mask, combat_kind_ids,
+        obs_list: list of (combat_hb, terrain_hb, global_state, combat_kinds, combat_parents) tuples.
+        Returns (combat_hb_batch, combat_mask, combat_kind_ids, combat_parent_ids,
                  terrain_hb_batch, terrain_mask, gs_batch).
-        combat_kind_ids: int32 (B, max_combat); padding rows are 0 ("unknown" id).
+        combat_kind_ids/parent_ids: int32 (B, max_combat); padding rows are 0 ("unknown").
         """
         combat_lists = [obs[0] for obs in obs_list]
         terrain_lists = [obs[1] for obs in obs_list]
         gs_list = [obs[2] for obs in obs_list]
         kind_lists = [obs[3] if len(obs) > 3 else [] for obs in obs_list]
+        parent_lists = [obs[4] if len(obs) > 4 else [] for obs in obs_list]
 
         B = len(obs_list)
 
@@ -140,6 +142,7 @@ class VecEnv:
         combat_batch = np.zeros((B, max_combat, self.config.combat_feature_dim), dtype=np.float32)
         combat_mask = np.zeros((B, max_combat), dtype=np.float32)
         combat_kind_ids = np.zeros((B, max_combat), dtype=np.int32)
+        combat_parent_ids = np.zeros((B, max_combat), dtype=np.int32)
         for i, hb in enumerate(combat_lists):
             n = len(hb)
             if n > 0:
@@ -148,6 +151,9 @@ class VecEnv:
                 ks = kind_lists[i]
                 if ks:
                     combat_kind_ids[i, :n] = self.vocab.encode_list(ks[:n])
+                ps = parent_lists[i]
+                if ps:
+                    combat_parent_ids[i, :n] = self.vocab.encode_list(ps[:n])
 
         # Pad terrain hitboxes
         max_terrain = max((len(t) for t in terrain_lists), default=0)
@@ -163,4 +169,5 @@ class VecEnv:
 
         gs_batch = np.stack(gs_list, axis=0)
 
-        return combat_batch, combat_mask, combat_kind_ids, terrain_batch, terrain_mask, gs_batch
+        return (combat_batch, combat_mask, combat_kind_ids, combat_parent_ids,
+                terrain_batch, terrain_mask, gs_batch)

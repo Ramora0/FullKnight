@@ -31,7 +31,7 @@ class KindVocab:
         return idx
 
     def encode(self, s):
-        if s is None:
+        if s is None or s == "":
             return self._s2i[UNKNOWN]
         idx = self._s2i.get(s)
         if idx is not None:

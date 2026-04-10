@@ -68,7 +68,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     print("Game connected!")
 
     # Reset with eval mode (real HP, boss can die)
-    obs = await env.reset(eval_mode=True)  # (combat_hb, terrain_hb, gs, combat_kinds)
+    obs = await env.reset(eval_mode=True)  # (combat_hb, terrain_hb, gs, combat_kinds, combat_parents)
     # Capture max HP/boss_hp from first obs (right after reset = full health)
     max_knight_hp = obs[2][2]   # global_state index 2
     max_boss_hp = obs[2][4]     # global_state index 4
@@ -98,7 +98,8 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
             obs[2][4] = max_boss_hp
             action_vec, hx = get_action(agent, obs, config, deterministic, hx, vocab)
 
-            combat_hb, terrain_hb, gs, combat_kinds, damage, hits, _, _, done = await env.step_eval(action_vec)
+            (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
+             damage, hits, _, _, done) = await env.step_eval(action_vec)
 
             total_damage += damage
             total_hits += int(hits)
@@ -129,7 +130,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
                     await asyncio.sleep(15)
                 break
 
-            obs = (combat_hb, terrain_hb, gs, combat_kinds)
+            obs = (combat_hb, terrain_hb, gs, combat_kinds, combat_parents)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
@@ -156,7 +157,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
         await server.wait_closed()
 
 
-def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, config):
+def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_parent_ids_arr, config):
     """Convert single-env obs into batched numpy arrays (B=1)."""
     n_combat = max(len(combat_hb_arr), 1)
     n_terrain = max(len(terrain_hb_arr), 1)
@@ -164,10 +165,12 @@ def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, config):
     chb = np.zeros((1, n_combat, config.combat_feature_dim), dtype=np.float32)
     cm = np.zeros((1, n_combat), dtype=np.float32)
     ckid = np.zeros((1, n_combat), dtype=np.int64)
+    cpid = np.zeros((1, n_combat), dtype=np.int64)
     if len(combat_hb_arr) > 0:
         chb[0, :len(combat_hb_arr)] = combat_hb_arr
         cm[0, :len(combat_hb_arr)] = 1.0
         ckid[0, :len(combat_hb_arr)] = combat_kind_ids_arr
+        cpid[0, :len(combat_hb_arr)] = combat_parent_ids_arr
 
     thb = np.zeros((1, n_terrain, config.terrain_feature_dim), dtype=np.float32)
     tm = np.zeros((1, n_terrain), dtype=np.float32)
@@ -176,7 +179,7 @@ def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, config):
         tm[0, :len(terrain_hb_arr)] = 1.0
 
     gs_batch = gs.reshape(1, -1)
-    return chb, cm, ckid, thb, tm, gs_batch
+    return chb, cm, ckid, cpid, thb, tm, gs_batch
 
 
 @torch.no_grad()
@@ -184,10 +187,11 @@ def get_action(agent, obs, config, deterministic, hx, vocab):
     """Get action from the policy using frozen normalizers (no stats update).
     Returns (action_vec, hx_new).
     """
-    combat_hb_list, terrain_hb_list, gs, combat_kinds = obs
+    combat_hb_list, terrain_hb_list, gs, combat_kinds, combat_parents = obs
     kind_ids = vocab.encode_list(combat_kinds)
-    chb, cm, ckid, thb, tm, gs_batch = batch_obs(
-        combat_hb_list, terrain_hb_list, gs, kind_ids, config)
+    parent_ids = vocab.encode_list(combat_parents)
+    chb, cm, ckid, cpid, thb, tm, gs_batch = batch_obs(
+        combat_hb_list, terrain_hb_list, gs, kind_ids, parent_ids, config)
 
     # Normalize global state (continuous features only, flags pass through)
     n_cont = config.global_state_dim - config.n_binary_flags
@@ -209,13 +213,14 @@ def get_action(agent, obs, config, deterministic, hx, vocab):
     chb_t = torch.from_numpy(chb).float().to(device)
     cm_t = torch.from_numpy(cm).float().to(device)
     ckid_t = torch.from_numpy(ckid).long().to(device)
+    cpid_t = torch.from_numpy(cpid).long().to(device)
     thb_t = torch.from_numpy(thb).float().to(device)
     tm_t = torch.from_numpy(tm).float().to(device)
     gs_t = torch.from_numpy(gs_norm).float().to(device)
     hx_t = torch.from_numpy(hx).float().to(device)
 
     if deterministic:
-        h, hx_new = agent.policy._encode(chb_t, cm_t, ckid_t, thb_t, tm_t, gs_t, hx=hx_t)
+        h, hx_new = agent.policy._encode(chb_t, cm_t, ckid_t, cpid_t, thb_t, tm_t, gs_t, hx=hx_t)
         logits_m = agent.policy.head_movement(h)
         logits_d = agent.policy.head_direction(h)
         logits_a = agent.policy.head_action(h).clone()
@@ -228,7 +233,7 @@ def get_action(agent, obs, config, deterministic, hx, vocab):
         a_j = logits_j.argmax(-1).item()
     else:
         actions, _, _, _, _, hx_new = agent.policy.get_action_and_value(
-            chb_t, cm_t, ckid_t, thb_t, tm_t, gs_t, hx=hx_t
+            chb_t, cm_t, ckid_t, cpid_t, thb_t, tm_t, gs_t, hx=hx_t
         )
         a_m = actions["movement"].item()
         a_d = actions["direction"].item()
