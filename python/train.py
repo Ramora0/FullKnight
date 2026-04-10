@@ -88,6 +88,14 @@ async def train(config: Config):
         t_start = time.perf_counter()
         recent = deque(maxlen=20)
 
+        # Slow-step bookkeeping: any per-env step whose wall time exceeds
+        # `slow_step_threshold_s` is counted against the (env, boss) pair it
+        # happened on. Lets us tell if slowness tracks a specific boss, a
+        # specific env slot, or is scattered uniformly.
+        slow_step_threshold_s = 2.0
+        slow_count_by_boss = {b: 0 for b in bosses}
+        slow_count_by_env = [0] * config.n_envs
+
         # First epoch: full reset to load boss scenes
         combat_hb, combat_mask, combat_kind_ids, combat_parent_ids, terrain_hb, terrain_mask, global_state = \
             await vec_env.reset_all(levels=env_boss)
@@ -137,8 +145,9 @@ async def train(config: Config):
                 ]
 
                 t_step = time.perf_counter()
-                next_chb, next_cm, next_ckid, next_cpid, next_thb, next_tm, next_gs, damage_landed, hits_taken, step_game_times, step_real_times = \
-                    await vec_env.step_all(action_vecs)
+                (next_chb, next_cm, next_ckid, next_cpid, next_thb, next_tm, next_gs,
+                 damage_landed, hits_taken, step_game_times, step_real_times,
+                 step_wall_per_env) = await vec_env.step_all(action_vecs)
                 wall_dt = time.perf_counter() - t_step
 
                 buf_combat_hb.append(combat_hb)
@@ -157,7 +166,7 @@ async def train(config: Config):
                 buf_hits_taken.append(hits_taken)
                 buf_step_game_times.append(step_game_times)
                 buf_step_real_times.append(step_real_times)
-                buf_step_wall_times.append(wall_dt)
+                buf_step_wall_times.append(step_wall_per_env)
 
                 combat_hb, combat_mask = next_chb, next_cm
                 combat_kind_ids = next_ckid
@@ -195,10 +204,27 @@ async def train(config: Config):
                 col = any_event[:, env_i]
                 idxs = np.where(col)[0]
                 first_event_steps.append(int(idxs[0]) if len(idxs) > 0 else damage_landed_arr.shape[0])
-            wall_time_arr = np.array(buf_step_wall_times)  # (T,)
+            wall_time_arr = np.stack(buf_step_wall_times)  # (T, N)
             # First step may include intro skip — show it separately
-            step0_ms = wall_time_arr[0] * 1000 if len(wall_time_arr) > 0 else 0
-            avg_wall_ms = wall_time_arr[1:].mean() * 1000 if len(wall_time_arr) > 1 else 0
+            step0_ms = wall_time_arr[0].mean() * 1000 if wall_time_arr.shape[0] > 0 else 0
+            avg_wall_ms = wall_time_arr[1:].mean() * 1000 if wall_time_arr.shape[0] > 1 else 0
+            # Per-env slow-step inventory (skip step 0 which includes intro-skip).
+            # For each env, report the max step time this epoch and every step
+            # over `slow_step_threshold_s` gets counted against the boss.
+            post_first = wall_time_arr[1:] if wall_time_arr.shape[0] > 1 else wall_time_arr
+            per_env_max = post_first.max(axis=0) if post_first.shape[0] > 0 else np.zeros(config.n_envs)
+            per_env_slow_count = (post_first > slow_step_threshold_s).sum(axis=0)
+            slow_events_epoch = []
+            for env_i in range(config.n_envs):
+                cnt = int(per_env_slow_count[env_i])
+                if cnt > 0:
+                    boss = env_boss[env_i]
+                    slow_count_by_boss[boss] = slow_count_by_boss.get(boss, 0) + cnt
+                    slow_count_by_env[env_i] += cnt
+                    slow_events_epoch.append(
+                        f"env{env_i}({boss.replace('GG_', '')}):{cnt}×max{per_env_max[env_i]:.1f}s"
+                    )
+            slow_str = " ".join(slow_events_epoch) if slow_events_epoch else "none"
             # Which envs will be reset after this epoch's training
             reset_offset = (epoch * envs_per_reset) % config.n_envs
             reset_indices = list(range(reset_offset, reset_offset + envs_per_reset))
@@ -209,6 +235,15 @@ async def train(config: Config):
                 f"step0 {step0_ms:.0f}ms | avg_step {avg_wall_ms:.1f}ms | "
                 f"reset_envs {reset_indices}"
             )
+            if slow_events_epoch:
+                cum_boss = " ".join(
+                    f"{b.replace('GG_', '')}:{slow_count_by_boss[b]}"
+                    for b in bosses if slow_count_by_boss.get(b, 0) > 0
+                )
+                print(
+                    f"  slow | this_epoch: {slow_str} | "
+                    f"cum_by_boss: {cum_boss} | cum_by_env: {slow_count_by_env}"
+                )
 
             # Per-boss adaptive D update. Only bosses represented in env_boss
             # this epoch contribute; bosses with no envs are left untouched.
@@ -327,11 +362,16 @@ async def train(config: Config):
                 "diag/first_event_avg": np.mean(first_event_steps),
                 "diag/step0_ms": step0_ms,
                 "diag/avg_step_ms": avg_wall_ms,
+                "diag/max_step_ms": float(post_first.max()) * 1000 if post_first.size else 0,
+                "diag/slow_steps_epoch": int(per_env_slow_count.sum()),
                 "diag/gru_norm": metrics["gru_norm"],
                 "epoch": epoch,
             }
             for boss in bosses:
                 log[f"curriculum/D/{boss}"] = boss_state[boss]["D"]
+                log[f"diag/slow_cum/{boss}"] = slow_count_by_boss.get(boss, 0)
+            for env_i in range(config.n_envs):
+                log[f"diag/slow_cum_env/{env_i}"] = slow_count_by_env[env_i]
             wandb.log(log, step=total_steps)
 
             boss_ds = " ".join(f"{b.split('_')[-1]}:{boss_state[b]['D']:.2f}" for b in bosses)

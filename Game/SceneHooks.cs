@@ -14,6 +14,23 @@ namespace FullKnight.Game
 			var HC = HeroController.instance;
 			var GM = GameManager.instance;
 
+			// Boss-to-boss transitions are unreliable: the wake FSM can miss its
+			// intro event (observed: Gruz Mother's 'Big Fly Control' stuck in 'Wake'
+			// with the boss sleeping on the ceiling) on both same-scene reloads AND
+			// cross-boss transitions. The only reliably working path seen so far is
+			// GG_Workshop → boss (Setup's initial load). Always bounce through
+			// GG_Workshop first unless we're already there.
+			string currentScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+			bool willBounce = currentScene != "GG_Workshop";
+			FullKnight.Instance.Log(
+				$"[SceneHooks] LoadBossScene target={scene_name} current={currentScene} bounce={willBounce}");
+			if (willBounce)
+			{
+				yield return BounceThroughWorkshop();
+				string postBounce = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+				FullKnight.Instance.Log($"[SceneHooks] bounce complete, now in {postBounce}");
+			}
+
 			PlayMakerFSM.BroadcastEvent("DREAM ENTER");
 			PlayerData.instance.dreamReturnScene = "GG_Workshop";
 			PlayMakerFSM.BroadcastEvent("BOX DOWN DREAM");
@@ -43,6 +60,21 @@ namespace FullKnight.Game
 			});
 			yield return FixSoul();
 			yield return new WaitForSeconds(2f);
+		}
+
+		private static IEnumerator BounceThroughWorkshop()
+		{
+			var GM = GameManager.instance;
+			GM.BeginSceneTransition(new GameManager.SceneLoadInfo
+			{
+				SceneName = "GG_Workshop",
+				EntryGateName = "door_dreamReturn",
+				EntryDelay = 0,
+				Visualization = GameManager.SceneLoadVisualizations.GodsAndGlory,
+				PreventCameraFadeOut = true
+			});
+			yield return new WaitForSceneLoad("GG_Workshop");
+			yield return new WaitForFinishedEnteringScene();
 		}
 
 		private static IEnumerator FixSoul()

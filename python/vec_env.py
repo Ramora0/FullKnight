@@ -18,6 +18,10 @@ class VecEnv:
         self._ws_connections = [None] * self.n_envs
         self._server = None
         self.vocab = KindVocab(max_size=config.kind_vocab_size)
+        # Latest level assigned per env. Annotates slow-op prints and lets
+        # callers grab the boss name from dt-tagged results without having
+        # to thread env_boss through step_all.
+        self.env_levels = ["?"] * self.n_envs
 
     async def start_server(self):
         """Start WebSocket server and wait for all N connections."""
@@ -59,7 +63,8 @@ class VecEnv:
         result = await coro
         dt = time.perf_counter() - t0
         if loud or dt > 2.0:
-            print(f"  {label} env {idx}: done in {dt:.1f}s", flush=True)
+            boss = self.env_levels[idx] if idx < len(self.env_levels) else "?"
+            print(f"  {label} env {idx} ({boss}): done in {dt:.1f}s", flush=True)
         return idx, dt, result
 
     async def reset_all(self, levels=None):
@@ -67,6 +72,10 @@ class VecEnv:
         (combat_hb, combat_mask, combat_kinds, combat_parents,
          terrain_hb, terrain_mask, global_states).
         levels: optional list of N scene names, one per env."""
+        if levels is not None:
+            for i, lv in enumerate(levels):
+                if lv is not None:
+                    self.env_levels[i] = lv
         t0 = time.perf_counter()
         timed = await asyncio.gather(*[
             self._timed_op("reset", i,
@@ -82,7 +91,10 @@ class VecEnv:
         """Step all envs in parallel.
         actions: list of N action_vecs, each [movement, direction, action, jump].
         Returns (combat_hb, combat_mask, combat_kinds, terrain_hb, terrain_mask,
-                 global_states, damage_landed, hits_taken, step_game_times, step_real_times).
+                 global_states, damage_landed, hits_taken, step_game_times, step_real_times,
+                 step_wall_times).
+        step_wall_times: (N,) float32 — per-env wall-clock seconds for this step, so
+        callers can localize slow steps to a specific env/boss.
         """
         t0 = time.perf_counter()
         timed = await asyncio.gather(*[
@@ -91,6 +103,7 @@ class VecEnv:
         total = time.perf_counter() - t0
 
         sorted_timed = sorted(timed, key=lambda x: x[0])
+        step_wall_times = np.array([dt for _, dt, _ in sorted_timed], dtype=np.float32)
         results = [r for _, _, r in sorted_timed]
         (combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists,
          damage_landed, hits_taken, step_game_times, step_real_times) = zip(*results)
@@ -101,7 +114,8 @@ class VecEnv:
         hits_taken = np.array(hits_taken, dtype=np.float32)
         step_game_times = np.array(step_game_times, dtype=np.float32)
         step_real_times = np.array(step_real_times, dtype=np.float32)
-        return *obs_batch, damage_landed, hits_taken, step_game_times, step_real_times
+        return (*obs_batch, damage_landed, hits_taken, step_game_times, step_real_times,
+                step_wall_times)
 
     async def reset_and_resume(self, reset_indices, levels=None):
         """Reset specified envs, resume the rest. Returns observations for reset envs only.
@@ -109,6 +123,9 @@ class VecEnv:
         reset_set = set(reset_indices)
         level_for = {env_i: levels[k] for k, env_i in enumerate(reset_indices)} \
             if levels is not None else {}
+        for env_i, lv in level_for.items():
+            if lv is not None:
+                self.env_levels[env_i] = lv
         tasks = []
         for i in range(self.n_envs):
             if i in reset_set:

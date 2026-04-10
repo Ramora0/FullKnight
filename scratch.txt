@@ -1,0 +1,1 @@
+python python/train.py --n_envs 8 --boss_levels GG_False_Knight,GG_Mega_Moss_Charger,GG_Gruz_Mother,GG_Hornet_1

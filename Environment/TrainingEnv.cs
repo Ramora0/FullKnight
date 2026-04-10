@@ -113,6 +113,10 @@ namespace FullKnight.Environment
 
 			InitBossRefs();
 			LogBossDiag($"reset#{_resetCount} POST-INITBOSSREFS");
+			// One-line pass/fail signal for the same-scene-reload bug. Grep for
+			// "[BounceCheck]" to audit every reset at a glance.
+			bool bossAwake = HasActiveCombatHitboxes();
+			Log($"[BounceCheck] reset#{_resetCount} level={_level} bossAwake={bossAwake}");
 			_knightMaxHP = PlayerData.instance.maxHealth;
 
 			UnhookDamage();

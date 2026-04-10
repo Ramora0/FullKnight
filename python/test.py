@@ -109,7 +109,8 @@ async def run(args):
             for step_i in range(args.steps):
                 (combat_hb, combat_mask, combat_kind_ids, combat_parent_ids,
                  terrain_hb, terrain_mask, gs,
-                 damage_landed, hits_taken, step_game_times, step_real_times) = \
+                 damage_landed, hits_taken, step_game_times, step_real_times,
+                 step_wall_times) = \
                     await vec_env.step_all(action_vec)
                 if step_i < 5 or step_i % 5 == 0:
                     summarize_obs(f"step {step_i:02d}", combat_hb, combat_mask,
