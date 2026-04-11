@@ -23,6 +23,9 @@ class VecEnv:
         # callers grab the boss name from dt-tagged results without having
         # to thread env_boss through step_all.
         self.env_levels = ["?"] * self.n_envs
+        # In-flight background reset tasks: env_i -> asyncio.Task wrapping the
+        # _timed_op reset coroutine. Caller polls with reap_completed_resets().
+        self._reset_tasks: dict = {}
 
     async def start_server(self):
         """Start WebSocket server and wait for all N connections."""
@@ -86,23 +89,34 @@ class VecEnv:
         results = [r for _, _, r in sorted(timed, key=lambda x: x[0])]
         return self._batch_observations(results)
 
-    async def step_all(self, actions):
-        """Step all envs in parallel.
-        actions: list of N action_vecs, each [movement, direction, action, jump].
+    async def step_all(self, actions, active_indices=None):
+        """Step envs in parallel.
+        actions: list of action_vecs, one per active env, each
+                 [movement, direction, action, jump]. Length must match
+                 len(active_indices) (or n_envs if not provided).
+        active_indices: optional list of env slots to step. When provided,
+                        only those envs are stepped and returned arrays are
+                        sized len(active_indices). Defaults to all envs.
         Returns (Observation, damage_landed, hits_taken, step_game_times,
-                 step_real_times, step_wall_times).
-        step_wall_times: (N,) float32 — per-env wall-clock seconds, so callers
-        can localize slow steps to a specific env/boss.
+                 step_real_times, step_wall_times). All arrays aligned to
+                 active_indices ordering.
         """
-        t0 = time.perf_counter()
-        timed = await asyncio.gather(*[
-            self._timed_op("step", i, self.envs[i].step(actions[i])) for i in range(self.n_envs)
-        ])
-        total = time.perf_counter() - t0
+        if active_indices is None:
+            active_indices = list(range(self.n_envs))
+        assert len(actions) == len(active_indices), \
+            f"actions length {len(actions)} != active_indices length {len(active_indices)}"
 
-        sorted_timed = sorted(timed, key=lambda x: x[0])
-        step_wall_times = np.array([dt for _, dt, _ in sorted_timed], dtype=np.float32)
-        results = [r for _, _, r in sorted_timed]
+        timed = await asyncio.gather(*[
+            self._timed_op("step", env_i, self.envs[env_i].step(actions[local_i]))
+            for local_i, env_i in enumerate(active_indices)
+        ])
+
+        # Sort results by position in active_indices (not env_i) to preserve
+        # caller ordering. _timed_op returns (env_i, dt, result); build a map.
+        by_env = {env_i: (dt, result) for env_i, dt, result in timed}
+        ordered = [by_env[env_i] for env_i in active_indices]
+        step_wall_times = np.array([dt for dt, _ in ordered], dtype=np.float32)
+        results = [r for _, r in ordered]
         (combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists,
          damage_landed, hits_taken, step_game_times, step_real_times) = zip(*results)
 
@@ -114,25 +128,76 @@ class VecEnv:
         step_real_times = np.array(step_real_times, dtype=np.float32)
         return obs, damage_landed, hits_taken, step_game_times, step_real_times, step_wall_times
 
-    async def reset_and_resume(self, reset_indices, levels=None):
-        """Reset specified envs, resume the rest. Returns observations for reset envs only.
-        levels: optional list aligned with reset_indices giving the new scene per reset env."""
+    async def start_resets(self, reset_indices, levels=None, resume_indices=None):
+        """Kick off background resets for reset_indices and synchronously
+        resume envs in resume_indices (defaults to all non-reset envs).
+
+        Reset tasks are stored in self._reset_tasks and run in the background
+        so the caller can immediately begin the next rollout on the remaining
+        active envs. Call reap_completed_resets() at epoch boundaries to
+        collect finished resets.
+
+        levels: optional list aligned with reset_indices giving the new scene
+                per reset env.
+        """
         reset_set = set(reset_indices)
         level_for = {env_i: levels[k] for k, env_i in enumerate(reset_indices)} \
             if levels is not None else {}
         for env_i, lv in level_for.items():
             if lv is not None:
                 self.env_levels[env_i] = lv
-        tasks = []
-        for i in range(self.n_envs):
-            if i in reset_set:
-                tasks.append(self._timed_op("reset", i,
-                                            self.envs[i].reset(level=level_for.get(i))))
-            else:
-                tasks.append(self._timed_op("resume", i, self.envs[i].resume()))
-        results = await asyncio.gather(*tasks)
-        reset_obs = [results[i][2] for i in reset_indices]
-        return reset_indices, self._batch_observations(reset_obs)
+
+        if resume_indices is None:
+            resume_indices = [i for i in range(self.n_envs) if i not in reset_set]
+
+        # Fire-and-forget: wrap each reset in an asyncio.Task so it runs in
+        # the background while we return control to the caller.
+        for env_i in reset_indices:
+            if env_i in self._reset_tasks:
+                raise RuntimeError(
+                    f"start_resets: env {env_i} already has a pending reset task"
+                )
+            coro = self._timed_op(
+                "reset", env_i,
+                self.envs[env_i].reset(level=level_for.get(env_i)),
+                loud=True,
+            )
+            self._reset_tasks[env_i] = asyncio.create_task(coro)
+
+        # Resume the remaining envs synchronously — these are fast (<10ms).
+        if resume_indices:
+            await asyncio.gather(*[
+                self._timed_op("resume", i, self.envs[i].resume())
+                for i in resume_indices
+            ])
+
+    def reap_completed_resets(self):
+        """Collect any reset tasks that have finished. Returns a list of
+        (env_i, raw_obs_tuple) where raw_obs_tuple is the per-env reset
+        return value (combat_hb, terrain_hb, gs, combat_kinds, combat_parents).
+
+        Completed tasks are removed from self._reset_tasks. Exceptions are
+        re-raised loudly — a silently-failed reset should crash the run
+        rather than leave an env stranded forever.
+        """
+        completed = []
+        for env_i in list(self._reset_tasks.keys()):
+            task = self._reset_tasks[env_i]
+            if not task.done():
+                continue
+            _env_i, _dt, result = task.result()  # raises if the task errored
+            completed.append((env_i, result))
+            del self._reset_tasks[env_i]
+        return completed
+
+    async def await_all_resets(self):
+        """Block until every in-flight reset task is done. Returns the same
+        list shape as reap_completed_resets(). Useful as a safety net at
+        epoch start if the reset cadence somehow exceeds the rollout budget."""
+        if not self._reset_tasks:
+            return []
+        await asyncio.gather(*self._reset_tasks.values())
+        return self.reap_completed_resets()
 
     async def pause_all(self):
         await asyncio.gather(*[env.pause() for env in self.envs])

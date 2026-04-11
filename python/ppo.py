@@ -177,9 +177,13 @@ class PPO:
         for i in indices:
             self.hx[i] = 0.0
 
-    def get_hx_snapshot(self):
-        """Return a copy of the current hidden state for buffering."""
-        return self.hx.copy()
+    def get_hx_snapshot(self, env_indices=None):
+        """Return a copy of the current hidden state for buffering.
+
+        If env_indices is provided, returns only those rows (in order)."""
+        if env_indices is None:
+            return self.hx.copy()
+        return self.hx[env_indices].copy()
 
     def _ensure_event_log(self):
         if not hasattr(self, '_event_log'):
@@ -218,9 +222,14 @@ class PPO:
         return result
 
     @torch.no_grad()
-    def collect_action(self, obs: Observation):
+    def collect_action(self, obs: Observation, env_indices=None):
         """Get actions for a batch of observations during rollout collection.
         Input is a numpy-backed Observation. Returns numpy arrays.
+
+        If env_indices is provided, the batch in `obs` corresponds to those
+        specific env slots. Only the matching rows of self.hx are read and
+        written; self.hx is kept full-sized (n_envs). Rows for envs not in
+        env_indices are left untouched.
         """
         import time as _time
         self._ensure_event_log()
@@ -252,7 +261,8 @@ class PPO:
         thb_t = torch.from_numpy(thb_norm).float()
         tm_t = torch.from_numpy(obs.terrain_mask).float()
         gs_t = torch.from_numpy(gs_norm).float()
-        hx_pinned = torch.from_numpy(self.hx).float()
+        hx_slice = self.hx[env_indices] if env_indices is not None else self.hx
+        hx_pinned = torch.from_numpy(hx_slice).float()
         self._tensor_prep_total += _time.perf_counter() - t1
 
         h2d_start.record()
@@ -274,7 +284,11 @@ class PPO:
         )
         fwd_end.record()
 
-        self.hx = hx_new.cpu().numpy()
+        hx_new_np = hx_new.cpu().numpy()
+        if env_indices is None:
+            self.hx = hx_new_np
+        else:
+            self.hx[env_indices] = hx_new_np
 
         d2h_start.record()
         actions_np = {k: v.cpu().numpy() for k, v in actions.items()}

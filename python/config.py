@@ -20,6 +20,10 @@ class Config:
     boss_levels: str = "GG_False_Knight,GG_Mega_Moss_Charger,GG_Gruz_Mother,GG_Hornet_1"  # comma-separated pool for training
     frames_per_wait: int = 5
     time_scale: int = 3
+    # Staggered reset cadence: each epoch resets max(1, n_envs // envs_per_reset_div)
+    # envs. Resets run as background asyncio tasks overlapping the next epoch's
+    # rollout, and those envs sit out that epoch (no data contributed).
+    envs_per_reset_div: int = 8
 
     # Hollow Knight paths (Windows)
     hk_path: str = r"C:\Program Files (x86)\Steam\steamapps\common\Hollow Knight"
