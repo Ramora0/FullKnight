@@ -13,7 +13,11 @@ from instance_manager import InstanceManager
 
 
 def merge_padded(old, new, indices, fill=0.0):
-    """Overwrite rows in old with rows from new, expanding padding dims if needed."""
+    """Overwrite rows in old with rows from new, expanding padding dims if needed.
+
+    `indices` is a list of row positions in `old` to overwrite; `new[k]` goes
+    into `old[indices[k]]`.
+    """
     if old.shape[1:] != new.shape[1:]:
         pad = [(0, 0)] + [(0, max(0, n - o)) for o, n in zip(old.shape[1:], new.shape[1:])]
         old = np.pad(old, pad, constant_values=fill)
@@ -22,6 +26,38 @@ def merge_padded(old, new, indices, fill=0.0):
         idx = tuple([env_i] + [slice(0, s) for s in new.shape[1:]])
         old[idx] = new[local_i]
     return old
+
+
+def merge_obs_padded(dst, src, indices):
+    """Scatter rows of batched Observation `src` into `dst` at `indices`.
+    Handles padding mismatch per-field via merge_padded. global_state has no
+    padding so it's a plain row copy.
+    """
+    out = dst.replace(
+        combat_hb=merge_padded(dst.combat_hb, src.combat_hb, indices),
+        combat_mask=merge_padded(dst.combat_mask, src.combat_mask, indices),
+        combat_kind_ids=merge_padded(dst.combat_kind_ids, src.combat_kind_ids, indices),
+        combat_parent_ids=merge_padded(dst.combat_parent_ids, src.combat_parent_ids, indices),
+        terrain_hb=merge_padded(dst.terrain_hb, src.terrain_hb, indices),
+        terrain_mask=merge_padded(dst.terrain_mask, src.terrain_mask, indices),
+    )
+    for local_i, env_i in enumerate(indices):
+        out.global_state[env_i] = src.global_state[local_i]
+    return out
+
+
+def slice_obs(obs, indices):
+    """Return a new Observation containing only the given env rows (in order)."""
+    idx = np.asarray(indices, dtype=np.int64)
+    return obs.replace(
+        combat_hb=obs.combat_hb[idx],
+        combat_mask=obs.combat_mask[idx],
+        combat_kind_ids=obs.combat_kind_ids[idx],
+        combat_parent_ids=obs.combat_parent_ids[idx],
+        terrain_hb=obs.terrain_hb[idx],
+        terrain_mask=obs.terrain_mask[idx],
+        global_state=obs.global_state[idx],
+    )
 
 
 def seed_everything(seed: int):
@@ -120,16 +156,39 @@ async def train(config: Config):
         slow_count_by_env = [0] * config.n_envs
 
         # First epoch: full reset to load boss scenes
-        obs = await vec_env.reset_all(levels=env_boss)
+        obs_full = await vec_env.reset_all(levels=env_boss)
         agent.reset_hidden(config.n_envs)
+        active_envs = list(range(config.n_envs))
 
-        # Staggered reset: cycle through envs, resetting n_envs/4 per epoch
-        envs_per_reset = max(1, config.n_envs // 4)
+        # Staggered reset: cycle through envs, resetting n_envs // envs_per_reset_div
+        # per epoch. Resets run as background tasks overlapping the next rollout;
+        # resetting envs sit out that epoch (no data contributed).
+        envs_per_reset = max(1, config.n_envs // config.envs_per_reset_div)
 
         # Initialized so the post-loop final save and summary have a defined
         # `epoch` even if the loop never runs (e.g. resuming from a completed run).
         epoch = start_epoch - 1
         for epoch in range(start_epoch, config.epochs):
+
+            # Reap any background resets that have completed since we kicked
+            # them off at the end of the prior epoch. Splice new obs into
+            # obs_full, zero their hidden state, and readd to active_envs.
+            reaped = vec_env.reap_completed_resets()
+            if reaped:
+                reaped_indices = [env_i for env_i, _ in reaped]
+                reaped_obs_batch = vec_env._batch_observations(
+                    [raw for _, raw in reaped]
+                )
+                obs_full = merge_obs_padded(obs_full, reaped_obs_batch, reaped_indices)
+                agent.reset_hidden_for(reaped_indices)
+                active_envs = sorted(set(active_envs) | set(reaped_indices))
+
+            # Rollout runs over the currently-active subset. Buffers are
+            # (T, N_active) shaped; N_active may be < n_envs if a reset from
+            # the previous epoch hasn't finished yet.
+            N_active = len(active_envs)
+            active_set = set(active_envs)
+            active_boss = [env_boss[i] for i in active_envs]
 
             # Rollout buffers
             buf_obs = []  # list of per-step Observations
@@ -146,9 +205,14 @@ async def train(config: Config):
 
             t_rollout_start = time.perf_counter()
 
+            # Slice the active-env view out of obs_full for the first step.
+            obs = slice_obs(obs_full, active_envs)
+
             for t in range(config.rollout_len):
-                buf_hx.append(agent.get_hx_snapshot())
-                actions_np, log_probs, values_atk, values_def = agent.collect_action(obs)
+                buf_hx.append(agent.get_hx_snapshot(env_indices=active_envs))
+                actions_np, log_probs, values_atk, values_def = agent.collect_action(
+                    obs, env_indices=active_envs
+                )
 
                 action_vecs = [
                     [
@@ -157,12 +221,14 @@ async def train(config: Config):
                         int(actions_np["action"][i]),
                         int(actions_np["jump"][i]),
                     ]
-                    for i in range(config.n_envs)
+                    for i in range(N_active)
                 ]
 
                 t_step = time.perf_counter()
                 (next_obs, damage_landed, hits_taken, step_game_times, step_real_times,
-                 step_wall_per_env) = await vec_env.step_all(action_vecs)
+                 step_wall_per_env) = await vec_env.step_all(
+                    action_vecs, active_indices=active_envs
+                )
                 wall_dt = time.perf_counter() - t_step
 
                 buf_obs.append(obs)
@@ -183,9 +249,15 @@ async def train(config: Config):
                     vis.update(obs)
 
             # Bootstrap final values
-            _, _, final_vatk, final_vdef = agent.collect_action(obs)
+            _, _, final_vatk, final_vdef = agent.collect_action(
+                obs, env_indices=active_envs
+            )
             buf_values_atk.append(final_vatk)
             buf_values_def.append(final_vdef)
+
+            # Scatter the final obs back into obs_full so the next epoch has a
+            # consistent per-env canonical state to splice reaped resets into.
+            obs_full = merge_obs_padded(obs_full, obs, active_envs)
 
             # Stack buffers: (T, N)
             damage_landed_arr = np.stack(buf_damage_landed)
@@ -197,15 +269,16 @@ async def train(config: Config):
             buf_hx_arr = np.stack(buf_hx)  # (T, N, hidden_dim)
 
             # Diagnostic: first combat event per env, step timing
-            any_event = (damage_landed_arr > 0) | (hits_taken_arr > 0)  # (T, N)
+            any_event = (damage_landed_arr > 0) | (hits_taken_arr > 0)  # (T, N_active)
             active_steps = int(any_event.sum())
             total_steps_epoch = damage_landed_arr.shape[0] * damage_landed_arr.shape[1]
             first_event_steps = []
-            for env_i in range(damage_landed_arr.shape[1]):
-                col = any_event[:, env_i]
+            for local_i in range(damage_landed_arr.shape[1]):
+                col = any_event[:, local_i]
                 idxs = np.where(col)[0]
                 first_event_steps.append(int(idxs[0]) if len(idxs) > 0 else damage_landed_arr.shape[0])
-            wall_time_arr = np.stack(buf_step_wall_times)  # (T, N)
+            wall_time_arr = np.stack(buf_step_wall_times)  # (T, N_active)
+            real_time_arr = np.stack(buf_step_real_times)  # (T, N_active) — C# unscaled sim time
             # First step may include intro skip — show it separately
             step0_ms = wall_time_arr[0].mean() * 1000 if wall_time_arr.shape[0] > 0 else 0
             avg_wall_ms = wall_time_arr[1:].mean() * 1000 if wall_time_arr.shape[0] > 1 else 0
@@ -213,29 +286,72 @@ async def train(config: Config):
             # For each env, report the max step time this epoch and every step
             # over `slow_step_threshold_s` gets counted against the boss.
             post_first = wall_time_arr[1:] if wall_time_arr.shape[0] > 1 else wall_time_arr
-            per_env_max = post_first.max(axis=0) if post_first.shape[0] > 0 else np.zeros(config.n_envs)
+            real_post = real_time_arr[1:] if real_time_arr.shape[0] > 1 else real_time_arr
+            per_env_max = post_first.max(axis=0) if post_first.shape[0] > 0 else np.zeros(N_active)
             per_env_slow_count = (post_first > slow_step_threshold_s).sum(axis=0)
+
+            # === PERF DIAGNOSTICS ===
+            # 1) Per-step spread across envs: how much wall time is wasted
+            #    waiting on the slowest env? Big P99 vs P50 → straggler problem
+            #    → queue/async stepping would help.
+            if post_first.size:
+                spread_s = post_first.max(axis=1) - post_first.min(axis=1)  # (T,)
+                spread_p50_ms = float(np.percentile(spread_s, 50)) * 1000
+                spread_p90_ms = float(np.percentile(spread_s, 90)) * 1000
+                spread_p99_ms = float(np.percentile(spread_s, 99)) * 1000
+                spread_max_ms = float(spread_s.max()) * 1000
+            else:
+                spread_p50_ms = spread_p90_ms = spread_p99_ms = spread_max_ms = 0.0
+
+            # 2) C# real_dt vs Python wall_dt: how much of HK time is sim
+            #    vs IPC/idle? If real_avg ≈ wall_avg the bottleneck is the
+            #    game itself; if real_avg << wall_avg it's IPC/Python.
+            #    real_dt is per-env; we average it over (T-1, N).
+            real_avg_ms = float(real_post.mean()) * 1000 if real_post.size else 0.0
+            overhead_ms = max(avg_wall_ms - real_avg_ms, 0.0)
+            sim_pct = 100 * real_avg_ms / avg_wall_ms if avg_wall_ms > 0 else 0
+
+            # 3) Per-boss avg step time: which bosses are slow stragglers?
+            #    Helps decide which bosses to drop or load-balance.
+            per_boss_step_ms = {}
+            if post_first.size:
+                for boss in set(active_boss):
+                    env_mask = np.array([b == boss for b in active_boss])
+                    if env_mask.any():
+                        per_boss_step_ms[boss] = float(post_first[:, env_mask].mean()) * 1000
             slow_events_epoch = []
-            for env_i in range(config.n_envs):
-                cnt = int(per_env_slow_count[env_i])
+            for local_i, env_i in enumerate(active_envs):
+                cnt = int(per_env_slow_count[local_i])
                 if cnt > 0:
                     boss = env_boss[env_i]
                     slow_count_by_boss[boss] = slow_count_by_boss.get(boss, 0) + cnt
                     slow_count_by_env[env_i] += cnt
                     slow_events_epoch.append(
-                        f"env{env_i}({boss.replace('GG_', '')}):{cnt}×max{per_env_max[env_i]:.1f}s"
+                        f"env{env_i}({boss.replace('GG_', '')}):{cnt}×max{per_env_max[local_i]:.1f}s"
                     )
             slow_str = " ".join(slow_events_epoch) if slow_events_epoch else "none"
             # Which envs will be reset after this epoch's training
             reset_offset = (epoch * envs_per_reset) % config.n_envs
             reset_indices = list(range(reset_offset, reset_offset + envs_per_reset))
             print(
-                f"  diag | active {active_steps}/{total_steps_epoch} "
+                f"  diag | active_envs {N_active}/{config.n_envs} | "
+                f"active_steps {active_steps}/{total_steps_epoch} "
                 f"({100*active_steps/total_steps_epoch:.1f}%) | "
                 f"first_event {first_event_steps} | "
                 f"step0 {step0_ms:.0f}ms | avg_step {avg_wall_ms:.1f}ms | "
                 f"reset_envs {reset_indices}"
             )
+            print(
+                f"  perf | spread P50/P90/P99/max "
+                f"{spread_p50_ms:.0f}/{spread_p90_ms:.0f}/{spread_p99_ms:.0f}/{spread_max_ms:.0f}ms | "
+                f"sim {real_avg_ms:.1f}ms ({sim_pct:.0f}%) overhead {overhead_ms:.1f}ms"
+            )
+            if per_boss_step_ms:
+                boss_perf_str = " ".join(
+                    f"{b.replace('GG_','')}:{per_boss_step_ms[b]:.0f}ms"
+                    for b in sorted(per_boss_step_ms, key=lambda b: -per_boss_step_ms[b])
+                )
+                print(f"  perf | per_boss_step {boss_perf_str}")
             if slow_events_epoch:
                 cum_boss = " ".join(
                     f"{b.replace('GG_', '')}:{slow_count_by_boss[b]}"
@@ -246,10 +362,12 @@ async def train(config: Config):
                     f"cum_by_boss: {cum_boss} | cum_by_env: {slow_count_by_env}"
                 )
 
-            # Per-boss adaptive D update. Only bosses represented in env_boss
-            # this epoch contribute; bosses with no envs are left untouched.
-            for boss in set(env_boss):
-                env_mask = np.array([b == boss for b in env_boss])
+            # Per-boss adaptive D update. Only bosses represented in the
+            # currently-active envs this epoch contribute; bosses with no
+            # active envs (e.g. only assigned to a currently-resetting env)
+            # are left untouched.
+            for boss in set(active_boss):
+                env_mask = np.array([b == boss for b in active_boss])
                 landed_b = float(damage_landed_arr[:, env_mask].sum())
                 taken_b = float(hits_taken_arr[:, env_mask].sum())
                 bs = boss_state[boss]
@@ -285,10 +403,13 @@ async def train(config: Config):
                 # else: both zero — no knight/boss interaction at all. Leave D
                 # alone; this usually means the arena is broken, not a signal.
 
-            D_per_env = np.array([boss_state[b]["D"] for b in env_boss], dtype=np.float32)
+            D_per_env = np.array([boss_state[b]["D"] for b in active_boss], dtype=np.float32)
 
-            # Pause game during training
-            await vec_env.pause_all()
+            # Pause game during training. Only pause active envs — resetting
+            # envs are mid-scene-load and must not be paused.
+            await asyncio.gather(*[
+                vec_env.envs[i].pause() for i in active_envs
+            ])
 
             t_rollout = time.perf_counter() - t_rollout_start
 
@@ -309,37 +430,38 @@ async def train(config: Config):
             inf = inf_timing or {}
             t_fwd = inf.get('forward_s', 0)
             t_norm = inf.get('normalize_s', 0)
-            t_xfer = inf.get('transfer_s', 0)
-            t_hk = t_rollout - t_fwd - t_norm - t_xfer
+            t_prep = inf.get('tensor_prep_s', 0)
+            t_h2d = inf.get('h2d_s', 0)
+            t_d2h = inf.get('d2h_s', 0)
+            t_collect = t_norm + t_prep + t_h2d + t_fwd + t_d2h
+            t_hk = t_rollout - t_collect
             print(
                 f"  timing | rollout {t_rollout:.2f}s | "
-                f"fwd {t_fwd:.2f}s | norm {t_norm:.2f}s | xfer {t_xfer:.2f}s | "
-                f"hk {t_hk:.2f}s | train {t_train:.2f}s | total {t_total:.2f}s"
+                f"hk {t_hk:.2f}s | collect {t_collect:.2f}s | "
+                f"train {t_train:.2f}s | total {t_total:.2f}s"
+            )
+            print(
+                f"  collect | norm {t_norm*1000:.0f}ms | prep {t_prep*1000:.0f}ms | "
+                f"h2d {t_h2d*1000:.0f}ms | fwd {t_fwd*1000:.0f}ms | d2h {t_d2h*1000:.0f}ms"
             )
 
             if config.anneal_lr:
                 agent.scheduler.step()
 
-            # Staggered reset: reset a subset of envs (randomly reassigning
-            # their boss from the pool) and resume the rest.
+            # Staggered reset: kick off resets for a subset of envs as
+            # background tasks, resume everyone else synchronously, and drop
+            # the reset envs from active_envs so the next rollout skips them.
+            # Only schedule envs that are actually currently active — an env
+            # still mid-reset from a prior epoch cannot be reset again.
+            reset_indices = [i for i in reset_indices if i in active_set]
             new_bosses = [bosses[int(rng.integers(len(bosses)))] for _ in reset_indices]
             for env_i, b in zip(reset_indices, new_bosses):
                 env_boss[env_i] = b
-            _, reset_obs = await vec_env.reset_and_resume(reset_indices, levels=new_bosses)
-
-            # Merge reset obs into carried-over obs (handle padding mismatch).
-            # Each field gets the same merge_padded treatment driven by reset_indices.
-            obs = obs.replace(
-                combat_hb=merge_padded(obs.combat_hb, reset_obs.combat_hb, reset_indices),
-                combat_mask=merge_padded(obs.combat_mask, reset_obs.combat_mask, reset_indices),
-                combat_kind_ids=merge_padded(obs.combat_kind_ids, reset_obs.combat_kind_ids, reset_indices),
-                combat_parent_ids=merge_padded(obs.combat_parent_ids, reset_obs.combat_parent_ids, reset_indices),
-                terrain_hb=merge_padded(obs.terrain_hb, reset_obs.terrain_hb, reset_indices),
-                terrain_mask=merge_padded(obs.terrain_mask, reset_obs.terrain_mask, reset_indices),
+            resume_indices = [i for i in active_envs if i not in set(reset_indices)]
+            await vec_env.start_resets(
+                reset_indices, levels=new_bosses, resume_indices=resume_indices
             )
-            for local_i, env_i in enumerate(reset_indices):
-                obs.global_state[env_i] = reset_obs.global_state[local_i]
-            agent.reset_hidden_for(reset_indices)
+            active_envs = [i for i in active_envs if i not in set(reset_indices)]
 
             # Logging — per-env curriculum reward uses per-env D.
             curriculum_reward = float(
@@ -354,11 +476,13 @@ async def train(config: Config):
 
             # Balanced sample means: per-boss mean first, then average across
             # represented bosses. Weights each boss equally regardless of how
-            # many envs happened to be assigned to it this epoch.
+            # many envs happened to be assigned to it this epoch. Uses
+            # active_boss (captured pre-reset) so the mask aligns with the
+            # (T, N_active) rollout arrays.
             per_boss_landed_mean = []
             per_boss_taken_mean = []
-            for boss in set(env_boss):
-                env_mask = np.array([b == boss for b in env_boss])
+            for boss in set(active_boss):
+                env_mask = np.array([b == boss for b in active_boss])
                 per_boss_landed_mean.append(float(damage_landed_arr[:, env_mask].mean()))
                 per_boss_taken_mean.append(float(hits_taken_arr[:, env_mask].mean()))
             balanced_landed = float(np.mean(per_boss_landed_mean))
@@ -385,8 +509,23 @@ async def train(config: Config):
                 "diag/max_step_ms": float(post_first.max()) * 1000 if post_first.size else 0,
                 "diag/slow_steps_epoch": int(per_env_slow_count.sum()),
                 "diag/gru_norm": metrics["gru_norm"],
+                # Perf diagnostics — see "PERF DIAGNOSTICS" block above for meaning.
+                "perf/spread_p50_ms": spread_p50_ms,
+                "perf/spread_p90_ms": spread_p90_ms,
+                "perf/spread_p99_ms": spread_p99_ms,
+                "perf/spread_max_ms": spread_max_ms,
+                "perf/sim_ms": real_avg_ms,
+                "perf/overhead_ms": overhead_ms,
+                "perf/sim_pct": sim_pct,
+                "perf/collect_norm_ms": t_norm * 1000,
+                "perf/collect_prep_ms": t_prep * 1000,
+                "perf/collect_h2d_ms": t_h2d * 1000,
+                "perf/collect_fwd_ms": t_fwd * 1000,
+                "perf/collect_d2h_ms": t_d2h * 1000,
                 "epoch": epoch,
             }
+            for boss, ms in per_boss_step_ms.items():
+                log[f"perf/per_boss_step_ms/{boss}"] = ms
             for boss in bosses:
                 log[f"curriculum/D/{boss}"] = boss_state[boss]["D"]
                 log[f"diag/slow_cum/{boss}"] = slow_count_by_boss.get(boss, 0)

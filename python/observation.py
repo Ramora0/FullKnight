@@ -56,6 +56,23 @@ class CB:
     HP_MAX_RAW = 9   # observed max HP (cached on first sight, refill-aware), same treatment
 
 
+class TR:
+    """Terrain segment feature column indices (8 floats).
+
+    Every terrain collider is decomposed into line segments C#-side
+    (boxes → 4 edges, edge colliders → polyline, polygons → closed paths,
+    circles → 12-gon). Each segment is knight-relative.
+    """
+    MX = 0           # segment midpoint x
+    MY = 1           # segment midpoint y
+    HDX = 2          # half-vector x (midpoint → one endpoint), canonicalized HDX ≥ 0
+    HDY = 3          # half-vector y (canonical tie-break: HDX == 0 ⇒ HDY ≥ 0)
+    NPX = 4          # nearest point on the segment (clamped, not infinite line) x
+    NPY = 5          # nearest point on the segment y
+    DIST = 6         # L2 norm of (NPX, NPY) — pre-computed so attention can gate on it linearly
+    IS_TRIGGER = 7   # 0/1, pass-through (not normalized)
+
+
 # ---------------------------------------------------------------------------
 # Observation: bundle of seven padded arrays/tensors that flow together.
 # ---------------------------------------------------------------------------
@@ -76,7 +93,7 @@ class Observation:
     combat_mask: Any       # (..., max_combat)
     combat_kind_ids: Any   # (..., max_combat) int
     combat_parent_ids: Any # (..., max_combat) int
-    terrain_hb: Any        # (..., max_terrain, 5)
+    terrain_hb: Any        # (..., max_terrain, 8)
     terrain_mask: Any      # (..., max_terrain)
     global_state: Any      # (..., 22)
 

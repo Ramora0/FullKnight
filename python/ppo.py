@@ -177,36 +177,59 @@ class PPO:
         for i in indices:
             self.hx[i] = 0.0
 
-    def get_hx_snapshot(self):
-        """Return a copy of the current hidden state for buffering."""
-        return self.hx.copy()
+    def get_hx_snapshot(self, env_indices=None):
+        """Return a copy of the current hidden state for buffering.
+
+        If env_indices is provided, returns only those rows (in order)."""
+        if env_indices is None:
+            return self.hx.copy()
+        return self.hx[env_indices].copy()
 
     def _ensure_event_log(self):
         if not hasattr(self, '_event_log'):
+            # Each entry: (h2d_start, h2d_end, fwd_start, fwd_end, d2h_start, d2h_end)
             self._event_log = []
             self._norm_total = 0.0
+            self._tensor_prep_total = 0.0  # CPU-side from_numpy/.float() before .to()
 
     def report_timing(self):
-        """Call once per epoch after cuda.synchronize(). Returns timing dict."""
+        """Call once per epoch after cuda.synchronize(). Returns timing dict.
+
+        Components of one collect_action call:
+          - normalize_s:    CPU-side numpy normalization
+          - tensor_prep_s:  CPU-side from_numpy/.float() (before async .to())
+          - h2d_s:          GPU-side host->device transfer
+          - forward_s:      GPU-side model forward + sampling
+          - d2h_s:          GPU-side device->host transfer of actions/values
+        """
         if not hasattr(self, '_event_log') or not self._event_log:
             return None
-        fwd_ms = sum(s.elapsed_time(e) for s, e, _ in self._event_log)
-        xfer_ms = sum(s.elapsed_time(e) for _, _, (s, e) in self._event_log)
+        h2d_ms = sum(s.elapsed_time(e) for s, e, _, _, _, _ in self._event_log)
+        fwd_ms = sum(s.elapsed_time(e) for _, _, s, e, _, _ in self._event_log)
+        d2h_ms = sum(s.elapsed_time(e) for _, _, _, _, s, e in self._event_log)
         c = len(self._event_log)
         result = {
-            'normalize_s': self._norm_total,
-            'forward_s': fwd_ms / 1000,
-            'transfer_s': xfer_ms / 1000,
+            'normalize_s':   self._norm_total,
+            'tensor_prep_s': self._tensor_prep_total,
+            'h2d_s':         h2d_ms / 1000,
+            'forward_s':     fwd_ms / 1000,
+            'd2h_s':         d2h_ms / 1000,
             'count': c,
         }
         self._event_log.clear()
         self._norm_total = 0.0
+        self._tensor_prep_total = 0.0
         return result
 
     @torch.no_grad()
-    def collect_action(self, obs: Observation):
+    def collect_action(self, obs: Observation, env_indices=None):
         """Get actions for a batch of observations during rollout collection.
         Input is a numpy-backed Observation. Returns numpy arrays.
+
+        If env_indices is provided, the batch in `obs` corresponds to those
+        specific env slots. Only the matching rows of self.hx are read and
+        written; self.hx is kept full-sized (n_envs). Rows for envs not in
+        env_indices are left untouched.
         """
         import time as _time
         self._ensure_event_log()
@@ -220,22 +243,40 @@ class PPO:
         thb_norm = self._normalize_hitboxes(obs.terrain_hb, obs.terrain_mask, self.terrain_normalizer)
         self._norm_total += _time.perf_counter() - t0
 
-        gpu_obs = Observation(
-            combat_hb=torch.from_numpy(chb_norm).float().to(self.device),
-            combat_mask=torch.from_numpy(obs.combat_mask).float().to(self.device),
-            combat_kind_ids=torch.from_numpy(obs.combat_kind_ids).long().to(self.device),
-            combat_parent_ids=torch.from_numpy(obs.combat_parent_ids).long().to(self.device),
-            terrain_hb=torch.from_numpy(thb_norm).float().to(self.device),
-            terrain_mask=torch.from_numpy(obs.terrain_mask).float().to(self.device),
-            global_state=torch.from_numpy(gs_norm).float().to(self.device),
-        )
-
+        # CPU-side tensor prep (from_numpy + .float()) — async .to() is timed
+        # separately via cuda events. We measure CPU prep with wall time and
+        # bracket the .to() calls with cuda events for the actual transfer.
+        h2d_start = torch.cuda.Event(enable_timing=True)
+        h2d_end = torch.cuda.Event(enable_timing=True)
         fwd_start = torch.cuda.Event(enable_timing=True)
         fwd_end = torch.cuda.Event(enable_timing=True)
-        xfer_start = torch.cuda.Event(enable_timing=True)
-        xfer_end = torch.cuda.Event(enable_timing=True)
+        d2h_start = torch.cuda.Event(enable_timing=True)
+        d2h_end = torch.cuda.Event(enable_timing=True)
 
-        hx_t = torch.from_numpy(self.hx).float().to(self.device)
+        t1 = _time.perf_counter()
+        chb_t = torch.from_numpy(chb_norm).float()
+        cm_t = torch.from_numpy(obs.combat_mask).float()
+        ckid_t = torch.from_numpy(obs.combat_kind_ids).long()
+        cpid_t = torch.from_numpy(obs.combat_parent_ids).long()
+        thb_t = torch.from_numpy(thb_norm).float()
+        tm_t = torch.from_numpy(obs.terrain_mask).float()
+        gs_t = torch.from_numpy(gs_norm).float()
+        hx_slice = self.hx[env_indices] if env_indices is not None else self.hx
+        hx_pinned = torch.from_numpy(hx_slice).float()
+        self._tensor_prep_total += _time.perf_counter() - t1
+
+        h2d_start.record()
+        gpu_obs = Observation(
+            combat_hb=chb_t.to(self.device),
+            combat_mask=cm_t.to(self.device),
+            combat_kind_ids=ckid_t.to(self.device),
+            combat_parent_ids=cpid_t.to(self.device),
+            terrain_hb=thb_t.to(self.device),
+            terrain_mask=tm_t.to(self.device),
+            global_state=gs_t.to(self.device),
+        )
+        hx_t = hx_pinned.to(self.device)
+        h2d_end.record()
 
         fwd_start.record()
         actions, log_prob, _, value_atk, value_def, hx_new = self.policy.get_action_and_value(
@@ -243,14 +284,18 @@ class PPO:
         )
         fwd_end.record()
 
-        self.hx = hx_new.cpu().numpy()
+        hx_new_np = hx_new.cpu().numpy()
+        if env_indices is None:
+            self.hx = hx_new_np
+        else:
+            self.hx[env_indices] = hx_new_np
 
-        xfer_start.record()
+        d2h_start.record()
         actions_np = {k: v.cpu().numpy() for k, v in actions.items()}
         result = actions_np, log_prob.cpu().numpy(), value_atk.cpu().numpy(), value_def.cpu().numpy()
-        xfer_end.record()
+        d2h_end.record()
 
-        self._event_log.append((fwd_start, fwd_end, (xfer_start, xfer_end)))
+        self._event_log.append((h2d_start, h2d_end, fwd_start, fwd_end, d2h_start, d2h_end))
         return result
 
     def train_on_rollout(self, obs_buf, actions_arr, log_probs_arr,
