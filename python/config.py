@@ -99,7 +99,7 @@ class Config:
     total_steps_per_epoch: int = 256
     batch_size: int = 128
     train_iters: int = 2
-    anneal_lr: bool = True
+    anneal_lr: bool = False
     save_every: int = 50
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
