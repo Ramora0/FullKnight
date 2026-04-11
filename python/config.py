@@ -15,7 +15,7 @@ class Config:
     # Environment
     server_host: str = "localhost"
     server_port: int = 8765
-    n_envs: int = 8
+    n_envs: int = 16
     level: str = "GG_Mega_Moss_Charger"  # used by eval
     boss_levels: str = "GG_False_Knight,GG_Mega_Moss_Charger,GG_Gruz_Mother,GG_Hornet_1"  # comma-separated pool for training
     frames_per_wait: int = 5
@@ -82,7 +82,7 @@ class Config:
     gamma: float = 0.95
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    value_coeff: float = 0.1
+    value_coeff: float = 0.5
     entropy_coeff: float = 0.02
     max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
