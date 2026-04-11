@@ -15,7 +15,7 @@ class Config:
     # Environment
     server_host: str = "localhost"
     server_port: int = 8765
-    n_envs: int = 1
+    n_envs: int = 8
     level: str = "GG_Mega_Moss_Charger"  # used by eval
     boss_levels: str = "GG_Mega_Moss_Charger"  # comma-separated pool for training
     frames_per_wait: int = 5
