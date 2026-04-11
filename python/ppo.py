@@ -5,7 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 from model import FullKnightActorCritic
-from observation import Observation
+from observation import Observation, CB
 
 
 class RunningNormalizer:
@@ -78,7 +78,8 @@ class PPO:
         # Only normalize continuous features (indices 0:n_cont), not binary validity flags
         self.obs_normalizer = RunningNormalizer(config.global_state_dim - config.n_binary_flags)
         # Combat normalizer covers cols [0, combat_normalized_dims). The trailing
-        # hp_raw column is intentionally left raw so the agent reads absolute HP.
+        # hp_raw / hp_max_raw columns get log1p compression instead of z-scoring,
+        # via _log_compress_combat_tail — see that helper for the rationale.
         self.combat_normalizer = RunningNormalizer(config.combat_normalized_dims)
         self.terrain_normalizer = RunningNormalizer(config.terrain_normalized_dims)
 
@@ -137,9 +138,23 @@ class PPO:
         gs_norm[..., n_cont:] = global_state[..., n_cont:]
         return gs_norm
 
+    @staticmethod
+    def _log_compress_combat_hp(combat_hb):
+        """In-place log1p compression of the hp_raw / hp_max_raw columns
+        (CB.HP_RAW, CB.HP_MAX_RAW). Padded slots stay zero (log1p(0)=0).
+        Values are clamped to >=0 first to be defensive against negative HP
+        from edge cases. See config.combat_feature_dim docstring for the
+        magnitude rationale."""
+        if combat_hb.shape[-1] <= CB.HP_RAW:
+            return
+        hp = combat_hb[..., CB.HP_RAW:CB.HP_MAX_RAW + 1]
+        np.maximum(hp, 0, out=hp)
+        np.log1p(hp, out=hp)
+
     def _normalize_hitboxes(self, hitboxes, mask, normalizer):
         """Normalize the first `normalizer.mean.shape[0]` columns; pass the rest through.
-        For combat hitboxes the trailing hp_raw column is left raw on purpose."""
+        Combat hp columns (hp_raw/hp_max_raw) are log1p-compressed by the caller
+        via _log_compress_combat_hp."""
         n_norm = normalizer.mean.shape[0]
         flat = hitboxes.reshape(-1, hitboxes.shape[-1])
         flat_mask = mask.reshape(-1)
@@ -201,6 +216,7 @@ class PPO:
         self.obs_normalizer.update(obs.global_state[..., :n_cont])
         gs_norm = self._normalize_global_state(obs.global_state)
         chb_norm = self._normalize_hitboxes(obs.combat_hb, obs.combat_mask, self.combat_normalizer)
+        self._log_compress_combat_hp(chb_norm)
         thb_norm = self._normalize_hitboxes(obs.terrain_hb, obs.terrain_mask, self.terrain_normalizer)
         self._norm_total += _time.perf_counter() - t0
 
@@ -328,6 +344,9 @@ class PPO:
             if nc > 0:
                 flat_chb_2d[i, :nc, :n_norm_c] = self.combat_normalizer.normalize(
                     flat_chb_2d[i, :nc, :n_norm_c])
+        # Log1p the hp columns over the whole buffer at once. Padded rows are
+        # zero so log1p(0)=0 keeps them clean.
+        self._log_compress_combat_hp(flat_chb_2d)
         flat_chb = flat_chb_2d.reshape(T_used, N, max_combat, cfg.combat_feature_dim)
 
         flat_thb_2d = stacked.terrain_hb.reshape(total_samples, max_terrain, cfg.terrain_feature_dim)

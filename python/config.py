@@ -26,13 +26,16 @@ class Config:
     hk_data_dir: str = "hollow_knight_Data"
 
     # Observation dims
-    # Combat: [rel_x, rel_y, w, h, is_trigger, gives_damage, takes_damage, is_target, hp_raw]
+    # Combat: [rel_x, rel_y, w, h, is_trigger, gives_damage, takes_damage, is_target,
+    #         hp_raw, hp_max_raw]
     # Only the continuous spatial cols (rel_x, rel_y, w, h) get running-normalized.
     # Binary flags (is_trigger, gives_damage, takes_damage, is_target) pass through raw
     # so sparse flags like is_target don't get amplified by a tiny running variance.
-    # hp_raw also passes through raw so the agent reads absolute HP.
-    combat_feature_dim: int = 9
-    combat_normalized_dims: int = 4  # first N combat columns get normalized; the rest pass through
+    # hp_raw / hp_max_raw also bypass the running normalizer; PPO log1p-compresses
+    # them so they enter the network as ~[0, 8] while keeping high resolution near
+    # death (log1p(0)→0, log1p(21)→3.09, log1p(42)→3.76, log1p(2000)→7.6).
+    combat_feature_dim: int = 10
+    combat_normalized_dims: int = 4  # first N combat columns get z-scored; binary flags pass raw; hp cols get log1p
     terrain_feature_dim: int = 5 # [rel_x, rel_y, w, h, is_trigger]
     terrain_normalized_dims: int = 4  # is_trigger passes through raw
     global_state_dim: int = 22   # vel(2), hp, soul, knight_bounds(2), 7 ability flags, 9 validity flags

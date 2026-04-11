@@ -30,6 +30,12 @@ namespace FullKnight.Game
 		public readonly Dictionary<Collider2D, string> kindCache = new();
 		public readonly Dictionary<Collider2D, string> parentCache = new();
 		public readonly Dictionary<Collider2D, HealthManager> hmCache = new();
+		// HK's HealthManager has no public maxHp field — max is whatever the
+		// prefab serialized into `hp` at OnEnable. We cache the highest hp
+		// we've ever seen per HM, populated on first sight (when hp == max in
+		// every normal flow) and bumped if a phase refill ever pushes it higher.
+		// Lives on the reader so it dies with the scene, same as the other caches.
+		public readonly Dictionary<HealthManager, int> hmMaxHpCache = new();
 
 		private void Start()
 		{
@@ -54,6 +60,10 @@ namespace FullKnight.Game
 			var dead = new List<Collider2D>();
 			foreach (var k in kindCache.Keys) if (k == null) dead.Add(k);
 			foreach (var k in dead) { kindCache.Remove(k); parentCache.Remove(k); hmCache.Remove(k); }
+			// Drop max-hp entries for HMs that have been destroyed.
+			var deadHms = new List<HealthManager>();
+			foreach (var k in hmMaxHpCache.Keys) if (k == null) deadHms.Add(k);
+			foreach (var k in deadHms) hmMaxHpCache.Remove(k);
 		}
 
 		private void AddHitbox(Collider2D collider2D)
@@ -133,6 +143,21 @@ namespace FullKnight.Game
 			// Force population.
 			GetParentKind(col);
 			return hmCache.TryGetValue(col, out cached) ? cached : null;
+		}
+
+		/// <summary>Return the observed max HP for an HM: max of (cached, current).
+		/// First sight populates the cache; phase refills (current > cached) bump it.</summary>
+		public int ObserveMaxHp(HealthManager hm)
+		{
+			if (hm == null) return 0;
+			int cur = hm.hp;
+			if (hmMaxHpCache.TryGetValue(hm, out int seen))
+			{
+				if (cur > seen) { hmMaxHpCache[hm] = cur; return cur; }
+				return seen;
+			}
+			hmMaxHpCache[hm] = cur;
+			return cur;
 		}
 
 		private void ClassifyParent(Collider2D col, out string name, out HealthManager hm)
@@ -469,15 +494,17 @@ namespace FullKnight.Game
 
 		/// <summary>
 		/// Extract hitbox features split by type.
-		/// Combat (Enemy + Attack): 9 floats per hitbox —
+		/// Combat (Enemy + Attack): 10 floats per hitbox —
 		///   [rel_x, rel_y, width, height, is_trigger,
-		///    gives_damage, takes_damage, is_target, hp_raw]
+		///    gives_damage, takes_damage, is_target, hp_raw, hp_max_raw]
 		///   gives_damage = collider hurts the knight on contact (Enemy bucket).
 		///   takes_damage = a HealthManager is reachable from this collider.
 		///   is_target    = that HealthManager is in the supplied bossHms set.
 		///   hp_raw       = current HP of the reached HealthManager (0 if none).
-		///                  Raw value, NOT normalized — the agent should be able to
-		///                  read "1-2 nail hits from death" vs "beefy".
+		///   hp_max_raw   = observed max HP (cached on first sight, bumped on refills).
+		/// Both hp_raw and hp_max_raw are emitted RAW; the Python side log1p-compresses
+		/// them so the network sees a sane magnitude while preserving high resolution
+		/// in the "1-2 nail hits from death" regime.
 		/// CombatKinds / CombatParents: parallel string lists.
 		/// Terrain: [rel_x, rel_y, width, height, is_trigger]
 		/// Knight: bounds only (width, height), folded into global state.
@@ -546,10 +573,11 @@ namespace FullKnight.Game
 						float takesDamage = hm != null ? 1f : 0f;
 						float isTarget = (hm != null && bossHms != null && bossHms.Contains(hm)) ? 1f : 0f;
 						float hpRaw = hm != null ? (float)hm.hp : 0f;
+						float hpMaxRaw = hm != null && reader != null ? (float)reader.ObserveMaxHp(hm) : 0f;
 
 						combat.Add(new float[] {
 							relX, relY, w, h, isTrigger,
-							givesDamage, takesDamage, isTarget, hpRaw
+							givesDamage, takesDamage, isTarget, hpRaw, hpMaxRaw
 						});
 						combatKinds.Add(reader != null ? reader.GetKind(col) : "unknown");
 						combatParents.Add(parent);

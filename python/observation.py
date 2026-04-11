@@ -43,7 +43,7 @@ class GS:
 
 
 class CB:
-    """Combat hitbox feature column indices (9 floats)."""
+    """Combat hitbox feature column indices (10 floats)."""
     REL_X = 0
     REL_Y = 1
     W = 2
@@ -52,7 +52,8 @@ class CB:
     GIVES_DAMAGE = 5
     TAKES_DAMAGE = 6
     IS_TARGET = 7
-    HP_RAW = 8
+    HP_RAW = 8       # current HP, raw on the wire; log1p-compressed before the model
+    HP_MAX_RAW = 9   # observed max HP (cached on first sight, refill-aware), same treatment
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +72,7 @@ class Observation:
       Per-rollout step (after stack): (T, B, ...)
       Per-training chunk: (B, L, ...)
     """
-    combat_hb: Any         # (..., max_combat, 9)
+    combat_hb: Any         # (..., max_combat, 10)
     combat_mask: Any       # (..., max_combat)
     combat_kind_ids: Any   # (..., max_combat) int
     combat_parent_ids: Any # (..., max_combat) int

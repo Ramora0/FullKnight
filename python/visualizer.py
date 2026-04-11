@@ -170,6 +170,7 @@ class Visualizer:
             takes = row[CB.TAKES_DAMAGE]
             is_target = row[CB.IS_TARGET]
             hp_raw = row[CB.HP_RAW]
+            hp_max_raw = row[CB.HP_MAX_RAW]
             if is_target > 0.5:
                 color = "red"
             elif gives > 0.5 and takes > 0.5:
@@ -196,7 +197,7 @@ class Visualizer:
             else:
                 label = f"{kid}<{pid}>" if pid > 0 else f"{kid}"
             if takes > 0.5:
-                label += f" hp={int(hp_raw)}"
+                label += f" hp={int(hp_raw)}/{int(hp_max_raw)}"
             ax.text(
                 rx - w / 2, ry + h / 2, label,
                 fontsize=7, color="black",

@@ -246,7 +246,10 @@ def get_action(agent, raw_obs, config, deterministic, hx, vocab):
     np_obs = np_obs.replace(global_state=gs_norm)
 
     # Normalize hitboxes — combat normalizer covers only the leading
-    # combat_normalized_dims columns; the trailing hp_raw column passes through raw.
+    # combat_normalized_dims (spatial) columns; binary flags pass through raw
+    # and the hp_raw / hp_max_raw columns get log1p compression to keep them
+    # in the same magnitude band as the z-scored features (see
+    # PPO._log_compress_combat_hp).
     n_norm_c = config.combat_normalized_dims
     chb = np_obs.combat_hb
     cm = np_obs.combat_mask
@@ -254,6 +257,7 @@ def get_action(agent, raw_obs, config, deterministic, hx, vocab):
         nc = int(cm[i].sum())
         if nc > 0:
             chb[i, :nc, :n_norm_c] = agent.combat_normalizer.normalize(chb[i, :nc, :n_norm_c])
+    PPO._log_compress_combat_hp(chb)
     n_norm_t = config.terrain_normalized_dims
     thb = np_obs.terrain_hb
     tm = np_obs.terrain_mask
