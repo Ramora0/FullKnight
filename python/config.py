@@ -82,7 +82,7 @@ class Config:
     gamma: float = 0.95
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    value_coeff: float = 0.5
+    value_coeff: float = 0.1
     entropy_coeff: float = 0.02
     max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
@@ -92,7 +92,7 @@ class Config:
     epochs: int = 2000
     total_steps_per_epoch: int = 1024
     batch_size: int = 128
-    train_iters: int = 3
+    train_iters: int = 2
     anneal_lr: bool = True
     save_every: int = 50
     save_path: str = "models/fullknight"
