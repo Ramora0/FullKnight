@@ -78,19 +78,19 @@ class Config:
 
 
     # PPO
-    lr: float = 1e-4
+    lr: float = 5e-4
     gamma: float = 0.95
     gae_lambda: float = 0.95
-    clip_eps: float = 0.1
+    clip_eps: float = 0.2
     value_coeff: float = 0.5
-    entropy_coeff: float = 0.05
+    entropy_coeff: float = 0.02
     max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
-    target_kl: float = 0.01
+    target_kl: float = 0.03
 
     # Training
     epochs: int = 2000
-    total_steps_per_epoch: int = 512
+    total_steps_per_epoch: int = 1024
     batch_size: int = 128
     train_iters: int = 4
     anneal_lr: bool = True
