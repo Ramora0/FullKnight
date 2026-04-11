@@ -160,10 +160,13 @@ async def train(config: Config):
         agent.reset_hidden(config.n_envs)
         active_envs = list(range(config.n_envs))
 
-        # Staggered reset: cycle through envs, resetting n_envs // envs_per_reset_div
-        # per epoch. Resets run as background tasks overlapping the next rollout;
-        # resetting envs sit out that epoch (no data contributed).
+        # Staggered reset: every `steps_per_reset` accumulated env-steps,
+        # schedule a reset for `envs_per_reset` envs round-robin. Resets run
+        # as background tasks overlapping the next rollout; scheduled envs sit
+        # out of the active set until their reset completes.
         envs_per_reset = max(1, config.n_envs // config.envs_per_reset_div)
+        steps_since_last_reset = 0
+        next_reset_env = 0  # round-robin cursor, advances only when scheduling
 
         # Initialized so the post-loop final save and summary have a defined
         # `epoch` even if the loop never runs (e.g. resuming from a completed run).
@@ -330,15 +333,24 @@ async def train(config: Config):
                         f"env{env_i}({boss.replace('GG_', '')}):{cnt}×max{per_env_max[local_i]:.1f}s"
                     )
             slow_str = " ".join(slow_events_epoch) if slow_events_epoch else "none"
-            # Which envs will be reset after this epoch's training
-            reset_offset = (epoch * envs_per_reset) % config.n_envs
-            reset_indices = list(range(reset_offset, reset_offset + envs_per_reset))
+            # Step-driven reset scheduling: accumulate env-steps collected this
+            # epoch, fire a reset batch each time we cross `steps_per_reset`.
+            # Cadence is independent of rollout wall time, so the offline pool
+            # stays bounded even when rollout << reset.
+            steps_since_last_reset += total_steps_epoch
+            reset_indices = []
+            while steps_since_last_reset >= config.steps_per_reset:
+                steps_since_last_reset -= config.steps_per_reset
+                for _ in range(envs_per_reset):
+                    reset_indices.append(next_reset_env)
+                    next_reset_env = (next_reset_env + 1) % config.n_envs
             print(
                 f"  diag | active_envs {N_active}/{config.n_envs} | "
                 f"active_steps {active_steps}/{total_steps_epoch} "
                 f"({100*active_steps/total_steps_epoch:.1f}%) | "
                 f"first_event {first_event_steps} | "
                 f"step0 {step0_ms:.0f}ms | avg_step {avg_wall_ms:.1f}ms | "
+                f"reset_budget {steps_since_last_reset}/{config.steps_per_reset} | "
                 f"reset_envs {reset_indices}"
             )
             print(
