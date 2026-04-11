@@ -411,7 +411,10 @@ class PPO:
 
         pbar = tqdm(total=total_passes, unit="pass", unit_scale=True,
                     desc="  train", leave=False, dynamic_ncols=True)
+        stop_training = False
         for _ in range(cfg.train_iters):
+            if stop_training:
+                break
             chunk_indices = np.random.permutation(total_chunks)
             iter_kl_sum = 0.0
             iter_kl_n = 0
@@ -486,8 +489,15 @@ class PPO:
                 pbar.update(len(idx) * L)
                 pbar.set_postfix_str(f"surr={surrogate.item():+.3f} kl={kl:.3f}")
 
-            if cfg.target_kl and iter_kl_n > 0:
-                if (iter_kl_sum / iter_kl_n) > cfg.target_kl:
+                # Mid-iter running-mean halt with 2-minibatch warmup: catches
+                # cumulative drift as soon as it exceeds target, but avoids the
+                # "first outlier kills the epoch" jankiness of per-batch halt.
+                if (
+                    cfg.target_kl
+                    and iter_kl_n >= 2
+                    and (iter_kl_sum / iter_kl_n) > cfg.target_kl
+                ):
+                    stop_training = True
                     break
 
         pbar.close()
