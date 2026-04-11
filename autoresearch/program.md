@@ -56,7 +56,9 @@ bash autoresearch/run_experiment.sh
 - **`frames_per_wait`** — current 5. Boss attacks are fast; this is on the table if you have a specific hypothesis, but it changes the effective time horizon so watch KL carefully.
 - **`max_grad_norm`**, **`target_kl`**, **`value_coeff`**, **`max_value_loss`** — all safe mid-run.
 
-**The goal is simple: get the highest hit_ratio** (damage_landed / damage_taken, averaged over the last 20 epochs of each run). Fixed time budget + same resume point = experiments are directly comparable.
+**The goal is simple: get the highest `final_D_geomean`** (geomean of per-boss D over the last 20 epochs). Fixed time budget + same resume point = experiments are directly comparable. D is the adaptive curriculum scale — it converges to damage_landed/hits_taken — so a higher geomean across the boss pool means the policy is doing better per hit taken on average across bosses.
+
+**Multi-boss noise caveat**: the default pool is 4 bosses, so with `n_envs=8` each boss only has ~2 envs collecting data per epoch. Per-epoch metrics are noisier than single-boss ablations. Treat sub-5% deltas as noise.
 
 **This is an early MVP, not a final product.** Keep long-run learning potential in mind, but balance it against measured results:
 - A change that *should* help long-run generalization but costs ~5% hit_ratio? Probably worth keeping.

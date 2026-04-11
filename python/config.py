@@ -17,7 +17,7 @@ class Config:
     server_port: int = 8765
     n_envs: int = 8
     level: str = "GG_Mega_Moss_Charger"  # used by eval
-    boss_levels: str = "GG_Mega_Moss_Charger"  # comma-separated pool for training
+    boss_levels: str = "GG_False_Knight,GG_Mega_Moss_Charger,GG_Gruz_Mother,GG_Hornet_1"  # comma-separated pool for training
     frames_per_wait: int = 5
     time_scale: int = 3
 
