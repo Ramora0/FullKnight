@@ -62,10 +62,28 @@ async def train(config: Config):
 
         bosses = config.boss_levels_list
         assert len(bosses) > 0, "config.boss_levels must list at least one scene"
+
+        # D curriculum knobs (D_window, D_ema, D_max_delta) were tuned for
+        # total_steps_per_epoch = 8192. Rescale them per-sample so behavior
+        # stays consistent as we vary rollout length: a 1024-step run does
+        # 8x more epochs per unit-data, so its per-epoch clamp should be 8x
+        # smaller, its EMA decay 8x slower, and its window 8x wider.
+        D_BASELINE_STEPS = 8192
+        D_step_scale = config.total_steps_per_epoch / D_BASELINE_STEPS
+        D_window_eff = max(1, int(round(config.D_window / D_step_scale)))
+        D_ema_eff = config.D_ema ** D_step_scale
+        D_max_delta_eff = config.D_max_delta * D_step_scale
+        print(
+            f"D curriculum: step_scale={D_step_scale:.4f} "
+            f"window={D_window_eff} ema={D_ema_eff:.4f} "
+            f"max_delta={D_max_delta_eff:.4f} (from config "
+            f"{config.D_window}/{config.D_ema}/{config.D_max_delta})"
+        )
+
         boss_state = {b: {
             "D": config.D_initial,
-            "landed_window": deque(maxlen=config.D_window),
-            "taken_window":  deque(maxlen=config.D_window),
+            "landed_window": deque(maxlen=D_window_eff),
+            "taken_window":  deque(maxlen=D_window_eff),
         } for b in bosses}
         rng = np.random.default_rng(config.seed or None)
         env_boss = [bosses[int(rng.integers(len(bosses)))] for _ in range(config.n_envs)]
@@ -246,24 +264,24 @@ async def train(config: Config):
                     if len(bs["landed_window"]) == 1:
                         bs["D"] = D_raw
                     else:
-                        D_new = config.D_ema * bs["D"] + (1 - config.D_ema) * D_raw
+                        D_new = D_ema_eff * bs["D"] + (1 - D_ema_eff) * D_raw
                         bs["D"] = float(np.clip(
                             D_new,
-                            bs["D"] * (1 - config.D_max_delta),
-                            bs["D"] * (1 + config.D_max_delta),
+                            bs["D"] * (1 - D_max_delta_eff),
+                            bs["D"] * (1 + D_max_delta_eff),
                         ))
                 elif window_landed == 0 and window_taken > 0:
                     # Strong signal: policy is taking hits but landing nothing.
                     # Curriculum is too hard — drop D aggressively (2x clamp rate).
                     bs["D"] = float(max(
-                        bs["D"] * (1 - 2 * config.D_max_delta),
+                        bs["D"] * (1 - 2 * D_max_delta_eff),
                         config.D_min,
                     ))
                 elif window_landed > 0 and window_taken == 0:
                     # Weaker signal: policy is landing damage without getting hit.
                     # Push D up at the normal clamp rate. No upper ceiling — D
                     # grows unbounded as the agent improves.
-                    bs["D"] = float(bs["D"] * (1 + config.D_max_delta))
+                    bs["D"] = float(bs["D"] * (1 + D_max_delta_eff))
                 # else: both zero — no knight/boss interaction at all. Leave D
                 # alone; this usually means the arena is broken, not a signal.
 
