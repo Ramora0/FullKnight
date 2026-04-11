@@ -14,3 +14,4 @@ bb3c01c	9.75	keep	apr11 baseline F scratch train_iters=3 target_kl=0 (FK 16.43 b
 65c7740	14.23	keep	apr11 baseline J steps 1024->512 NEW BEST (+9.6%, 830 ep vs 407 = +104% epochs; FK 32.31 Moss 10.73 both best, Gruz 13.51 -15% Hornet 8.56 flat, ent -2.60 kl 0.0024; small epochs viable post-reset-amortize)
 fabd714	18.36	keep	apr11 baseline K steps 512->256 NEW BEST (+29% vs J, +41% vs I; 1583 ep, FK 29.28 Moss 17.63 Gruz 13.99 Hornet 16.63, ent -2.30 IMPROVED kl 4e-5; small-epoch on-policy regime validated)
 09ed8cd	17.96	keep	apr11 baseline L post-merge step-based resets on K config (D within noise 17.96 vs 18.36; per-boss shifted FK 45.01 +54% Moss 12.69 -28%; epochs 1553 ~ K's 1583 so no throughput bump from step-based resets — amortized epoch-based was already doing the work)
+b792ad3	11.43	discard	apr11 baseline M anneal_lr True->False (-36% vs L; dmg halved 0.123->0.053, kl 0.0005->0.004; lr=5e-4 sustained too high, anneal was needed; revert)

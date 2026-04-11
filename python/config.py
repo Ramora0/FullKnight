@@ -86,7 +86,7 @@ class Config:
     # PPO
     lr: float = 5e-4
     gamma: float = 0.95
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.9
     clip_eps: float = 0.2
     value_coeff: float = 0.5
     entropy_coeff: float = 0.02
@@ -99,7 +99,7 @@ class Config:
     total_steps_per_epoch: int = 256
     batch_size: int = 128
     train_iters: int = 2
-    anneal_lr: bool = False
+    anneal_lr: bool = True
     save_every: int = 50
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
