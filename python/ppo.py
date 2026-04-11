@@ -413,7 +413,8 @@ class PPO:
                     desc="  train", leave=False, dynamic_ncols=True)
         for _ in range(cfg.train_iters):
             chunk_indices = np.random.permutation(total_chunks)
-            early_stop = False
+            epoch_kl_sum = 0.0
+            epoch_kl_n = 0
 
             for start in range(0, total_chunks, CPB):
                 idx = chunk_indices[start:start + CPB]
@@ -478,17 +479,17 @@ class PPO:
                 with torch.no_grad():
                     kl = ((ratio - 1) - log_ratio).mean().item()
                     total_metrics["kl"] += kl
+                    epoch_kl_sum += kl
+                    epoch_kl_n += 1
 
                 passes_done += len(idx) * L
                 pbar.update(len(idx) * L)
                 pbar.set_postfix_str(f"surr={surrogate.item():+.3f} kl={kl:.3f}")
 
-                if cfg.target_kl and kl > cfg.target_kl:
-                    early_stop = True
+            if cfg.target_kl and epoch_kl_n > 0:
+                epoch_kl = epoch_kl_sum / epoch_kl_n
+                if epoch_kl > cfg.target_kl:
                     break
-
-            if early_stop:
-                break
 
         pbar.close()
         out = {k: v / max(n_updates, 1) for k, v in total_metrics.items()}
