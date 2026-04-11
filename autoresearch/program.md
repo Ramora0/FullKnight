@@ -21,37 +21,51 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment trains for a **fixed time budget of 20 minutes** (wall clock). Launch it as:
+Each experiment trains for a **fixed time budget of 30 minutes** (wall clock) and **resumes from `models/fullknight_500.pth`** — we're ablating "what's best for continuing this training," not "what's best from scratch." 30 minutes from a warm 500-epoch checkpoint gives a much cleaner signal than 30 minutes from random init (which at ~50 epochs is dominated by noise).
+
+Launch a run via:
 
 ```bash
-.venv/Scripts/python.exe python/train.py --time_budget 1200 > autoresearch/run.log 2>&1
+bash autoresearch/run_experiment.sh
 ```
 
-The `--time_budget` flag sets the wall-clock limit in seconds and auto-disables wandb. All verbose output goes to `autoresearch/run.log`; pipe through `sed -n '/^---$/,$ p' autoresearch/run.log` afterward to extract the summary block.
+`run_experiment.sh` handles time budget, resume path, wandb config, and run naming. All verbose output goes to `autoresearch/run.log`; the script prints only the summary block on success.
+
+**Wandb**: runs go to project `fullknight-ablation`, named `"<short_hash> <commit_subject>"`, so every row in the dashboard maps 1:1 to a git commit on the ablation branch. Write descriptive commit messages — they *are* the run names.
 
 **What you CAN do:**
-- Modify `python/config.py` — this is the only file you edit. Only numeric hyperparameters are fair game: learning rate, discount factor, entropy coefficient, batch size, network dimensions, curriculum parameters, etc.
+- Modify `python/config.py` — the only file you edit. Numeric hyperparameters are fair game (see "priority ablations" below).
 
 **What you CANNOT do:**
-- Modify `train.py`, `ppo.py`, `model.py`, `run_experiment.sh`, or any other file. They are read-only.
-- Change non-tunable structural fields: `server_host`, `server_port`, `n_envs`, file paths, observation dims (`combat_feature_dim`, `terrain_feature_dim`, `global_state_dim`), action dims (`movement_n`, `direction_n`, `action_n`, `jump_n`), or `n_validity_flags`.
+- Modify `train.py`, `ppo.py`, `model.py`, `run_experiment.sh`, or any other file. Read-only during the experiment loop.
+- Change non-tunable structural fields: `server_host`, `server_port`, `n_envs`, file paths, observation dims (`combat_feature_dim`, `combat_normalized_dims`, `terrain_feature_dim`, `terrain_normalized_dims`, `global_state_dim`, `n_binary_flags`), action dims (`movement_n`, `direction_n`, `action_n`, `jump_n`), or the kind-vocab dims.
+- **Off-limits because we're resuming from a checkpoint** — changing these breaks the warm start:
+  - `gamma` — value heads are calibrated to the current discount factor; changing it invalidates V(s).
+  - `D_initial`, `D_ema`, `D_window`, `D_min`, `D_max_delta` — curriculum state is restored from the checkpoint, so changing these mid-curriculum produces garbage.
+  - Any reward-shape field (there aren't any tunable reward knobs in `Config`, but if you find one, leave it).
+  - Architecture dims: `global_hidden`, `global_output`, `combat_hidden`, `combat_output`, `terrain_hidden`, `terrain_output`, `hidden_dim`, `gru_dim`, `kind_embed_dim`. The checkpoint has fixed shapes; changing these forces a fresh init and defeats the point of resuming.
 - Install new packages or add dependencies.
 
-**The goal is simple: get the highest hit_ratio** (damage_landed / damage_taken, averaged over the last 20 epochs of each run). Since the time budget is fixed, experiments are directly comparable regardless of how many epochs complete. Higher hit_ratio is better.
+**Priority ablations** (things we explicitly want to explore):
+- **`entropy_coeff`** — current default 0.01. At epoch 500 the policy may be collapsing; try 0.02, 0.03, 0.05. Or 0.005 if entropy is still high and exploration is wasting steps.
+- **`total_steps_per_epoch`** — current default 8192. Longer rollouts = better advantage estimates but fewer gradient updates per wall-clock minute. Try 4096, 16384.
+- **`lr`** — current 5e-4. Adam absorbs lr shifts cleanly on resume, so this is a safe knob. Try 2e-4, 1e-3.
+- **`clip_eps`** — current 0.2. Tighter (0.1) = more conservative updates from a warm policy; looser (0.3) = more aggressive.
+- **`gae_lambda`** — current 0.95. Safe to perturb; trades variance vs bias in the advantage estimate.
+- **`batch_size`**, **`chunks_per_batch`**, **`seq_len`**, **`train_iters`** — all safe mid-run. With 8192 steps/epoch and batch_size 128, that's a specific sample-reuse ratio; try wider ranges.
+- **`frames_per_wait`** — current 5. Boss attacks are fast; this is on the table if you have a specific hypothesis, but it changes the effective time horizon so watch KL carefully.
+- **`max_grad_norm`**, **`target_kl`**, **`value_coeff`**, **`max_value_loss`** — all safe mid-run.
 
-**This is an early MVP, not a final product.** The model will be trained much longer after this ablation pass. Keep long-run learning potential in mind, but balance it against measured results:
-- A change that *should* help long-run generalization but costs ~5% hit_ratio? Probably worth keeping — short-run noise matters less than ceiling.
-- A change that hurts long-run potential (e.g. gamma too low, entropy too low, network too small) but shows 20%+ improvement? Probably still worth keeping — a massive empirical win outweighs theoretical concerns.
-- Use judgment. Neither short-run metrics nor long-run theory should be an absolute veto. Weigh both.
+**The goal is simple: get the highest hit_ratio** (damage_landed / damage_taken, averaged over the last 20 epochs of each run). Fixed time budget + same resume point = experiments are directly comparable.
 
-**Think about the domain.** This is a Hollow Knight boss-fighting agent — a fast-paced 2D action game with variable-length hitbox observations, frame-skip, and real-time combat. Default PPO hyperparameters come from Atari/MuJoCo papers and may not suit this environment at all. Consider:
-- **Epoch length** (`total_steps_per_epoch`): 2048 steps at 5-frame skip is only ~570 real-time frames per epoch at 60fps. Is that enough per rollout? Too much? This is absolutely on the table.
-- **Frame skip** (`frames_per_wait`): Boss attacks are fast — too much skip and the agent can't react; too little and credit assignment gets harder.
-- **Discount factor** (`gamma`): Boss fights have short time horizons compared to e.g. Atari adventure games. 0.99 may or may not be appropriate.
-- **Batch size / train iters**: With only 2048 steps per epoch and batch_size 128, that's 16 batches × 4 iters = 64 gradient steps per epoch. Is that enough? Too many reuses of the same data?
-- The defaults were guesses. Question all of them.
+**This is an early MVP, not a final product.** Keep long-run learning potential in mind, but balance it against measured results:
+- A change that *should* help long-run generalization but costs ~5% hit_ratio? Probably worth keeping.
+- A change that hurts long-run potential but shows 20%+ improvement? Probably still worth keeping.
+- Use judgment. Weigh both.
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+**Think about the domain.** This is a Hollow Knight boss-fighting agent — a fast-paced 2D action game with variable-length hitbox observations, frame-skip, and real-time combat. Default PPO hyperparameters come from Atari/MuJoCo papers and may not suit this environment. Question the defaults.
+
+**The first run**: Your very first run should establish the baseline at the current config — run the script unchanged so the wandb dashboard has a reference point for every future comparison.
 
 ## Output format
 
@@ -117,14 +131,16 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **One variable at a time**: Prefer changing ONE hyperparameter per experiment. This is ablation, not random search. After establishing which direction helps for individual parameters, you can combine winners in later experiments.
 
+**Follow the gradient — don't abandon promising leads**: When a change helps, keep pushing in that direction until it stops helping. If `entropy_coeff 0.01 → 0.02` improves hit_ratio, the next experiment should be `0.03` or `0.04`, not a completely different parameter. Ride the win all the way to the peak — only move on once you see a clear plateau or regression. Conversely, when a change hurts, try the *opposite* direction before giving up on that parameter: if `lr 5e-4 → 1e-3` regressed, try `2e-4` next rather than concluding "lr is fine." You've only falsified one side of the knob. A parameter is only "done" once you've seen both directions underperform or you've found its peak. Never declare a promising direction "explored" after a single step — that's how you leave 20% gains on the table.
+
 **Use diagnostics**: Check `final_entropy` and `final_kl` in the output. If KL is consistently high (> 0.05), the learning rate or clip_eps may be too aggressive. If entropy collapses early, `entropy_coeff` is too low. Use these signals to guide your next experiment, not just hit_ratio.
 
 **Noise**: RL is noisy. If a result is within ~5% of baseline, it's probably noise — treat it as "equal" and discard. Focus on changes that show clear directional improvement.
 
-**Timeout**: Each experiment takes ~20 minutes. If a run exceeds 30 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment takes ~30 minutes. If a run exceeds 40 minutes, kill it and treat it as a failure (discard and revert).
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the code for new angles, try combining previous near-misses, try wider ranges of parameters you've already tested. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~20 minutes then you can run 3/hour, for a total of about 24 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+As an example use case, a user might leave you running while they sleep. If each experiment takes ~30 minutes then you can run 2/hour, for a total of about 16 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
