@@ -27,12 +27,14 @@ class Config:
 
     # Observation dims
     # Combat: [rel_x, rel_y, w, h, is_trigger, gives_damage, takes_damage, is_target, hp_raw]
-    # The last column (hp_raw) is intentionally left out of the running normalizer
-    # so the agent reads raw HP values and can recognize "1-2 nail hits from death"
-    # vs "beefy" in absolute terms.
+    # Only the continuous spatial cols (rel_x, rel_y, w, h) get running-normalized.
+    # Binary flags (is_trigger, gives_damage, takes_damage, is_target) pass through raw
+    # so sparse flags like is_target don't get amplified by a tiny running variance.
+    # hp_raw also passes through raw so the agent reads absolute HP.
     combat_feature_dim: int = 9
-    combat_normalized_dims: int = 8  # first N combat columns get normalized; the rest pass through
+    combat_normalized_dims: int = 4  # first N combat columns get normalized; the rest pass through
     terrain_feature_dim: int = 5 # [rel_x, rel_y, w, h, is_trigger]
+    terrain_normalized_dims: int = 4  # is_trigger passes through raw
     global_state_dim: int = 22   # vel(2), hp, soul, knight_bounds(2), 7 ability flags, 9 validity flags
     n_binary_flags: int = 16     # 7 ability unlock + 9 action validity (not normalized)
 

@@ -1,0 +1,560 @@
+{
+  "global_state": {
+    "vel_x": 0.0,
+    "vel_y": 0.0,
+    "hp": 9.0,
+    "soul": 0.0,
+    "knight_w": 0.5,
+    "knight_h": 1.28125,
+    "raw": [
+      0.0,
+      0.0,
+      9.0,
+      0.0,
+      0.5,
+      1.28125,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "combat": [
+    {
+      "kind": "Cloud Hazard",
+      "parent": "unknown",
+      "rel_x": 2.6500015258789062,
+      "rel_y": -7.8081231117248535,
+      "w": 113.2699966430664,
+      "h": 5.880000114440918,
+      "is_trigger": false,
+      "gives_damage": true,
+      "takes_damage": false,
+      "is_target": false,
+      "hp_raw": 0.0
+    },
+    {
+      "kind": "Giant Buzzer Col",
+      "parent": "Giant Buzzer Col",
+      "rel_x": 13.465511322021484,
+      "rel_y": 5.715694427490234,
+      "w": 2.390625,
+      "h": 1.328125,
+      "is_trigger": false,
+      "gives_damage": true,
+      "takes_damage": true,
+      "is_target": true,
+      "hp_raw": 450.0
+    }
+  ],
+  "terrain": [
+    {
+      "rel_x": 104.89666748046875,
+      "rel_y": -183.70811462402344,
+      "w": 1520.17333984375,
+      "h": 78.1693115234375,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Bounds Cage",
+        "path": "_GameManager",
+        "col_type": "BoxCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "150.09,-170.30,1520.17,78.17",
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "143.21",
+        "touching": "0",
+        "ray_self": "0",
+        "ray_first": "Knight",
+        "ray_dist": "0.11",
+        "overlap_self": "1",
+        "overlap_n": "1"
+      }
+    },
+    {
+      "rel_x": -17.779998779296875,
+      "rel_y": 57.72261428833008,
+      "w": 1.9699172973632812,
+      "h": 143.261474609375,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "World Edge (1)",
+        "path": "",
+        "col_type": "BoxCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "27.41,71.13,1.97,143.26",
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "16.52",
+        "touching": "0",
+        "ray_self": "0",
+        "ray_first": "Buzzer Dust 5 (1)",
+        "ray_dist": "1.33",
+        "overlap_self": "1",
+        "overlap_n": "1"
+      }
+    },
+    {
+      "rel_x": 21.210002899169922,
+      "rel_y": 57.72261428833008,
+      "w": 1.96990966796875,
+      "h": 143.261474609375,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "World Edge (1)",
+        "path": "",
+        "col_type": "BoxCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "66.40,71.13,1.97,143.26",
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "19.95",
+        "touching": "0",
+        "ray_self": "0",
+        "ray_first": "Buzzer Dust 2 (1)",
+        "ray_dist": "0.66",
+        "overlap_self": "1",
+        "overlap_n": "1"
+      }
+    },
+    {
+      "rel_x": 0.7433052062988281,
+      "rel_y": -13.873872756958008,
+      "w": 59.86063766479492,
+      "h": 6.653542518615723,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Floor Saver",
+        "path": "GG_Arena_Prefab/Floor",
+        "col_type": "BoxCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "45.93,-0.47,59.86,6.65",
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "9.13",
+        "touching": "0",
+        "ray_self": "0",
+        "ray_first": "Knight",
+        "ray_dist": "0.11",
+        "overlap_self": "1",
+        "overlap_n": "1"
+      }
+    },
+    {
+      "rel_x": -29.189998626708984,
+      "rel_y": -11.908123016357422,
+      "w": 32.0,
+      "h": 3.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 0",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "16.00,1.50,32.00,3.00",
+        "segments": [
+          [
+            -45.19,
+            -12.41,
+            -45.19,
+            -13.41
+          ],
+          [
+            -45.19,
+            -13.41,
+            -13.19,
+            -13.41
+          ],
+          [
+            -13.19,
+            -13.41,
+            -13.19,
+            -10.41
+          ],
+          [
+            -13.19,
+            -10.41,
+            -45.19,
+            -10.41
+          ],
+          [
+            -45.19,
+            -10.41,
+            -45.19,
+            -12.41
+          ]
+        ],
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "15.75",
+        "touching": "0",
+        "ray_self": "0",
+        "ray_first": "Knight",
+        "ray_dist": "0.17",
+        "overlap_self": "0",
+        "overlap_n": "0"
+      }
+    },
+    {
+      "rel_x": 98.80999755859375,
+      "rel_y": -11.908123016357422,
+      "w": 32.0,
+      "h": 3.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 4",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "144.00,1.50,32.00,3.00",
+        "segments": [
+          [
+            82.81,
+            -12.41,
+            82.81,
+            -13.41
+          ],
+          [
+            82.81,
+            -13.41,
+            114.81,
+            -13.41
+          ],
+          [
+            114.81,
+            -13.41,
+            114.81,
+            -10.41
+          ],
+          [
+            114.81,
+            -10.41,
+            82.81,
+            -10.41
+          ],
+          [
+            82.81,
+            -10.41,
+            82.81,
+            -12.41
+          ]
+        ],
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "83.03",
+        "touching": "0",
+        "ray_self": "0",
+        "ray_first": "Buzzer Dust 2 (1)",
+        "ray_dist": "0.66",
+        "overlap_self": "0",
+        "overlap_n": "0"
+      }
+    },
+    {
+      "rel_x": 124.80999755859375,
+      "rel_y": -11.908123016357422,
+      "w": 20.0,
+      "h": 3.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 5",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "170.00,1.50,20.00,3.00",
+        "segments": [
+          [
+            114.81,
+            -12.41,
+            114.81,
+            -13.41
+          ],
+          [
+            114.81,
+            -13.41,
+            134.81,
+            -13.41
+          ],
+          [
+            134.81,
+            -13.41,
+            134.81,
+            -10.41
+          ],
+          [
+            134.81,
+            -10.41,
+            114.81,
+            -10.41
+          ],
+          [
+            114.81,
+            -10.41,
+            114.81,
+            -12.41
+          ]
+        ],
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "114.89",
+        "touching": "0",
+        "ray_self": "0",
+        "ray_first": "Buzzer Dust 2 (1)",
+        "ray_dist": "0.66",
+        "overlap_self": "0",
+        "overlap_n": "0"
+      }
+    },
+    {
+      "rel_x": 2.8100013732910156,
+      "rel_y": -7.408123016357422,
+      "w": 32.0,
+      "h": 12.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 1",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "48.00,6.00,32.00,12.00",
+        "segments": [
+          [
+            -13.19,
+            -12.41,
+            -13.19,
+            -13.41
+          ],
+          [
+            -13.19,
+            -13.41,
+            18.81,
+            -13.41
+          ],
+          [
+            18.81,
+            -13.41,
+            18.81,
+            -10.41
+          ],
+          [
+            18.81,
+            -10.41,
+            9.81,
+            -10.41
+          ],
+          [
+            9.81,
+            -10.41,
+            9.81,
+            -1.41
+          ],
+          [
+            9.81,
+            -1.41,
+            -5.19,
+            -1.41
+          ],
+          [
+            -5.19,
+            -1.41,
+            -5.19,
+            -10.41
+          ],
+          [
+            -5.19,
+            -10.41,
+            -13.19,
+            -10.41
+          ],
+          [
+            -13.19,
+            -10.41,
+            -13.19,
+            -12.41
+          ]
+        ],
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "-0.01",
+        "touching": "1",
+        "ray_self": "0",
+        "ray_first": "Knight",
+        "ray_dist": "0.11",
+        "overlap_self": "0",
+        "overlap_n": "1"
+      }
+    },
+    {
+      "rel_x": 66.80999755859375,
+      "rel_y": -11.908123016357422,
+      "w": 32.0,
+      "h": 3.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 3",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "112.00,1.50,32.00,3.00",
+        "segments": [
+          [
+            50.81,
+            -12.41,
+            50.81,
+            -13.41
+          ],
+          [
+            50.81,
+            -13.41,
+            82.81,
+            -13.41
+          ],
+          [
+            82.81,
+            -13.41,
+            82.81,
+            -10.41
+          ],
+          [
+            82.81,
+            -10.41,
+            50.81,
+            -10.41
+          ],
+          [
+            50.81,
+            -10.41,
+            50.81,
+            -12.41
+          ]
+        ],
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "51.34",
+        "touching": "0",
+        "ray_self": "0",
+        "ray_first": "Buzzer Dust 2 (1)",
+        "ray_dist": "0.67",
+        "overlap_self": "0",
+        "overlap_n": "0"
+      }
+    },
+    {
+      "rel_x": 34.810001373291016,
+      "rel_y": -11.908123016357422,
+      "w": 32.0,
+      "h": 3.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 2",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "80.00,1.50,32.00,3.00",
+        "segments": [
+          [
+            18.81,
+            -12.41,
+            18.81,
+            -13.41
+          ],
+          [
+            18.81,
+            -13.41,
+            50.81,
+            -13.41
+          ],
+          [
+            50.81,
+            -13.41,
+            50.81,
+            -10.41
+          ],
+          [
+            50.81,
+            -10.41,
+            18.81,
+            -10.41
+          ],
+          [
+            18.81,
+            -10.41,
+            18.81,
+            -12.41
+          ]
+        ],
+        "layer_ignore": "0",
+        "pair_ignore": "0",
+        "rb": "0",
+        "dist": "20.61",
+        "touching": "0",
+        "ray_self": "0",
+        "ray_first": "Knight",
+        "ray_dist": "0.22",
+        "overlap_self": "0",
+        "overlap_n": "0"
+      }
+    }
+  ]
+}

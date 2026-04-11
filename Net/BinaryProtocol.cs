@@ -89,6 +89,19 @@ namespace FullKnight.Net
 					w.Write((byte)len);
 					w.Write(bytes, 0, len);
 				}
+
+				// Terrain debug strings (temporary, for the hitbox viewer).
+				// One per terrain hitbox. u16 length prefix — these carry full
+				// GameObject paths and can exceed 255 bytes.
+				var tdebug = d.terrain_debug ?? new List<string>();
+				for (int i = 0; i < terrain.Count; i++)
+				{
+					string s = i < tdebug.Count ? (tdebug[i] ?? "") : "";
+					var bytes = System.Text.Encoding.UTF8.GetBytes(s);
+					int len = bytes.Length > 65535 ? 65535 : bytes.Length;
+					w.Write((ushort)len);
+					w.Write(bytes, 0, len);
+				}
 			}
 
 			return ms.ToArray();

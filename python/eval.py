@@ -20,7 +20,7 @@ from observation import Observation, GS, CB
 
 async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
                     level="GG_Mega_Moss_Charger", record=None, hk_path=None,
-                    duration=0):
+                    duration=0, no_agent=False, visualize=False):
     config = Config(n_envs=1, level=level)
     # Scale frames_per_wait to preserve game-time-per-step from training.
     # Training: time_scale=3, frames_per_wait=5 → 15 frame-equivalents per step.
@@ -29,13 +29,21 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     config.time_scale = time_scale
     config.frames_per_wait = train_game_time // time_scale
 
-    # Load agent (vocab loaded from checkpoint to keep embedding rows aligned)
-    agent = PPO(config)
+    agent = None
     vocab = KindVocab(max_size=config.kind_vocab_size)
-    agent.load_checkpoint(checkpoint_path, vocab=vocab)
-    agent.policy.eval()
-    print(f"Loaded checkpoint: {checkpoint_path}")
+    if no_agent:
+        print(f"No-agent mode: sending noop actions, skipping PPO entirely.")
+    else:
+        agent = PPO(config)
+        agent.load_checkpoint(checkpoint_path, vocab=vocab)
+        agent.policy.eval()
+        print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Level: {level} | Time scale: {time_scale}x | frames_per_wait: {config.frames_per_wait} | Deterministic: {deterministic}")
+
+    vis = None
+    if visualize:
+        from visualizer import Visualizer
+        vis = Visualizer(vocab=vocab)
 
     # Launch game instance with full graphics
     mgr = None
@@ -68,9 +76,10 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
     await connected.wait()
     print("Game connected!")
 
-    # Reset with eval mode (real HP, boss can die). raw_obs is the per-env tuple
-    # straight from the wire: (combat_hb_list, terrain_hb_list, gs, kinds, parents).
-    raw_obs = await env.reset(eval_mode=True)
+    # Reset. With an agent we use eval_mode=True (real HP, boss can die); in
+    # no-agent viewer mode we stay in the infinite-fight training distribution
+    # so nothing dies while you poke around.
+    raw_obs = await env.reset(eval_mode=not no_agent)
     # Capture max knight HP from first obs (right after reset = full health).
     # Boss HP is now per-hitbox (hp_raw column); we record the per-target max
     # on first sight so we can spoof targets back to full each step (matching the
@@ -98,20 +107,35 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
 
     try:
         while True:
-            # Spoof knight HP so agent sees max like during training.
-            raw_obs[2][GS.HP] = max_knight_hp
-            # Spoof every is_target hitbox's hp_raw back to its observed max.
-            combat_hb_now = raw_obs[0]
-            combat_kinds_now = raw_obs[3]
-            for hb_i in range(len(combat_hb_now)):
-                row = combat_hb_now[hb_i]
-                if row[CB.IS_TARGET] > 0.5:
-                    key = combat_kinds_now[hb_i] if hb_i < len(combat_kinds_now) else ""
-                    cur = float(row[CB.HP_RAW])
-                    if cur > target_max_hp.get(key, 0.0):
-                        target_max_hp[key] = cur
-                    row[CB.HP_RAW] = target_max_hp.get(key, cur)
-            action_vec, hx = get_action(agent, raw_obs, config, deterministic, hx, vocab)
+            if no_agent:
+                action_vec = [2, 2, 7, 1]  # idle: no move/dir/action/jump
+            else:
+                # Spoof knight HP so agent sees max like during training.
+                raw_obs[2][GS.HP] = max_knight_hp
+                # Spoof every is_target hitbox's hp_raw back to its observed max.
+                combat_hb_now = raw_obs[0]
+                combat_kinds_now = raw_obs[3]
+                for hb_i in range(len(combat_hb_now)):
+                    row = combat_hb_now[hb_i]
+                    if row[CB.IS_TARGET] > 0.5:
+                        key = combat_kinds_now[hb_i] if hb_i < len(combat_kinds_now) else ""
+                        cur = float(row[CB.HP_RAW])
+                        if cur > target_max_hp.get(key, 0.0):
+                            target_max_hp[key] = cur
+                        row[CB.HP_RAW] = target_max_hp.get(key, cur)
+                action_vec, hx = get_action(agent, raw_obs, config, deterministic, hx, vocab)
+
+            if vis is not None:
+                combat_hb_list, terrain_hb_list, gs_raw, c_kinds, c_parents = raw_obs
+                kind_ids = vocab.encode_list(c_kinds)
+                parent_ids = vocab.encode_list(c_parents)
+                vis.update(
+                    batch_obs(
+                        combat_hb_list, terrain_hb_list, gs_raw,
+                        kind_ids, parent_ids, config,
+                    ),
+                    terrain_debug=env.last_terrain_debug,
+                )
 
             (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
              damage, hits, _, _, done) = await env.step_eval(action_vec)
@@ -230,12 +254,13 @@ def get_action(agent, raw_obs, config, deterministic, hx, vocab):
         nc = int(cm[i].sum())
         if nc > 0:
             chb[i, :nc, :n_norm_c] = agent.combat_normalizer.normalize(chb[i, :nc, :n_norm_c])
+    n_norm_t = config.terrain_normalized_dims
     thb = np_obs.terrain_hb
     tm = np_obs.terrain_mask
     for i in range(thb.shape[0]):
         nt = int(tm[i].sum())
         if nt > 0:
-            thb[i, :nt] = agent.terrain_normalizer.normalize(thb[i, :nt])
+            thb[i, :nt, :n_norm_t] = agent.terrain_normalizer.normalize(thb[i, :nt, :n_norm_t])
 
     device = agent.device
     obs_t = Observation(
@@ -386,7 +411,12 @@ def stop_recording(proc):
 
 def main():
     parser = argparse.ArgumentParser(description="Play trained agent in a real boss fight")
-    parser.add_argument("checkpoint", help="Path to model checkpoint (.pth)")
+    parser.add_argument("checkpoint", nargs="?", default=None,
+                        help="Path to model checkpoint (.pth). Omit with --no-agent.")
+    parser.add_argument("--no-agent", action="store_true",
+                        help="Skip PPO entirely; send noop actions. Intended for the observation viewer.")
+    parser.add_argument("--visualize", action="store_true",
+                        help="Open the live hitbox viewer (matplotlib).")
     parser.add_argument("--no-deterministic", dest="deterministic", action="store_false",
                         help="Use stochastic sampling instead of greedy argmax")
     parser.set_defaults(deterministic=True)
@@ -395,7 +425,7 @@ def main():
     parser.add_argument("--level", default="GG_Mega_Moss_Charger",
                         help="Boss scene name (default: GG_Mega_Moss_Charger)")
     parser.add_argument("--record", metavar="FILE", default="fight.mp4",
-                        help="Record screen to video file (default: fight.mp4, --record none to disable)")
+                        help="Record screen to video file (default: fight.mp4, --no-record to disable)")
     parser.add_argument("--no-record", dest="record", action="store_const", const=None,
                         help="Disable screen recording")
     parser.add_argument("--duration", type=int, default=0,
@@ -403,6 +433,11 @@ def main():
     parser.add_argument("--hk-path", default=None,
                         help="Path to Hollow Knight install (overrides config default)")
     args = parser.parse_args()
+
+    if not args.no_agent and not args.checkpoint:
+        parser.error("checkpoint is required unless --no-agent is passed")
+    if args.no_agent and args.record == "fight.mp4":
+        args.record = None  # don't default-record in viewer mode
 
     asyncio.run(eval_play(
         args.checkpoint,
@@ -412,6 +447,8 @@ def main():
         record=args.record,
         hk_path=args.hk_path,
         duration=args.duration,
+        no_agent=args.no_agent,
+        visualize=args.visualize,
     ))
 
 

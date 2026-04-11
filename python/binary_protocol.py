@@ -92,24 +92,64 @@ def unpack_kinds(data, offset, n):
         offset += ln
     return kinds, offset
 
+def unpack_terrain_debug(data, offset, n):
+    """Read n terrain debug strings (u16 length + UTF-8 bytes each).
+
+    Backwards-compatible: if the buffer is exhausted (old C# mod), returns
+    empty strings and does not raise. The terrain debug channel is a
+    temporary diagnostic for the observation viewer."""
+    out = []
+    for _ in range(n):
+        if offset + 2 > len(data):
+            out.extend([""] * (n - len(out)))
+            return out, offset
+        ln = struct.unpack_from('<H', data, offset)[0]
+        offset += 2
+        if offset + ln > len(data):
+            out.append("")
+            continue
+        out.append(bytes(data[offset:offset + ln]).decode('utf-8', errors='replace'))
+        offset += ln
+    return out, offset
+
+
+# Side channel: the last `terrain_debug` list pulled off the wire. Only
+# populated by unpack_reset / unpack_step and only read by the debug viewer.
+# Kept out of the main return tuple so training / model code is unchanged.
+_last_terrain_debug: list = []
+
+def pop_last_terrain_debug():
+    """Return (and clear) the most-recently-received terrain debug strings."""
+    global _last_terrain_debug
+    out = _last_terrain_debug
+    _last_terrain_debug = []
+    return out
+
+
 def unpack_step(data):
     """Unpack a step response.
     Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
              damage_landed, hits_taken, game_time, real_time, done)."""
+    global _last_terrain_debug
     combat_hb, terrain_hb, gs, n_combat, offset = unpack_obs(data)
+    n_terrain = terrain_hb.shape[0]
     damage_landed, hits_taken, game_time, real_time = struct.unpack_from('<ffff', data, offset)
     offset += 16
     done = data[offset] != 0
     offset += 1
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
     combat_parents, offset = unpack_kinds(data, offset, n_combat)
+    _last_terrain_debug, _ = unpack_terrain_debug(data, offset, n_terrain)
     return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
             damage_landed, hits_taken, game_time, real_time, done)
 
 def unpack_reset(data):
     """Unpack a reset response.
     Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents)."""
+    global _last_terrain_debug
     combat_hb, terrain_hb, gs, n_combat, offset = unpack_obs(data)
+    n_terrain = terrain_hb.shape[0]
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
-    combat_parents, _ = unpack_kinds(data, offset, n_combat)
+    combat_parents, offset = unpack_kinds(data, offset, n_combat)
+    _last_terrain_debug, _ = unpack_terrain_debug(data, offset, n_terrain)
     return combat_hb, terrain_hb, gs, combat_kinds, combat_parents

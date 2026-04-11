@@ -21,6 +21,10 @@ namespace FullKnight.Net
 		public List<string> combat_kinds;    // parallel: leaf-kind id string per combat hitbox
 		public List<string> combat_parents;  // parallel: HealthManager-root name per combat hitbox ("" if none)
 		public List<float[]> terrain_hitboxes;
+		// Debug-only: parallel to terrain_hitboxes. Pipe-delimited fields describing
+		// the underlying Collider2D so the Python viewer can explain ghost terrain
+		// boxes (disabled colliders, tilemap/composite interactions, etc.).
+		public List<string> terrain_debug;
 		public float[] global_state;
 
 		// Reward / done

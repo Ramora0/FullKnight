@@ -137,6 +137,7 @@ namespace FullKnight.Environment
 			data.combat_kinds = obs.CombatKinds;
 			data.combat_parents = obs.CombatParents;
 			data.terrain_hitboxes = obs.TerrainHitboxes;
+			data.terrain_debug = obs.TerrainDebug;
 			data.global_state = gs;
 
 			Time.timeScale = 0;
@@ -264,6 +265,7 @@ namespace FullKnight.Environment
 			data.combat_kinds = obs.CombatKinds;
 			data.combat_parents = obs.CombatParents;
 			data.terrain_hitboxes = obs.TerrainHitboxes;
+			data.terrain_debug = obs.TerrainDebug;
 			data.global_state = gs;
 			data.done = false;
 

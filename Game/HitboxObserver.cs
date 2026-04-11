@@ -271,8 +271,200 @@ namespace FullKnight.Game
 			public List<string> CombatKinds;
 			public List<string> CombatParents;
 			public List<float[]> TerrainHitboxes;
+			// Parallel to TerrainHitboxes; one pipe-delimited debug string per box.
+			// Format: "name|path|colType|layer|enabled|active|trigger|usedByComposite|bx,by,bw,bh"
+			public List<string> TerrainDebug;
 			public float KnightWidth;
 			public float KnightHeight;
+		}
+
+		private static string BuildTerrainDebug(Collider2D col, Vector3 knightPos, Collider2D knightCol)
+		{
+			if (col == null) return "null";
+			var go = col.gameObject;
+			string name = go.name ?? "";
+			// Build path from up to 4 parents for traceability in-scene.
+			var sb = new System.Text.StringBuilder();
+			Transform t = go.transform.parent;
+			int depth = 0;
+			var parts = new List<string>();
+			while (t != null && depth < 4)
+			{
+				parts.Add(t.gameObject.name);
+				t = t.parent;
+				depth++;
+			}
+			parts.Reverse();
+			string path = string.Join("/", parts);
+			string colType = col.GetType().Name;
+			string layer = LayerMask.LayerToName(go.layer);
+			bool enabled = col.enabled;
+			bool active = go.activeInHierarchy;
+			bool trigger = col.isTrigger;
+			bool usedByComposite = false;
+			try { usedByComposite = col.usedByComposite; } catch { }
+			var b = col.bounds;
+			sb.Append(name).Append('|')
+			  .Append(path).Append('|')
+			  .Append(colType).Append('|')
+			  .Append(layer).Append('|')
+			  .Append(enabled ? "1" : "0").Append('|')
+			  .Append(active ? "1" : "0").Append('|')
+			  .Append(trigger ? "1" : "0").Append('|')
+			  .Append(usedByComposite ? "1" : "0").Append('|')
+			  .Append(b.center.x.ToString("0.00")).Append(',')
+			  .Append(b.center.y.ToString("0.00")).Append(',')
+			  .Append(b.size.x.ToString("0.00")).Append(',')
+			  .Append(b.size.y.ToString("0.00"));
+
+			// Decompose into actual collision segments (knight-relative world coords)
+			// so the viewer can draw the real geometry on top of the lying AABB.
+			// Emitted as a trailing pipe-delimited field: "|segments=x1,y1,x2,y2;..."
+			// Only emitted for shapes where the AABB is a lie (EdgeCollider2D,
+			// PolygonCollider2D). BoxCollider2D's AABB already matches its collision
+			// surface modulo rotation, so we skip it to keep the payload small.
+			var segs = new System.Text.StringBuilder();
+			Transform tr = col.transform;
+			if (col is EdgeCollider2D ec)
+			{
+				var pts = ec.points;
+				for (int i = 0; i + 1 < pts.Length; i++)
+				{
+					Vector3 a = tr.TransformPoint(new Vector3(pts[i].x + ec.offset.x, pts[i].y + ec.offset.y, 0));
+					Vector3 bw = tr.TransformPoint(new Vector3(pts[i + 1].x + ec.offset.x, pts[i + 1].y + ec.offset.y, 0));
+					if (segs.Length > 0) segs.Append(';');
+					segs.Append((a.x - knightPos.x).ToString("0.00")).Append(',')
+					    .Append((a.y - knightPos.y).ToString("0.00")).Append(',')
+					    .Append((bw.x - knightPos.x).ToString("0.00")).Append(',')
+					    .Append((bw.y - knightPos.y).ToString("0.00"));
+				}
+			}
+			else if (col is PolygonCollider2D pc)
+			{
+				for (int pi = 0; pi < pc.pathCount; pi++)
+				{
+					var pts = pc.GetPath(pi);
+					if (pts == null || pts.Length == 0) continue;
+					for (int i = 0; i < pts.Length; i++)
+					{
+						var p0 = pts[i];
+						var p1 = pts[(i + 1) % pts.Length]; // closed path
+						Vector3 a = tr.TransformPoint(new Vector3(p0.x + pc.offset.x, p0.y + pc.offset.y, 0));
+						Vector3 bw = tr.TransformPoint(new Vector3(p1.x + pc.offset.x, p1.y + pc.offset.y, 0));
+						if (segs.Length > 0) segs.Append(';');
+						segs.Append((a.x - knightPos.x).ToString("0.00")).Append(',')
+						    .Append((a.y - knightPos.y).ToString("0.00")).Append(',')
+						    .Append((bw.x - knightPos.x).ToString("0.00")).Append(',')
+						    .Append((bw.y - knightPos.y).ToString("0.00"));
+					}
+				}
+			}
+			if (segs.Length > 0)
+				sb.Append("|segments=").Append(segs);
+
+			// ---- Reachability / "will this actually collide with the knight?" probes ----
+			// Appended as trailing key=value fields. Each is independently defensive:
+			// any exception downgrades the field to "?" rather than dropping the whole
+			// debug string, because these queries touch live Unity physics state.
+			//
+			// Heroic (hero) layer + the knight collider are the ground truth for "can
+			// the knight touch this". The parent pair GetIgnoreLayerCollision +
+			// GetIgnoreCollision tells us if the layer-matrix or an explicit per-pair
+			// override rules the collider out before physics even looks at the shape.
+			// PhysLayers.HERO doesn't exist in HK's enum. Read the hero layer directly
+			// from the live HeroController GameObject — ground truth, no enum lookup.
+			int heroLayer = HeroController.instance != null
+				? HeroController.instance.gameObject.layer
+				: -1;
+			{
+				// Layer collision matrix: true if physics ignores this layer pair.
+				string v = "?";
+				try { v = Physics2D.GetIgnoreLayerCollision(heroLayer, go.layer) ? "1" : "0"; } catch { }
+				sb.Append("|layer_ignore=").Append(v);
+			}
+			{
+				// Per-pair override (takes precedence over the matrix, set at runtime).
+				string v = "?";
+				try { v = knightCol != null && Physics2D.GetIgnoreCollision(knightCol, col) ? "1" : "0"; } catch { }
+				sb.Append("|pair_ignore=").Append(v);
+			}
+			// Rigidbody2D attached to the terrain collider. If absent the collider
+			// acts as a static collider attached to the implicit static body, which
+			// is the normal case for terrain.
+			var rb = col.attachedRigidbody;
+			sb.Append("|rb=").Append(rb != null ? "1" : "0");
+			if (rb != null)
+			{
+				sb.Append("|rb_sim=").Append(rb.simulated ? "1" : "0");
+				sb.Append("|rb_type=").Append(rb.bodyType.ToString().Substring(0, 3).ToLower());
+			}
+			// Signed minimum distance from knight collider to this collider. Negative
+			// means currently penetrating (overlap). `isValid=false` means physics
+			// couldn't compute — usually because one side isn't simulated.
+			if (knightCol != null)
+			{
+				try
+				{
+					var cd = Physics2D.Distance(knightCol, col);
+					sb.Append("|dist=")
+					  .Append(cd.isValid ? cd.distance.ToString("0.00") : "inv");
+				}
+				catch { sb.Append("|dist=err"); }
+
+				try
+				{
+					sb.Append("|touching=").Append(col.IsTouching(knightCol) ? "1" : "0");
+				}
+				catch { sb.Append("|touching=?"); }
+			}
+			// Linecast from knight center to the collider's closest point on its
+			// surface. Two questions answered:
+			//   ray_self  : does the first hit along that line belong to `col`?
+			//               1 = yes (line-of-sight reachable), 0 = something else
+			//               blocks first, ? = no hit at all.
+			//   ray_first : name of whatever DID get hit first (useful when
+			//               ray_self=0, so we can see what's eclipsing this one).
+			//   ray_dist  : distance along the ray to the first hit.
+			try
+			{
+				Vector2 start = knightPos;
+				Vector2 end;
+				try { end = col.ClosestPoint(start); }
+				catch { end = (Vector2)col.bounds.center; }
+				var hit = Physics2D.Linecast(start, end);
+				if (hit.collider == null)
+				{
+					sb.Append("|ray_self=?|ray_first=none");
+				}
+				else
+				{
+					sb.Append("|ray_self=").Append(hit.collider == col ? "1" : "0");
+					sb.Append("|ray_first=").Append(hit.collider.gameObject.name);
+					sb.Append("|ray_dist=").Append(hit.distance.ToString("0.00"));
+				}
+			}
+			catch { sb.Append("|ray_self=err"); }
+
+			// OverlapPoint at the collider's AABB center, all layers. Tells us what
+			// (if anything) actually sits at that spot — helps spot render-only
+			// GameObjects whose bounds don't correspond to any solid collider.
+			try
+			{
+				var hits = Physics2D.OverlapPointAll(b.center);
+				bool sawSelf = false;
+				int solidCount = 0;
+				foreach (var h in hits)
+				{
+					if (h == null) continue;
+					if (h == col) sawSelf = true;
+					if (!h.isTrigger) solidCount++;
+				}
+				sb.Append("|overlap_self=").Append(sawSelf ? "1" : "0");
+				sb.Append("|overlap_n=").Append(solidCount);
+			}
+			catch { sb.Append("|overlap_self=err"); }
+
+			return sb.ToString();
 		}
 
 		/// <summary>
@@ -298,11 +490,30 @@ namespace FullKnight.Game
 			foreach (var kvp in hitboxes)
 				kvp.Value.RemoveWhere(c => c == null);
 			var knightPos = HeroController.instance.transform.position;
+			// Pick a representative knight collider to use as the "query" side of
+			// every reachability probe in BuildTerrainDebug. Prefer a non-trigger
+			// collider from the Knight bucket; fall back to any Collider2D on the
+			// hero GameObject.
+			Collider2D knightCol = null;
+			if (hitboxes.ContainsKey(HitboxType.Knight))
+			{
+				foreach (var kc in hitboxes[HitboxType.Knight])
+				{
+					if (kc != null && kc.isActiveAndEnabled && !kc.isTrigger)
+					{
+						knightCol = kc;
+						break;
+					}
+				}
+			}
+			if (knightCol == null && HeroController.instance != null)
+				knightCol = HeroController.instance.GetComponent<Collider2D>();
 
 			var combat = new List<float[]>();
 			var combatKinds = new List<string>();
 			var combatParents = new List<string>();
 			var terrain = new List<float[]>();
+			var terrainDebug = new List<string>();
 			float knightW = 0f, knightH = 0f;
 
 			foreach (var kvp in hitboxes)
@@ -346,6 +557,7 @@ namespace FullKnight.Game
 					else if (kvp.Key == HitboxType.Terrain)
 					{
 						terrain.Add(new float[] { relX, relY, w, h, isTrigger });
+						terrainDebug.Add(BuildTerrainDebug(col, knightPos, knightCol));
 					}
 				}
 			}
@@ -356,6 +568,7 @@ namespace FullKnight.Game
 				CombatKinds = combatKinds,
 				CombatParents = combatParents,
 				TerrainHitboxes = terrain,
+				TerrainDebug = terrainDebug,
 				KnightWidth = knightW,
 				KnightHeight = knightH
 			};

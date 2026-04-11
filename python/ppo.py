@@ -44,6 +44,27 @@ class RunningNormalizer:
         self.count = state["count"]
 
 
+def _load_normalizer_compat(normalizer, state, label):
+    """Load running-normalizer stats, truncating leading columns if the checkpoint
+    was saved with more dims than the current normalizer tracks. Used for the
+    combat (8 -> 4) and terrain (5 -> 4) shrink when binary cols stopped being
+    running-normalized. Column order is preserved, so the first N stats are still
+    valid for the same physical features."""
+    ckpt_mean = np.asarray(state["mean"])
+    cur_n = normalizer.mean.shape[0]
+    ckpt_n = ckpt_mean.shape[0]
+    if ckpt_n == cur_n:
+        normalizer.load_state_dict(state)
+        return
+    if ckpt_n > cur_n:
+        normalizer.mean = ckpt_mean[:cur_n].astype(np.float64)
+        normalizer.var = np.asarray(state["var"])[:cur_n].astype(np.float64)
+        normalizer.count = state["count"]
+        print(f"  [compat] {label}_normalizer: truncated {ckpt_n}->{cur_n} dims from checkpoint")
+    else:
+        print(f"  [compat] {label}_normalizer: checkpoint has {ckpt_n} dims, current expects {cur_n} — skipping load")
+
+
 class PPO:
     def __init__(self, config):
         self.config = config
@@ -59,7 +80,7 @@ class PPO:
         # Combat normalizer covers cols [0, combat_normalized_dims). The trailing
         # hp_raw column is intentionally left raw so the agent reads absolute HP.
         self.combat_normalizer = RunningNormalizer(config.combat_normalized_dims)
-        self.terrain_normalizer = RunningNormalizer(config.terrain_feature_dim)
+        self.terrain_normalizer = RunningNormalizer(config.terrain_normalized_dims)
 
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(), lr=config.lr
@@ -262,6 +283,15 @@ class PPO:
             all_atk_returns[:, env_i] = atk_ret
             all_def_returns[:, env_i] = def_ret
 
+        # Explained variance at rollout time: how well did the critic predict
+        # returns using the values it produced during collection. Scale-free,
+        # so atk and def are directly comparable (unlike raw MSE).
+        def _ev(returns, values):
+            var = returns.var()
+            return float(1.0 - (returns - values).var() / var) if var > 1e-8 else 0.0
+        ev_atk = _ev(all_atk_returns, values_atk_arr[:T])
+        ev_def = _ev(all_def_returns, values_def_arr[:T])
+
         # --- Chunk (T, N) arrays into (total_chunks, L) ---
         def chunk_tn(arr):
             """(T, N) -> (total_chunks, L): group by chunk then env."""
@@ -302,10 +332,12 @@ class PPO:
 
         flat_thb_2d = stacked.terrain_hb.reshape(total_samples, max_terrain, cfg.terrain_feature_dim)
         flat_tm_2d = stacked.terrain_mask.reshape(total_samples, max_terrain)
+        n_norm_t = cfg.terrain_normalized_dims
         for i in range(total_samples):
             nt = int(flat_tm_2d[i].sum())
             if nt > 0:
-                flat_thb_2d[i, :nt] = self.terrain_normalizer.normalize(flat_thb_2d[i, :nt])
+                flat_thb_2d[i, :nt, :n_norm_t] = self.terrain_normalizer.normalize(
+                    flat_thb_2d[i, :nt, :n_norm_t])
         flat_thb = flat_thb_2d.reshape(T_used, N, max_terrain, cfg.terrain_feature_dim)
 
         flat_ckid = stacked.combat_kind_ids
@@ -356,6 +388,7 @@ class PPO:
         total_metrics = {"surrogate": 0, "value_atk": 0, "value_def": 0, "entropy": 0, "kl": 0,
                          "gru_norm": 0}
         n_updates = 0
+        passes_done = 0
 
         pbar = tqdm(total=total_passes, unit="pass", unit_scale=True,
                     desc="  train", leave=False, dynamic_ncols=True)
@@ -427,6 +460,7 @@ class PPO:
                     kl = ((ratio - 1) - log_ratio).mean().item()
                     total_metrics["kl"] += kl
 
+                passes_done += len(idx) * L
                 pbar.update(len(idx) * L)
                 pbar.set_postfix_str(f"surr={surrogate.item():+.3f} kl={kl:.3f}")
 
@@ -438,7 +472,11 @@ class PPO:
                 break
 
         pbar.close()
-        return {k: v / max(n_updates, 1) for k, v in total_metrics.items()}
+        out = {k: v / max(n_updates, 1) for k, v in total_metrics.items()}
+        out["ev_atk"] = ev_atk
+        out["ev_def"] = ev_def
+        out["pass_frac"] = passes_done / max(total_passes, 1)
+        return out
 
     def save_checkpoint(self, path, vocab=None, boss_state=None, epoch=None):
         # Serialize per-boss curriculum state: D plus the raw rolling windows
@@ -503,9 +541,9 @@ class PPO:
         if ckpt.get("obs_normalizer"):
             self.obs_normalizer.load_state_dict(ckpt["obs_normalizer"])
         if ckpt.get("combat_normalizer"):
-            self.combat_normalizer.load_state_dict(ckpt["combat_normalizer"])
+            _load_normalizer_compat(self.combat_normalizer, ckpt["combat_normalizer"], "combat")
         if ckpt.get("terrain_normalizer"):
-            self.terrain_normalizer.load_state_dict(ckpt["terrain_normalizer"])
+            _load_normalizer_compat(self.terrain_normalizer, ckpt["terrain_normalizer"], "terrain")
         if ckpt.get("hx") is not None:
             self.hx = ckpt["hx"]
         if vocab is not None and ckpt.get("kind_vocab") is not None:

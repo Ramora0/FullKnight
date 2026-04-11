@@ -1,7 +1,7 @@
 import numpy as np
 from binary_protocol import (
     pack_init, pack_reset, pack_action, pack_pause, pack_resume,
-    unpack_reset, unpack_step, MSG_CLOSE,
+    unpack_reset, unpack_step, pop_last_terrain_debug, MSG_CLOSE,
 )
 import struct
 
@@ -16,6 +16,9 @@ class HKEnv:
     def __init__(self, websocket, config):
         self.ws = websocket
         self.config = config
+        # Debug-only: last terrain_debug strings pulled off the wire.
+        # Populated after each reset/step by reading the protocol side channel.
+        self.last_terrain_debug: list = []
 
     async def init(self):
         """Send init handshake and wait for ack."""
@@ -31,7 +34,9 @@ class HKEnv:
             self.config.time_scale, eval_mode=eval_mode,
         ))
         data = await self.ws.recv()
-        return unpack_reset(data)
+        result = unpack_reset(data)
+        self.last_terrain_debug = pop_last_terrain_debug()
+        return result
 
     async def step(self, action_vec):
         """Take a step. action_vec = [movement, direction, action, jump].
@@ -42,6 +47,7 @@ class HKEnv:
         data = await self.ws.recv()
         (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
          damage_landed, hits_taken, game_time, real_time, done) = unpack_step(data)
+        self.last_terrain_debug = pop_last_terrain_debug()
         return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
                 damage_landed, hits_taken, game_time, real_time)
 
@@ -49,7 +55,9 @@ class HKEnv:
         """Like step() but also returns done flag. For eval mode."""
         await self.ws.send(pack_action(action_vec))
         data = await self.ws.recv()
-        return unpack_step(data)
+        result = unpack_step(data)
+        self.last_terrain_debug = pop_last_terrain_debug()
+        return result
 
     async def pause(self):
         await self.ws.send(pack_pause())

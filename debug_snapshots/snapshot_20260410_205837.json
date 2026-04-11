@@ -1,0 +1,253 @@
+{
+  "global_state": {
+    "vel_x": 0.0,
+    "vel_y": 0.0,
+    "hp": 9.0,
+    "soul": 0.0,
+    "knight_w": 0.5,
+    "knight_h": 1.28125,
+    "raw": [
+      0.0,
+      0.0,
+      9.0,
+      0.0,
+      0.5,
+      1.28125,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "combat": [],
+  "terrain": [
+    {
+      "rel_x": 106.22666931152344,
+      "rel_y": -177.70811462402344,
+      "w": 1520.17333984375,
+      "h": 78.1693115234375,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Bounds Cage",
+        "path": "_GameManager",
+        "col_type": "BoxCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "150.09,-170.30,1520.17,78.17"
+      }
+    },
+    {
+      "rel_x": 30.470001220703125,
+      "rel_y": 11.041876792907715,
+      "w": 8.653762817382812,
+      "h": 41.035682678222656,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "wall collider",
+        "path": "",
+        "col_type": "BoxCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "74.33,18.45,8.65,41.04"
+      }
+    },
+    {
+      "rel_x": 5.534461975097656,
+      "rel_y": 88.99261474609375,
+      "w": 64.56381225585938,
+      "h": 143.261474609375,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "World Edge v2",
+        "path": "",
+        "col_type": "BoxCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "49.39,96.40,64.56,143.26"
+      }
+    },
+    {
+      "rel_x": -20.150001525878906,
+      "rel_y": 11.041876792907715,
+      "w": 8.653759002685547,
+      "h": 41.035682678222656,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "wall collider (1)",
+        "path": "",
+        "col_type": "BoxCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "23.71,18.45,8.65,41.04"
+      }
+    },
+    {
+      "rel_x": 1.8133010864257812,
+      "rel_y": -4.913873672485352,
+      "w": 59.86063766479492,
+      "h": 6.653542518615723,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Floor Saver",
+        "path": "GG_Arena_Prefab/Floor",
+        "col_type": "BoxCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "45.67,2.49,59.86,6.65"
+      }
+    },
+    {
+      "rel_x": 4.1399993896484375,
+      "rel_y": 23.091876983642578,
+      "w": 32.0,
+      "h": 3.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 1",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "48.00,30.50,32.00,3.00"
+      }
+    },
+    {
+      "rel_x": 4.1399993896484375,
+      "rel_y": -4.408123970031738,
+      "w": 32.0,
+      "h": 6.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 1",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "48.00,3.00,32.00,6.00"
+      }
+    },
+    {
+      "rel_x": -27.860000610351562,
+      "rel_y": 8.591876029968262,
+      "w": 32.0,
+      "h": 32.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 0",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "16.00,16.00,32.00,32.00"
+      }
+    },
+    {
+      "rel_x": 4.1399993896484375,
+      "rel_y": 25.591876983642578,
+      "w": 32.0,
+      "h": 2.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 1 1",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "48.00,33.00,32.00,2.00"
+      }
+    },
+    {
+      "rel_x": -27.860000610351562,
+      "rel_y": 25.591876983642578,
+      "w": 32.0,
+      "h": 2.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 1 0",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "16.00,33.00,32.00,2.00"
+      }
+    },
+    {
+      "rel_x": 30.639999389648438,
+      "rel_y": 8.591876029968262,
+      "w": 21.0,
+      "h": 32.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 0 2",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "74.50,16.00,21.00,32.00"
+      }
+    },
+    {
+      "rel_x": 30.639999389648438,
+      "rel_y": 25.591876983642578,
+      "w": 21.0,
+      "h": 2.0,
+      "is_trigger_obs": false,
+      "debug": {
+        "name": "Chunk 1 2",
+        "path": "TileMap Render Data/Scenemap",
+        "col_type": "EdgeCollider2D",
+        "layer": "Terrain",
+        "enabled": "1",
+        "active": "1",
+        "trigger": "0",
+        "used_by_composite": "0",
+        "world_bounds": "74.50,33.00,21.00,2.00"
+      }
+    }
+  ]
+}
