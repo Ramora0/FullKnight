@@ -296,11 +296,144 @@ namespace FullKnight.Game
 			public List<string> CombatKinds;
 			public List<string> CombatParents;
 			public List<float[]> TerrainHitboxes;
-			// Parallel to TerrainHitboxes; one pipe-delimited debug string per box.
-			// Format: "name|path|colType|layer|enabled|active|trigger|usedByComposite|bx,by,bw,bh"
+			// Parallel to TerrainHitboxes; one pipe-delimited debug string per segment.
+			// Format: "name|path|colType|layer|enabled|active|trigger|usedByComposite|bx,by,bw,bh[|probe=val...]|seg_idx=N"
+			// Segments from the same source collider share the base string; only
+			// seg_idx differs — lets the viewer group them visually if desired.
 			public List<string> TerrainDebug;
 			public float KnightWidth;
 			public float KnightHeight;
+		}
+
+		/// <summary>
+		/// Decompose a terrain collider into a flat list of line segments in
+		/// knight-relative world space, emitting one 8-float feature row per
+		/// segment:
+		///   [mx, my, hdx, hdy, npx, npy, dist, is_trigger]
+		/// mx,my     — segment midpoint (knight frame).
+		/// hdx,hdy   — half-vector from midpoint to one endpoint, canonicalized
+		///             to hdx >= 0 (hdy >= 0 on vertical segments). Length and
+		///             orientation recoverable as (2·|hd|, atan2(hdy, hdx)).
+		/// npx,npy   — closest point on the *segment* (clamped, not infinite line)
+		///             to the knight at origin. Lets the encoder read "how far
+		///             above/below/left/right is the nearest surface" as a
+		///             single linear readout.
+		/// dist      — L2 norm of (npx, npy). Redundant with (npx, npy) in
+		///             principle, but sqrt(x² + y²) is multi-layer to approximate
+		///             from raw inputs, so pre-computing it means the attention
+		///             key-space can gate on distance as a single linear readout
+		///             from step 1 of training instead of waiting for phi to
+		///             learn L2 norm.
+		/// is_trigger — 0/1 passthrough, not normalized.
+		/// BoxCollider2D → 4 edges (respecting rotation via TransformPoint).
+		/// EdgeCollider2D → one segment per consecutive point pair.
+		/// PolygonCollider2D → segments around each path (closed).
+		/// CircleCollider2D → 12-gon approximation.
+		/// </summary>
+		private static void EmitTerrainSegments(
+			Collider2D col, Vector3 knightPos,
+			List<float[]> outFeatures, List<string> outDebug, string baseDebug)
+		{
+			if (col == null) return;
+			var pairs = new List<(Vector2 a, Vector2 b)>();
+			Transform tr = col.transform;
+
+			if (col is EdgeCollider2D ec)
+			{
+				var pts = ec.points;
+				for (int i = 0; i + 1 < pts.Length; i++)
+				{
+					Vector2 p0 = tr.TransformPoint(new Vector3(pts[i].x + ec.offset.x, pts[i].y + ec.offset.y, 0));
+					Vector2 p1 = tr.TransformPoint(new Vector3(pts[i + 1].x + ec.offset.x, pts[i + 1].y + ec.offset.y, 0));
+					pairs.Add((p0, p1));
+				}
+			}
+			else if (col is PolygonCollider2D pc)
+			{
+				for (int pi = 0; pi < pc.pathCount; pi++)
+				{
+					var pts = pc.GetPath(pi);
+					if (pts == null || pts.Length == 0) continue;
+					for (int i = 0; i < pts.Length; i++)
+					{
+						var p0 = pts[i];
+						var p1 = pts[(i + 1) % pts.Length];
+						Vector2 a = tr.TransformPoint(new Vector3(p0.x + pc.offset.x, p0.y + pc.offset.y, 0));
+						Vector2 b = tr.TransformPoint(new Vector3(p1.x + pc.offset.x, p1.y + pc.offset.y, 0));
+						pairs.Add((a, b));
+					}
+				}
+			}
+			else if (col is BoxCollider2D bc)
+			{
+				Vector2 half = bc.size * 0.5f;
+				Vector2 o = bc.offset;
+				Vector2 bl = tr.TransformPoint(new Vector3(o.x - half.x, o.y - half.y, 0));
+				Vector2 br = tr.TransformPoint(new Vector3(o.x + half.x, o.y - half.y, 0));
+				Vector2 tl = tr.TransformPoint(new Vector3(o.x - half.x, o.y + half.y, 0));
+				Vector2 trc = tr.TransformPoint(new Vector3(o.x + half.x, o.y + half.y, 0));
+				pairs.Add((bl, br));  // bottom
+				pairs.Add((br, trc)); // right
+				pairs.Add((trc, tl)); // top
+				pairs.Add((tl, bl));  // left
+			}
+			else if (col is CircleCollider2D cc)
+			{
+				// 12-gon approximation. Uses lossyScale to capture non-uniform
+				// parent scales; good enough for circles that are axis-aligned
+				// scaled, which covers every HK case I'm aware of.
+				int N = 12;
+				float r = cc.radius;
+				var prev = Vector2.zero;
+				for (int i = 0; i <= N; i++)
+				{
+					float ang = 2f * Mathf.PI * i / N;
+					Vector2 p = tr.TransformPoint(new Vector3(
+						cc.offset.x + Mathf.Cos(ang) * r,
+						cc.offset.y + Mathf.Sin(ang) * r, 0));
+					if (i > 0) pairs.Add((prev, p));
+					prev = p;
+				}
+			}
+			else return;
+
+			float isTrigger = col.isTrigger ? 1f : 0f;
+			int segIdx = 0;
+			foreach (var (aw, bw) in pairs)
+			{
+				float ax = aw.x - knightPos.x, ay = aw.y - knightPos.y;
+				float bx = bw.x - knightPos.x, by = bw.y - knightPos.y;
+				float mx = 0.5f * (ax + bx);
+				float my = 0.5f * (ay + by);
+				float hdx = 0.5f * (bx - ax);
+				float hdy = 0.5f * (by - ay);
+				// Canonicalize direction: hdx >= 0, tie-break to hdy >= 0 on
+				// vertical segments. Matches the parameterization contract so
+				// the running normalizer sees a consistent sign across frames.
+				if (hdx < 0f || (hdx == 0f && hdy < 0f))
+				{
+					hdx = -hdx;
+					hdy = -hdy;
+				}
+				// Closest point on the SEGMENT (not infinite line) to origin.
+				// t = proj(origin - a, b - a) / |b - a|^2, clamped to [0, 1].
+				float dxs = bx - ax, dys = by - ay;
+				float denom = dxs * dxs + dys * dys;
+				float t = 0f;
+				if (denom > 1e-12f)
+				{
+					t = (-ax * dxs + -ay * dys) / denom;
+					if (t < 0f) t = 0f;
+					else if (t > 1f) t = 1f;
+				}
+				float npx = ax + t * dxs;
+				float npy = ay + t * dys;
+				float dist = Mathf.Sqrt(npx * npx + npy * npy);
+
+				outFeatures.Add(new float[] { mx, my, hdx, hdy, npx, npy, dist, isTrigger });
+				outDebug.Add(baseDebug + "|seg_idx=" + segIdx);
+				segIdx++;
+			}
 		}
 
 		private static string BuildTerrainDebug(Collider2D col, Vector3 knightPos, Collider2D knightCol)
@@ -341,51 +474,6 @@ namespace FullKnight.Game
 			  .Append(b.center.y.ToString("0.00")).Append(',')
 			  .Append(b.size.x.ToString("0.00")).Append(',')
 			  .Append(b.size.y.ToString("0.00"));
-
-			// Decompose into actual collision segments (knight-relative world coords)
-			// so the viewer can draw the real geometry on top of the lying AABB.
-			// Emitted as a trailing pipe-delimited field: "|segments=x1,y1,x2,y2;..."
-			// Only emitted for shapes where the AABB is a lie (EdgeCollider2D,
-			// PolygonCollider2D). BoxCollider2D's AABB already matches its collision
-			// surface modulo rotation, so we skip it to keep the payload small.
-			var segs = new System.Text.StringBuilder();
-			Transform tr = col.transform;
-			if (col is EdgeCollider2D ec)
-			{
-				var pts = ec.points;
-				for (int i = 0; i + 1 < pts.Length; i++)
-				{
-					Vector3 a = tr.TransformPoint(new Vector3(pts[i].x + ec.offset.x, pts[i].y + ec.offset.y, 0));
-					Vector3 bw = tr.TransformPoint(new Vector3(pts[i + 1].x + ec.offset.x, pts[i + 1].y + ec.offset.y, 0));
-					if (segs.Length > 0) segs.Append(';');
-					segs.Append((a.x - knightPos.x).ToString("0.00")).Append(',')
-					    .Append((a.y - knightPos.y).ToString("0.00")).Append(',')
-					    .Append((bw.x - knightPos.x).ToString("0.00")).Append(',')
-					    .Append((bw.y - knightPos.y).ToString("0.00"));
-				}
-			}
-			else if (col is PolygonCollider2D pc)
-			{
-				for (int pi = 0; pi < pc.pathCount; pi++)
-				{
-					var pts = pc.GetPath(pi);
-					if (pts == null || pts.Length == 0) continue;
-					for (int i = 0; i < pts.Length; i++)
-					{
-						var p0 = pts[i];
-						var p1 = pts[(i + 1) % pts.Length]; // closed path
-						Vector3 a = tr.TransformPoint(new Vector3(p0.x + pc.offset.x, p0.y + pc.offset.y, 0));
-						Vector3 bw = tr.TransformPoint(new Vector3(p1.x + pc.offset.x, p1.y + pc.offset.y, 0));
-						if (segs.Length > 0) segs.Append(';');
-						segs.Append((a.x - knightPos.x).ToString("0.00")).Append(',')
-						    .Append((a.y - knightPos.y).ToString("0.00")).Append(',')
-						    .Append((bw.x - knightPos.x).ToString("0.00")).Append(',')
-						    .Append((bw.y - knightPos.y).ToString("0.00"));
-					}
-				}
-			}
-			if (segs.Length > 0)
-				sb.Append("|segments=").Append(segs);
 
 			// ---- Reachability / "will this actually collide with the knight?" probes ----
 			// Appended as trailing key=value fields. Each is independently defensive:
@@ -506,7 +594,12 @@ namespace FullKnight.Game
 		/// them so the network sees a sane magnitude while preserving high resolution
 		/// in the "1-2 nail hits from death" regime.
 		/// CombatKinds / CombatParents: parallel string lists.
-		/// Terrain: [rel_x, rel_y, width, height, is_trigger]
+		/// Terrain: 7 floats per SEGMENT — see EmitTerrainSegments.
+		///   Each terrain collider is decomposed into one or more line segments
+		///   (boxes → 4 edges, edge colliders → their polyline, polygons →
+		///   closed paths, circles → 12-gon). Colliders with usedByComposite
+		///   are skipped — they're absorbed into a CompositeCollider2D and
+		///   don't physically collide on their own.
 		/// Knight: bounds only (width, height), folded into global state.
 		/// </summary>
 		public SplitObservation GetSplitFeatures(System.Collections.Generic.HashSet<HealthManager> bossHms = null)
@@ -584,8 +677,17 @@ namespace FullKnight.Game
 					}
 					else if (kvp.Key == HitboxType.Terrain)
 					{
-						terrain.Add(new float[] { relX, relY, w, h, isTrigger });
-						terrainDebug.Add(BuildTerrainDebug(col, knightPos, knightCol));
+						// Composite-absorbed colliders don't collide independently;
+						// the parent CompositeCollider2D owns the collision, and we
+						// either pick it up as a PolygonCollider2D path list or miss
+						// it entirely. Emitting the absorbed child would double-count
+						// + introduce physics ghosts.
+						bool absorbed = false;
+						try { absorbed = col.usedByComposite; } catch { }
+						if (absorbed) continue;
+
+						string baseDebug = BuildTerrainDebug(col, knightPos, knightCol);
+						EmitTerrainSegments(col, knightPos, terrain, terrainDebug, baseDebug);
 					}
 				}
 			}

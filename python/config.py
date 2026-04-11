@@ -36,8 +36,8 @@ class Config:
     # death (log1p(0)→0, log1p(21)→3.09, log1p(42)→3.76, log1p(2000)→7.6).
     combat_feature_dim: int = 10
     combat_normalized_dims: int = 4  # first N combat columns get z-scored; binary flags pass raw; hp cols get log1p
-    terrain_feature_dim: int = 5 # [rel_x, rel_y, w, h, is_trigger]
-    terrain_normalized_dims: int = 4  # is_trigger passes through raw
+    terrain_feature_dim: int = 8 # [mx, my, hdx, hdy, npx, npy, dist, is_trigger]
+    terrain_normalized_dims: int = 7  # is_trigger passes through raw
     global_state_dim: int = 22   # vel(2), hp, soul, knight_bounds(2), 7 ability flags, 9 validity flags
     n_binary_flags: int = 16     # 7 ability unlock + 9 action validity (not normalized)
 

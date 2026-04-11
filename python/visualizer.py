@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 
-from observation import Observation, GS, CB
+from observation import Observation, GS, CB, TR
 
 
 _TERRAIN_DEBUG_FIELDS = [
@@ -85,70 +85,54 @@ class Visualizer:
         knight_w = gs[GS.KNIGHT_W]
         knight_h = gs[GS.KNIGHT_H]
 
-        # Terrain hitboxes (gray)
+        # Terrain segments — each row of terrain_hb is one line segment in
+        # knight-relative world space, parameterized as
+        # (mx, my, hdx, hdy, npx, npy, is_trigger). Endpoints recover as
+        # midpoint ± half-vector. Nearest point on the clamped segment to
+        # the knight is drawn as a small dot so reachability reads at a
+        # glance. Colliders that decompose to N segments will have N rows
+        # here with the same base debug string (seg_idx differs).
         t_hb = obs.terrain_hb[0]
         t_mask = obs.terrain_mask[0]
+        seen_names = set()
         for i in range(len(t_mask)):
             if t_mask[i] < 0.5:
                 continue
-            rx, ry, w, h, _ = t_hb[i]
+            row = t_hb[i]
+            mx, my = row[TR.MX], row[TR.MY]
+            hdx, hdy = row[TR.HDX], row[TR.HDY]
+            npx, npy = row[TR.NPX], row[TR.NPY]
+            is_trig = row[TR.IS_TRIGGER] > 0.5
+            x1, y1 = mx - hdx, my - hdy
+            x2, y2 = mx + hdx, my + hdy
+            color = "steelblue" if is_trig else "black"
+            ax.plot(
+                [x1, x2], [y1, y2],
+                color=color, linewidth=1.4, alpha=0.85, solid_capstyle="round",
+            )
+            ax.plot(npx, npy, marker="o", markersize=2.5,
+                    color="deepskyblue", alpha=0.8)
+
             dbg = parse_terrain_debug(
                 self._last_terrain_debug[i]
                 if i < len(self._last_terrain_debug) else ""
             )
-            # "Ghost" = physics engine won't let the knight collide with this.
-            # Ghost boxes are tinted magenta so they jump out against the normal
-            # gray terrain. Any one of these checks is enough to flag it.
-            is_ghost = (
-                dbg.get("layer_ignore") == "1"
-                or dbg.get("pair_ignore") == "1"
-                or dbg.get("used_by_composite") == "1"
-                or dbg.get("trigger") == "1"
-                or dbg.get("enabled") == "0"
-                or dbg.get("active") == "0"
-                or (dbg.get("rb") == "1" and dbg.get("rb_sim") == "0")
-            )
-            edge_col = "magenta" if is_ghost else "gray"
-            face_col = "mistyrose" if is_ghost else "lightgray"
-            rect = patches.Rectangle(
-                (rx - w / 2, ry - h / 2), w, h,
-                linewidth=1, edgecolor=edge_col, facecolor=face_col, alpha=0.3,
-            )
-            ax.add_patch(rect)
-            # Overlay the true collision polyline on top of the AABB (solid
-            # dark line) so the gap between the gray box the agent "sees"
-            # and what it would actually collide with is visually obvious.
-            segs = dbg.get("segments") or []
-            for (x1, y1, x2, y2) in segs:
-                ax.plot(
-                    [x1, x2], [y1, y2],
-                    color="black", linewidth=1.5, alpha=0.9, solid_capstyle="round",
-                )
-            label = dbg.get("name", "")
-            flags = []
-            if dbg.get("enabled") == "0": flags.append("dis")
-            if dbg.get("active") == "0": flags.append("inact")
-            if dbg.get("used_by_composite") == "1": flags.append("composite")
-            if dbg.get("trigger") == "1": flags.append("trig")
-            if dbg.get("layer_ignore") == "1": flags.append("layer!")
-            if dbg.get("pair_ignore") == "1": flags.append("pair!")
-            if dbg.get("rb") == "1" and dbg.get("rb_sim") == "0":
-                flags.append("!sim")
-            # ray_self=0 means something else sits between knight and this box.
-            # Stamp the blocker name so the cause is visible inline.
-            if dbg.get("ray_self") == "0":
-                flags.append(f"blk:{dbg.get('ray_first','?')}")
-            if dbg.get("touching") == "1": flags.append("touch")
-            if segs:
-                flags.append(f"{len(segs)}seg")
-            if flags:
-                label = f"{label} [{','.join(flags)}]"
-            if label:
+            # Label each collider once (seg_idx=0) to keep the plot readable;
+            # remaining segments share the group. Labels sit near the midpoint.
+            name = dbg.get("name", "")
+            seg_idx = dbg.get("seg_idx", "0")
+            if seg_idx == "0" and name and name not in seen_names:
+                seen_names.add(name)
+                flags = []
+                if dbg.get("layer_ignore") == "1": flags.append("layer!")
+                if dbg.get("pair_ignore") == "1": flags.append("pair!")
+                if is_trig: flags.append("trig")
+                label = f"{name} [{','.join(flags)}]" if flags else name
                 ax.text(
-                    rx - w / 2, ry - h / 2, label,
+                    mx, my, label,
                     fontsize=6, color="black",
-                    bbox=dict(facecolor="lightgray", alpha=0.6, edgecolor="none", pad=1),
-                    verticalalignment="top", horizontalalignment="left",
+                    bbox=dict(facecolor="lightgray", alpha=0.5, edgecolor="none", pad=1),
+                    verticalalignment="center", horizontalalignment="center",
                 )
 
         # Combat hitboxes — colors encode the three behavioral flags:
@@ -298,17 +282,20 @@ class Visualizer:
         for i in range(len(t_mask)):
             if t_mask[i] < 0.5:
                 continue
-            rx, ry, w, h, trig = t_hb[i]
+            row = t_hb[i]
             dbg = parse_terrain_debug(
                 self._last_terrain_debug[i]
                 if i < len(self._last_terrain_debug) else ""
             )
             payload["terrain"].append({
-                "rel_x": float(rx),
-                "rel_y": float(ry),
-                "w": float(w),
-                "h": float(h),
-                "is_trigger_obs": bool(trig > 0.5),
+                "mx": float(row[TR.MX]),
+                "my": float(row[TR.MY]),
+                "hdx": float(row[TR.HDX]),
+                "hdy": float(row[TR.HDY]),
+                "npx": float(row[TR.NPX]),
+                "npy": float(row[TR.NPY]),
+                "dist": float(row[TR.DIST]),
+                "is_trigger": bool(row[TR.IS_TRIGGER] > 0.5),
                 "debug": dbg,
             })
 
