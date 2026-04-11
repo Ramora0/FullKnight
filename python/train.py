@@ -127,9 +127,9 @@ async def train(config: Config):
         print(f"Initial env_boss: {env_boss}")
 
         agent = PPO(config)
-        start_epoch = 0
+        start_env_steps = 0
         if config.resume:
-            start_epoch = agent.load_checkpoint(
+            start_env_steps = agent.load_checkpoint(
                 config.resume, vocab=vec_env.vocab, boss_state=boss_state
             )
             print(f"Resumed from: {config.resume}")
@@ -168,10 +168,14 @@ async def train(config: Config):
         steps_since_last_reset = 0
         next_reset_env = 0  # round-robin cursor, advances only when scheduling
 
-        # Initialized so the post-loop final save and summary have a defined
-        # `epoch` even if the loop never runs (e.g. resuming from a completed run).
-        epoch = start_epoch - 1
-        for epoch in range(start_epoch, config.epochs):
+        # Step-driven training: total_env_steps bounds the run, save cadence
+        # and LR annealing are both keyed on env_steps_collected (not epoch
+        # count) so they stay meaningful as rollout size varies.
+        env_steps_collected = start_env_steps
+        last_save_step = start_env_steps
+        epoch = -1  # local counter purely for logging
+        while env_steps_collected < config.total_env_steps:
+            epoch += 1
 
             # Reap any background resets that have completed since we kicked
             # them off at the end of the prior epoch. Splice new obs into
@@ -457,8 +461,13 @@ async def train(config: Config):
                 f"h2d {t_h2d*1000:.0f}ms | fwd {t_fwd*1000:.0f}ms | d2h {t_d2h*1000:.0f}ms"
             )
 
+            # Step-based linear LR annealing. Progress is measured in
+            # env-steps collected (not epochs), so variable rollout sizes
+            # and dropped-env epochs decay LR at the same rate per unit work.
+            env_steps_collected += total_steps_epoch
             if config.anneal_lr:
-                agent.scheduler.step()
+                progress = min(1.0, env_steps_collected / config.total_env_steps)
+                agent.set_lr(config.lr * (1.0 - progress))
 
             # Staggered reset: kick off resets for a subset of envs as
             # background tasks, resume everyone else synchronously, and drop
@@ -479,7 +488,7 @@ async def train(config: Config):
             curriculum_reward = float(
                 (damage_landed_arr / D_per_env[None, :] - hits_taken_arr).mean()
             )
-            total_steps = (epoch + 1) * config.n_envs * config.rollout_len
+            total_steps = env_steps_collected
             Ds = np.array([boss_state[b]["D"] for b in bosses], dtype=np.float64)
             D_geomean = float(np.exp(np.log(np.maximum(Ds, 1e-6)).mean()))
             # Harmonic mean of D expressed in hits units. Dominated by the worst
@@ -574,10 +583,14 @@ async def train(config: Config):
                 print(f"Time budget ({time_budget}s) reached after {epoch + 1} epochs")
                 break
 
-            if epoch % config.save_every == 0:
-                path = f"{config.save_path}_{epoch}.pth"
-                agent.save_checkpoint(path, vocab=vec_env.vocab, boss_state=boss_state, epoch=epoch)
+            if env_steps_collected - last_save_step >= config.save_every_steps:
+                path = f"{config.save_path}_{env_steps_collected}.pth"
+                agent.save_checkpoint(
+                    path, vocab=vec_env.vocab, boss_state=boss_state,
+                    env_steps=env_steps_collected,
+                )
                 print(f"  Saved checkpoint: {path}")
+                last_save_step = env_steps_collected
 
         # Print summary (used by autoresearch pipeline)
         if recent:
@@ -598,7 +611,10 @@ async def train(config: Config):
             print(f"epochs_completed:    {epoch + 1}")
             print(f"training_seconds:    {elapsed:.1f}")
 
-        agent.save_checkpoint(f"{config.save_path}_final.pth", vocab=vec_env.vocab, boss_state=boss_state, epoch=epoch)
+        agent.save_checkpoint(
+            f"{config.save_path}_final.pth", vocab=vec_env.vocab,
+            boss_state=boss_state, env_steps=env_steps_collected,
+        )
         wandb.finish()
 
         if vis is not None:

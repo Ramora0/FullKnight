@@ -95,12 +95,15 @@ class Config:
     target_kl: float = 0.03
 
     # Training
-    epochs: int = 2000
+    # total_env_steps: total env-steps collected across the whole run.
+    # Replaces the old epoch-based budget; makes LR annealing, save cadence,
+    # and termination independent of wall-clock epoch size.
+    total_env_steps: int = 2_048_000
     total_steps_per_epoch: int = 1024
     batch_size: int = 128
     train_iters: int = 4
     anneal_lr: bool = True
-    save_every: int = 50
+    save_every_steps: int = 51_200
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
 

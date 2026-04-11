@@ -86,12 +86,8 @@ class PPO:
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(), lr=config.lr
         )
-
-        if config.anneal_lr:
-            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self.optimizer,
-                lr_lambda=lambda epoch: 1.0 - epoch / config.epochs,
-            )
+        # LR annealing is now step-based and driven from train.py via
+        # set_lr(); no torch LR scheduler needed.
 
     def get_advantages(self, damage_landed, hits_taken, values_atk, values_def, D):
         """GAE with decomposed value heads and curriculum scaling.
@@ -543,7 +539,13 @@ class PPO:
         out["pass_frac"] = passes_done / max(total_passes, 1)
         return out
 
-    def save_checkpoint(self, path, vocab=None, boss_state=None, epoch=None):
+    def set_lr(self, lr: float):
+        """Manually set the optimizer LR. Used by train.py for step-based
+        linear annealing (replacing the old LambdaLR scheduler)."""
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
+
+    def save_checkpoint(self, path, vocab=None, boss_state=None, env_steps=None):
         # Serialize per-boss curriculum state: D plus the raw rolling windows
         # so resume can continue the EMA without a warm-up gap.
         ckpt_boss = None
@@ -560,14 +562,13 @@ class PPO:
             {
                 "model": self.policy.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
-                "scheduler": self.scheduler.state_dict() if self.config.anneal_lr else None,
                 "obs_normalizer": self.obs_normalizer.state_dict(),
                 "combat_normalizer": self.combat_normalizer.state_dict(),
                 "terrain_normalizer": self.terrain_normalizer.state_dict(),
                 "hx": self.hx,
                 "kind_vocab": vocab.state_dict() if vocab is not None else None,
                 "boss_state": ckpt_boss,
-                "epoch": epoch,
+                "env_steps": env_steps,
             },
             path,
         )
@@ -601,8 +602,6 @@ class PPO:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         except ValueError:
             pass  # param group mismatch (e.g. pre-GRU checkpoint); fine for eval
-        if self.config.anneal_lr and ckpt.get("scheduler"):
-            self.scheduler.load_state_dict(ckpt["scheduler"])
         if ckpt.get("obs_normalizer"):
             self.obs_normalizer.load_state_dict(ckpt["obs_normalizer"])
         if ckpt.get("combat_normalizer"):
@@ -614,11 +613,11 @@ class PPO:
         if vocab is not None and ckpt.get("kind_vocab") is not None:
             vocab.load_state_dict(ckpt["kind_vocab"])
             print(f"  Loaded kind vocab: {len(vocab)} entries")
-        start_epoch = 0
-        ckpt_epoch = ckpt.get("epoch")
-        if ckpt_epoch is not None:
-            start_epoch = int(ckpt_epoch) + 1
-            print(f"  Resuming at epoch {start_epoch} (checkpoint saved at epoch {ckpt_epoch})")
+        start_env_steps = 0
+        ckpt_env_steps = ckpt.get("env_steps")
+        if ckpt_env_steps is not None:
+            start_env_steps = int(ckpt_env_steps)
+            print(f"  Resuming at env_steps={start_env_steps}")
         if boss_state is not None and ckpt.get("boss_state") is not None:
             ckpt_boss = ckpt["boss_state"]
             restored, new, dropped = [], [], []
@@ -641,4 +640,4 @@ class PPO:
                 print(f"  New bosses (using D_initial): {new}")
             if dropped:
                 print(f"  Checkpoint bosses not in current pool (skipped): {dropped}")
-        return start_epoch
+        return start_env_steps
