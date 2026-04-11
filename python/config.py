@@ -83,7 +83,7 @@ class Config:
     gae_lambda: float = 0.95
     clip_eps: float = 0.1
     value_coeff: float = 0.5
-    entropy_coeff: float = 0.02
+    entropy_coeff: float = 0.05
     max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
     target_kl: float = 0.01
