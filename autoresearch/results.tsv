@@ -9,3 +9,5 @@ cb4694c	8.35	discard	apr11 baseline C scratch mid-iter running-mean halt 2mb-war
 054e8dc	7.42	discard	apr11 baseline D scratch train_iters=1 target_kl=0 (pct_trained 100.0% but only 8 updates/ep; WORST: FK 8.80 Moss 5.67 Gruz 11.03 Hornet 5.88 => 1 iter too few, undershoots gradient; optimum ~2 iters)
 acdcd63	10.07	keep	apr11 baseline E scratch train_iters=2 target_kl=0 NEW BEST (+6.6% vs A; FK 15.00 Moss 7.99 Gruz 12.59 Hornet 7.65, wins on 3/4 bosses, dmg 0.167 hits 0.012 ent -2.67 kl 0.013, 195 ep; deterministic 2 iters, simpler than A)
 bb3c01c	9.75	keep	apr11 baseline F scratch train_iters=3 target_kl=0 (FK 16.43 best, Moss 9.17 best, Gruz 9.67 outlier drags geomean, Hornet 7.77, dmg 0.193 BEST curr_rew 0.0077 BEST; tied with E within noise, 2-3 iters is flat plateau)
+4b5273d	13.11	keep	apr11 baseline G scratch n_envs 8->16 (+30% vs E, +49% throughput 138->207 samp/s; 242 ep, FK 26.92 Moss 8.95 Gruz 13.39 Hornet 10.25 wins all 4 bosses)
+185a1ce	12.98	keep	apr11 baseline I post-merge amortized-resets on G config (+68% throughput 207->347 samp/s, 407 ep vs 242; D within noise, ent BETTER -2.44, validates reset amortization)
