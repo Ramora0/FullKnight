@@ -78,7 +78,7 @@ class Config:
 
 
     # PPO
-    lr: float = 5e-4
+    lr: float = 1e-4
     gamma: float = 0.95
     gae_lambda: float = 0.95
     clip_eps: float = 0.1
