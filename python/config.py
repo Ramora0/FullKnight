@@ -90,7 +90,7 @@ class Config:
 
     # Training
     epochs: int = 2000
-    total_steps_per_epoch: int = 1024
+    total_steps_per_epoch: int = 512
     batch_size: int = 128
     train_iters: int = 4
     anneal_lr: bool = True
