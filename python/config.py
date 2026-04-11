@@ -15,7 +15,7 @@ class Config:
     # Environment
     server_host: str = "localhost"
     server_port: int = 8765
-    n_envs: int = 1
+    n_envs: int = 8
     level: str = "GG_Mega_Moss_Charger"  # used by eval
     boss_levels: str = "GG_Mega_Moss_Charger"  # comma-separated pool for training
     frames_per_wait: int = 5
@@ -86,7 +86,7 @@ class Config:
 
     # Training
     epochs: int = 2000
-    total_steps_per_epoch: int = 8192
+    total_steps_per_epoch: int = 1024
     batch_size: int = 128
     train_iters: int = 4
     anneal_lr: bool = True

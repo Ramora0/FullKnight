@@ -83,7 +83,9 @@ async def train(config: Config):
         print(f"Model parameters: {sum(p.numel() for p in agent.policy.parameters()):,}")
 
         os.makedirs(os.path.dirname(config.save_path) or ".", exist_ok=True)
-        if config.time_budget:
+        # Time-budgeted runs default to wandb-off (quick local experiments),
+        # but let the caller opt back in by setting WANDB_MODE=online explicitly.
+        if config.time_budget and os.environ.get("WANDB_MODE") is None:
             os.environ["WANDB_MODE"] = "disabled"
         wandb.init(project=config.wandb_project, config=vars(config))
 
