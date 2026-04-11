@@ -17,7 +17,7 @@ cd "$REPO_ROOT"
 
 SHORT_HASH="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
 COMMIT_SUBJECT="$(git -C "$REPO_ROOT" log -1 --pretty=%s)"
-export WANDB_MODE=online
+export WANDB_MODE=disabled
 export WANDB_NAME="${SHORT_HASH} ${COMMIT_SUBJECT}"
 
 .venv/Scripts/python.exe python/train.py \
