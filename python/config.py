@@ -67,7 +67,6 @@ class Config:
 
     # Adaptive reward scaling: D = % of boss HP dealt per hit taken
     D_min: float = 0.01       # floor (0.01% boss HP per hit) — prevents reward blowup early
-    D_max: float = 200.0      # ceiling: real boss HP
     D_initial: float = 2.0    # starting difficulty (% boss HP dealt per hit taken)
     D_ema: float = 0.9        # smoothing: D moves 10% toward new value each epoch
     D_max_delta: float = 0.10 # max relative change per epoch (10%) — primary smoothing is the EMA + rolling window, not the clamp

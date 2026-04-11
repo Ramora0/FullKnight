@@ -261,11 +261,9 @@ async def train(config: Config):
                     ))
                 elif window_landed > 0 and window_taken == 0:
                     # Weaker signal: policy is landing damage without getting hit.
-                    # Push D up at the normal clamp rate.
-                    bs["D"] = float(min(
-                        bs["D"] * (1 + config.D_max_delta),
-                        config.D_max,
-                    ))
+                    # Push D up at the normal clamp rate. No upper ceiling — D
+                    # grows unbounded as the agent improves.
+                    bs["D"] = float(bs["D"] * (1 + config.D_max_delta))
                 # else: both zero — no knight/boss interaction at all. Leave D
                 # alone; this usually means the arena is broken, not a signal.
 
