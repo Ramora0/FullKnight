@@ -102,7 +102,7 @@ class Config:
     resume: str = ""  # path to checkpoint to resume from
 
     # Reproducibility
-    seed: int = 0  # 0 = non-deterministic
+    seed: int = 42  # fixed for KL-ablation baselines
 
     # Time budget (seconds, 0 = unlimited). Disables wandb when set.
     time_budget: int = 0

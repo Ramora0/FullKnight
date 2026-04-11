@@ -8,8 +8,8 @@
 #   - logs to wandb under WANDB_PROJECT, named "<short_hash> <commit_subject>"
 #     so every run in the dashboard maps 1:1 to a git commit on the ablation branch.
 
-TIME_BUDGET=900  # 15 minutes (phase A — regression-fix iterations)
-RESUME_CKPT="models/fullknight_500.pth"
+TIME_BUDGET=1200  # 20 minutes (scratch-baseline KL ablation)
+RESUME_CKPT=""  # from-scratch training to test KL variants in isolation
 WANDB_PROJECT="fullknight-ablation"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

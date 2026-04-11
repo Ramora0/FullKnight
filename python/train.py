@@ -417,6 +417,7 @@ async def train(config: Config):
                 'D_geomean': D_geomean,
                 'avg_hits_per_boss': avg_hits_per_boss,
                 'surrogate': metrics['surrogate'],
+                'pass_frac': metrics['pass_frac'],
             })
 
             if time_budget and (time.perf_counter() - t_start) >= time_budget:
@@ -444,6 +445,7 @@ async def train(config: Config):
             print(f"final_entropy:       {avg['entropy']:.6f}")
             print(f"final_kl:            {avg['kl']:.6f}")
             print(f"final_surrogate:     {avg['surrogate']:.6f}")
+            print(f"pct_samples_trained: {100 * avg['pass_frac']:.1f}")
             print(f"epochs_completed:    {epoch + 1}")
             print(f"training_seconds:    {elapsed:.1f}")
 
