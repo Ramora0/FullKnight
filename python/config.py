@@ -86,13 +86,13 @@ class Config:
     entropy_coeff: float = 0.02
     max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
-    target_kl: float = 0.03
+    target_kl: float = 0.0
 
     # Training
     epochs: int = 2000
     total_steps_per_epoch: int = 1024
     batch_size: int = 128
-    train_iters: int = 4
+    train_iters: int = 1
     anneal_lr: bool = True
     save_every: int = 50
     save_path: str = "models/fullknight"

@@ -1,3 +1,8 @@
-commit	hit_ratio	status	description
-e04c2da	1.243849	keep	v2 baseline (tuned params from v1)
-e04c2da	0.858359	discard	original defaults comparison (lr 2.5e-4 gamma 0.99 entropy 0.05 steps 2048 vcoeff 0.25)
+commit	D_geomean	status	description
+9431478	38.90	keep	apr10 baseline single-boss (n_envs=8, steps=8192, lr=5e-4, ent=0.01, clip=0.2, iters=4)
+b323ace	70.06	keep	apr10 steps 8192->4096 single-boss
+e541a97	81.61	keep	apr10 steps 4096->2048 single-boss (winner)
+# --- apr11 phase A exp1-7 discarded: all regressed from fullknight_500 on 4-boss pool, root cause not in KL gating; starting fresh from-scratch baselines below ---
+4ad6c06	9.45	keep	apr11 baseline A scratch 20m seed42 4boss old per-batch KL halt (pct_trained 55.2%, FK 16.27 Moss 7.16 Gruz 11.18 Hornet 7.10, dmg 0.193 hits 0.011, ent -2.29, 193 ep)
+630d724	8.20	discard	apr11 baseline B scratch epoch-mean-at-end-of-iter halt (pct_trained 83.8%, D worse than A despite 52%+ data: FK 10.39 Moss 6.06 Gruz 12.92 Hornet 5.96, dmg 0.084, ent -2.99, 186 ep)
+cb4694c	8.35	discard	apr11 baseline C scratch mid-iter running-mean halt 2mb-warmup (pct_trained 60.5%, FK 13.32 Moss 6.47 Gruz 11.77 Hornet 5.81, dmg 0.134, ent -2.78, 188 ep; between A and B)
