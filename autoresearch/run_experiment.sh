@@ -20,7 +20,7 @@ COMMIT_SUBJECT="$(git -C "$REPO_ROOT" log -1 --pretty=%s)"
 export WANDB_MODE=online
 export WANDB_NAME="${SHORT_HASH} ${COMMIT_SUBJECT}"
 
-python python/train.py \
+.venv/Scripts/python.exe python/train.py \
     --time_budget "$TIME_BUDGET" \
     --resume "$RESUME_CKPT" \
     --wandb_project "$WANDB_PROJECT" \
