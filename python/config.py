@@ -86,7 +86,7 @@ class Config:
     entropy_coeff: float = 0.02
     max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
-    target_kl: float = 0.03
+    target_kl: float = 0.01
 
     # Training
     epochs: int = 2000
