@@ -411,13 +411,9 @@ class PPO:
 
         pbar = tqdm(total=total_passes, unit="pass", unit_scale=True,
                     desc="  train", leave=False, dynamic_ncols=True)
-        stop_training = False
         for _ in range(cfg.train_iters):
-            if stop_training:
-                break
             chunk_indices = np.random.permutation(total_chunks)
-            iter_kl_sum = 0.0
-            iter_kl_n = 0
+            early_stop = False
 
             for start in range(0, total_chunks, CPB):
                 idx = chunk_indices[start:start + CPB]
@@ -482,23 +478,17 @@ class PPO:
                 with torch.no_grad():
                     kl = ((ratio - 1) - log_ratio).mean().item()
                     total_metrics["kl"] += kl
-                    iter_kl_sum += kl
-                    iter_kl_n += 1
 
                 passes_done += len(idx) * L
                 pbar.update(len(idx) * L)
                 pbar.set_postfix_str(f"surr={surrogate.item():+.3f} kl={kl:.3f}")
 
-                # Running-mean KL halt with 2-minibatch warmup: catches drift
-                # mid-iter (no more wasting updates after drift exceeds target),
-                # but a single outlier minibatch can't trip the check.
-                if (
-                    cfg.target_kl
-                    and iter_kl_n >= 2
-                    and (iter_kl_sum / iter_kl_n) > cfg.target_kl
-                ):
-                    stop_training = True
+                if cfg.target_kl and kl > cfg.target_kl:
+                    early_stop = True
                     break
+
+            if early_stop:
+                break
 
         pbar.close()
         out = {k: v / max(n_updates, 1) for k, v in total_metrics.items()}
