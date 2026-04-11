@@ -17,7 +17,6 @@ namespace FullKnight.Environment
 		private int _timeScaleValue;
 		private int _hitsTakenInStep;
 		private float _damageLandedInStep;
-		private int _bossMaxHP;
 		private int _knightMaxHP;
 
 		// Eval mode: real damage, real death, episode ends on kill
@@ -25,12 +24,16 @@ namespace FullKnight.Environment
 		private bool _bossDied;
 		private bool _episodeDone;
 		private string _episodeResult;
-		private HealthManager _bossHM;
-		// Set of HealthManagers considered the "true target(s)" for is_target.
-		// Populated from BossSceneController.bosses on each reset; used by
-		// HitboxObserver.GetSplitFeatures to flag which combat hitboxes the
-		// agent should actually try to kill (vs. minions / projectiles).
+		// Set of HealthManagers considered the "true target(s)" for is_target and
+		// reward. Populated from BossSceneController.bosses on each reset; used by
+		// HitboxObserver.GetSplitFeatures to flag which combat hitboxes the agent
+		// should actually try to kill (vs. minions / projectiles), and by the
+		// damage hook to credit reward and apply training-mode immortality.
 		private readonly HashSet<HealthManager> _bossHMs = new();
+		// Max HP at reset for each boss in _bossHMs. Stored per-hm because multi-
+		// boss fights (Oro/Mato, God Tamer) have asymmetric HP pools and damage
+		// must be normalized against each boss's own maxHP.
+		private readonly Dictionary<HealthManager, int> _bossMaxHPs = new();
 
 		// Boss intro skip: keep simulating internally until combat starts
 		private bool _combatStarted;
@@ -455,28 +458,47 @@ namespace FullKnight.Environment
 
 		private void OnBossDamaged(On.HealthManager.orig_TakeDamage orig, HealthManager self, HitInstance hitInstance)
 		{
-			// Only track the one designated boss. Minions, summons, and ambient
-			// HealthManagers in the arena pass through unmodified.
-			if (self != _bossHM) { orig(self, hitInstance); return; }
+			// Only track HealthManagers in the designated boss set. Minions,
+			// summons, and ambient HealthManagers pass through unmodified.
+			if (!_bossMaxHPs.TryGetValue(self, out int maxHP))
+			{
+				orig(self, hitInstance);
+				return;
+			}
 
-			_damageLandedInStep += hitInstance.DamageDealt / (float)_bossMaxHP * 100f;
+			// Equal-weight-per-boss normalization: each boss contributes 100/N
+			// percent when fully killed, independent of its HP pool. Collapses
+			// to the single-boss formula when N=1. Asymmetric fights (Oro/Mato,
+			// God Tamer) get correct 50/50 weighting instead of HP-proportional.
+			int n = _bossHMs.Count;
+			_damageLandedInStep += hitInstance.DamageDealt / (float)(n * maxHP) * 100f;
 
 			if (!_evalMode)
 			{
-				// Training: prevent boss death, restore HP for infinite fighting
+				// Training: prevent boss death, restore HP for infinite fighting.
 				if (self.hp - hitInstance.DamageDealt <= 0)
-					self.hp = _bossMaxHP;
+					self.hp = maxHP;
 				orig(self, hitInstance);
-				self.hp = _bossMaxHP;
+				self.hp = maxHP;
 			}
 			else
 			{
-				// Eval: let damage through, detect boss death
-				bool wouldDie = _bossHM != null && self == _bossHM
-					&& self.hp - hitInstance.DamageDealt <= 0;
+				// Eval: let damage through. Episode ends only when every boss in
+				// the set is dead — handles multi-boss arenas where the fight
+				// continues until the last one falls.
+				bool wouldDie = self.hp - hitInstance.DamageDealt <= 0;
 				orig(self, hitInstance);
 				if (wouldDie)
-					_bossDied = true;
+				{
+					bool allDead = true;
+					foreach (var hm in _bossHMs)
+					{
+						if (hm == null) continue;
+						if (hm == self) continue;
+						if (hm.hp > 0) { allDead = false; break; }
+					}
+					if (allDead) _bossDied = true;
+				}
 			}
 		}
 
@@ -493,25 +515,20 @@ namespace FullKnight.Environment
 
 		private void InitBossRefs()
 		{
-			_bossHM = null;
-			_bossMaxHP = 1;
 			_bossHMs.Clear();
+			_bossMaxHPs.Clear();
 			try
 			{
 				if (BossSceneController.Instance?.bosses != null
 					&& BossSceneController.Instance.bosses.Length > 0)
 				{
-					// Primary boss for damage tracking / death detection.
-					_bossHM = BossSceneController.Instance.bosses[0]
-						.gameObject.GetComponent<HealthManager>();
-					if (_bossHM != null) _bossMaxHP = _bossHM.hp;
-					// Full set for is_target tagging — handles multi-boss scenes
-					// (Mantis Lords, etc.) where every entry is a "real" target.
 					foreach (var b in BossSceneController.Instance.bosses)
 					{
 						if (b == null) continue;
 						var hm = b.gameObject.GetComponent<HealthManager>();
-						if (hm != null) _bossHMs.Add(hm);
+						if (hm == null) continue;
+						_bossHMs.Add(hm);
+						_bossMaxHPs[hm] = hm.hp;
 					}
 				}
 			}
