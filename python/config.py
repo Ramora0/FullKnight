@@ -84,12 +84,12 @@ class Config:
 
 
     # PPO
-    lr: float = 5e-4
+    lr: float = 1e-4
     gamma: float = 0.95
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
     value_coeff: float = 0.5
-    entropy_coeff: float = 0.005
+    entropy_coeff: float = 0.02
     max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
     target_kl: float = 0.0
