@@ -84,7 +84,7 @@ class Config:
 
 
     # PPO
-    lr: float = 1e-4
+    lr: float = 3e-4
     gamma: float = 0.95
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
@@ -95,11 +95,11 @@ class Config:
     target_kl: float = 0.0
 
     # Training
-    epochs: int = 2000
+    epochs: int = 75000
     total_steps_per_epoch: int = 256
     batch_size: int = 128
     train_iters: int = 2
-    anneal_lr: bool = False
+    anneal_lr: bool = True
     save_every: int = 50
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
@@ -108,7 +108,7 @@ class Config:
     resume: str = ""  # path to checkpoint to resume from
 
     # Reproducibility
-    seed: int = 42  # fixed for KL-ablation baselines
+    seed: int = 0  # 0 = non-deterministic
 
     # Time budget (seconds, 0 = unlimited). Disables wandb when set.
     time_budget: int = 0
