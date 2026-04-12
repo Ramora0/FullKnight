@@ -133,23 +133,22 @@ def main():
     new_combat_norm = remap_combat_normalizer(old_ckpt["combat_normalizer"])
     new_terrain_norm = old_ckpt["terrain_normalizer"]  # shape (5,) — unchanged
 
-    # Build a fresh PPO so we can grab a clean optimizer/scheduler state matching
-    # the new model's param groups. The loader assumes both keys are non-None and
-    # only catches ValueError on optimizer load, so we can't just stash None.
+    # Build a fresh PPO so we can grab a clean optimizer state matching the
+    # new model's param groups. (The LR scheduler has been removed — LR is
+    # now annealed manually in train.py based on env_steps_collected.)
     fresh = PPO(config)
     fresh.policy.load_state_dict(new_model.state_dict())
 
     out_ckpt = {
         "model": new_model.state_dict(),
         "optimizer": fresh.optimizer.state_dict(),
-        "scheduler": fresh.scheduler.state_dict() if config.anneal_lr else None,
         "obs_normalizer": new_obs_norm,
         "combat_normalizer": new_combat_norm,
         "terrain_normalizer": new_terrain_norm,
         "hx": None,
         "kind_vocab": None,            # vocab is fresh; will populate from env
         "boss_state": None,            # adaptive D restarts from D_initial
-        "epoch": None,                 # treat as a fresh run, not a resume
+        "env_steps": None,             # treat as a fresh run, not a resume
     }
     torch.save(out_ckpt, NEW_PATH)
 
