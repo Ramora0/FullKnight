@@ -39,7 +39,7 @@ namespace FullKnight.Game
 			BossSceneController.SetupEvent = (self) =>
 			{
 				StaticVariableList.SetValue("bossSceneToLoad", scene_name);
-				self.BossLevel = 1;
+				self.BossLevel = 0;
 				self.DreamReturnEvent = "DREAM RETURN";
 				self.OnBossSceneComplete += () => self.DoDreamReturn();
 			};

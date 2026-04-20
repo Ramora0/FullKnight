@@ -465,20 +465,23 @@ namespace FullKnight.Environment
 
 		private void HookDamage()
 		{
-			ModHooks.AfterTakeDamageHook += OnKnightDamaged;
+			ModHooks.TakeDamageHook += OnKnightDamaged;
 			On.HealthManager.TakeDamage += OnBossDamaged;
 		}
 
 		private void UnhookDamage()
 		{
-			ModHooks.AfterTakeDamageHook -= OnKnightDamaged;
+			ModHooks.TakeDamageHook -= OnKnightDamaged;
 			On.HealthManager.TakeDamage -= OnBossDamaged;
 		}
 
-		private int OnKnightDamaged(int damageType, int damage)
+		// TakeDamageHook (before): return value replaces the damage the game
+		// will apply. AfterTakeDamageHook (what we used before) fires post-HP
+		// subtraction and re-applies its return as additional damage, which
+		// doubled every hit once the training HP clamp was removed.
+		private int OnKnightDamaged(ref int hazardType, int damage)
 		{
 			_hitsTakenInStep++;
-			// Real damage in both modes now (no HP clamping)
 			return damage;
 		}
 
