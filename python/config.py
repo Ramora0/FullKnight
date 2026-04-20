@@ -78,9 +78,9 @@ class Config:
     # size differs, so D's wallclock behavior stays consistent.
     D_min: float = 0.01       # floor (0.01% boss HP per hit) — prevents reward blowup early
     D_initial: float = 2.0    # starting difficulty (% boss HP dealt per hit taken)
-    D_ema: float = 0.9        # smoothing at 8192-step epochs: D moves 10% toward new value per epoch
-    D_max_delta: float = 0.10 # max relative change per 8192-step epoch (10%)
-    D_window: int = 4         # rolling window size at 8192-step epochs (auto-widened for smaller rollouts)
+    D_ema: float = 0.97       # smoothing at 8192-step epochs: D moves 3% toward new value per epoch
+    D_max_delta: float = 0.03 # max relative change per 8192-step epoch (3%)
+    D_window: int = 10        # rolling window size at 8192-step epochs (auto-widened for smaller rollouts)
 
 
     # PPO
