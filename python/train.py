@@ -181,6 +181,12 @@ async def train(config: Config):
             # them off at the end of the prior epoch. Splice new obs into
             # obs_full, zero their hidden state, and readd to active_envs.
             reaped = vec_env.reap_completed_resets()
+            # If nothing is active but resets are in flight (common with small
+            # n_envs after a death-triggered reset), block until at least one
+            # reset finishes — otherwise the rollout loop crashes on an empty
+            # batch.
+            if not reaped and not active_envs and vec_env._reset_tasks:
+                reaped = await vec_env.await_all_resets()
             if reaped:
                 reaped_indices = [env_i for env_i, _ in reaped]
                 reaped_obs_batch = vec_env._batch_observations(
