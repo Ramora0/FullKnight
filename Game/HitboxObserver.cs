@@ -290,6 +290,31 @@ namespace FullKnight.Game
 		public void RecreateReader() => _hook.RecreateReader();
 		public SortedDictionary<HitboxType, HashSet<Collider2D>> GetHitboxes() => _hook.GetHitboxes();
 
+		public struct CacheSizes
+		{
+			public int EnemyCount;
+			public int AttackCount;
+			public int TerrainCount;
+			public int KindCacheCount;
+		}
+
+		/// <summary>Return raw HashSet / Dictionary sizes so Python can watch for
+		/// unbounded growth (pooled prefabs accumulating across episodes).</summary>
+		public CacheSizes GetCacheSizes()
+		{
+			var s = new CacheSizes();
+			var hb = _hook.GetHitboxes();
+			if (hb != null)
+			{
+				if (hb.ContainsKey(HitboxType.Enemy)) s.EnemyCount = hb[HitboxType.Enemy].Count;
+				if (hb.ContainsKey(HitboxType.Attack)) s.AttackCount = hb[HitboxType.Attack].Count;
+				if (hb.ContainsKey(HitboxType.Terrain)) s.TerrainCount = hb[HitboxType.Terrain].Count;
+			}
+			var reader = _hook.GetReader();
+			if (reader != null) s.KindCacheCount = reader.kindCache.Count;
+			return s;
+		}
+
 		public struct SplitObservation
 		{
 			public List<float[]> CombatHitboxes;

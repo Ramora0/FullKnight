@@ -126,22 +126,56 @@ def pop_last_terrain_debug():
     return out
 
 
+_DIAG_FMT = '<HHHif'  # enemy_cnt, attack_cnt, terrain_cnt, kind_cache_size, gc_heap_mb
+_DIAG_SIZE = struct.calcsize(_DIAG_FMT)  # 14 bytes
+
+# Side channel: last diag tuple pulled off the wire. Populated by unpack_step,
+# read by vec_env so we don't balloon the main return tuple on every caller.
+_last_diag = {
+    "enemy_count": 0,
+    "attack_count": 0,
+    "terrain_count": 0,
+    "kind_cache_size": 0,
+    "gc_heap_mb": 0.0,
+}
+
+def pop_last_diag():
+    """Return the most-recently-received diag block (dict)."""
+    return dict(_last_diag)
+
+
 def unpack_step(data):
     """Unpack a step response.
     Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-             damage_landed, hits_taken, game_time, real_time, done)."""
-    global _last_terrain_debug
+             damage_landed, hits_taken, hp_healed, game_time, real_time, done).
+    Diag fields are stashed in _last_diag — read via pop_last_diag()."""
+    global _last_terrain_debug, _last_diag
     combat_hb, terrain_hb, gs, n_combat, offset = unpack_obs(data)
     n_terrain = terrain_hb.shape[0]
-    damage_landed, hits_taken, game_time, real_time = struct.unpack_from('<ffff', data, offset)
-    offset += 16
+    damage_landed, hits_taken, game_time, real_time, hp_healed = struct.unpack_from('<fffff', data, offset)
+    offset += 20
     done = data[offset] != 0
     offset += 1
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
     combat_parents, offset = unpack_kinds(data, offset, n_combat)
-    _last_terrain_debug, _ = unpack_terrain_debug(data, offset, n_terrain)
+    _last_terrain_debug, offset = unpack_terrain_debug(data, offset, n_terrain)
+    # Diag trailer (14 bytes). Defensive: older C# mods don't send it.
+    if offset + _DIAG_SIZE <= len(data):
+        e, a, t, kc, heap_mb = struct.unpack_from(_DIAG_FMT, data, offset)
+        _last_diag = {
+            "enemy_count": int(e),
+            "attack_count": int(a),
+            "terrain_count": int(t),
+            "kind_cache_size": int(kc),
+            "gc_heap_mb": float(heap_mb),
+        }
+    else:
+        _last_diag = {
+            "enemy_count": 0, "attack_count": 0, "terrain_count": 0,
+            "kind_cache_size": 0, "gc_heap_mb": 0.0,
+        }
     return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-            damage_landed, hits_taken, game_time, real_time, done)
+            damage_landed, hits_taken, hp_healed, game_time, real_time, done)
 
 def unpack_reset(data):
     """Unpack a reset response.

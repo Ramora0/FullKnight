@@ -65,6 +65,7 @@ namespace FullKnight.Net
 					w.Write((float)(d.hits_taken ?? 0));
 					w.Write(d.step_game_time ?? 0f);
 					w.Write(d.step_real_time ?? 0f);
+					w.Write(d.hp_healed ?? 0f);
 					w.Write(d.done == true ? (byte)1 : (byte)0);
 				}
 
@@ -101,6 +102,20 @@ namespace FullKnight.Net
 					int len = bytes.Length > 65535 ? 65535 : bytes.Length;
 					w.Write((ushort)len);
 					w.Write(bytes, 0, len);
+				}
+
+				// Diag block — appended at the very end so older Python clients
+				// that stop reading after terrain_debug still parse correctly.
+				// Step-only (resets are rare, don't need per-reset leak probes).
+				// Layout: HHHif = 14 bytes. Must match unpack order in
+				// python/binary_protocol.py:unpack_step.
+				if (message.type == "step")
+				{
+					w.Write(d.diag_enemy_count ?? (ushort)0);
+					w.Write(d.diag_attack_count ?? (ushort)0);
+					w.Write(d.diag_terrain_count ?? (ushort)0);
+					w.Write(d.diag_kind_cache_size ?? 0);
+					w.Write(d.diag_gc_heap_mb ?? 0f);
 				}
 			}
 
