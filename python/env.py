@@ -1,7 +1,7 @@
 import numpy as np
 from binary_protocol import (
     pack_init, pack_reset, pack_action, pack_pause, pack_resume,
-    unpack_reset, unpack_step, pop_last_terrain_debug, MSG_CLOSE,
+    unpack_reset, unpack_step, pop_last_terrain_debug, pop_last_diag, MSG_CLOSE,
 )
 import struct
 
@@ -19,6 +19,12 @@ class HKEnv:
         # Debug-only: last terrain_debug strings pulled off the wire.
         # Populated after each reset/step by reading the protocol side channel.
         self.last_terrain_debug: list = []
+        # Diag block (leak probes) from the most recent step — populated by
+        # step(). vec_env reads this to aggregate per-epoch perf metrics.
+        self.last_diag: dict = {
+            "enemy_count": 0, "attack_count": 0, "terrain_count": 0,
+            "kind_cache_size": 0, "gc_heap_mb": 0.0,
+        }
 
     async def init(self):
         """Send init handshake and wait for ack."""
@@ -41,15 +47,16 @@ class HKEnv:
     async def step(self, action_vec):
         """Take a step. action_vec = [movement, direction, action, jump].
         Returns (combat_hb, terrain_hb, global_state, combat_kinds, combat_parents,
-                 damage_landed, hits_taken, step_game_time, step_real_time).
+                 damage_landed, hits_taken, hp_healed, step_game_time, step_real_time, done).
         """
         await self.ws.send(pack_action(action_vec))
         data = await self.ws.recv()
         (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-         damage_landed, hits_taken, game_time, real_time, done) = unpack_step(data)
+         damage_landed, hits_taken, hp_healed, game_time, real_time, done) = unpack_step(data)
         self.last_terrain_debug = pop_last_terrain_debug()
+        self.last_diag = pop_last_diag()
         return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-                damage_landed, hits_taken, game_time, real_time)
+                damage_landed, hits_taken, hp_healed, game_time, real_time, done)
 
     async def step_eval(self, action_vec):
         """Like step() but also returns done flag. For eval mode."""

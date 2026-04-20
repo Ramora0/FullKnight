@@ -97,9 +97,11 @@ class VecEnv:
         active_indices: optional list of env slots to step. When provided,
                         only those envs are stepped and returned arrays are
                         sized len(active_indices). Defaults to all envs.
-        Returns (Observation, damage_landed, hits_taken, step_game_times,
-                 step_real_times, step_wall_times). All arrays aligned to
-                 active_indices ordering.
+        Returns (Observation, damage_landed, hits_taken, hp_healed, done_flags,
+                 step_game_times, step_real_times, step_wall_times, diag).
+        `diag` is a dict of (N_active,) arrays: enemy_count, attack_count,
+        terrain_count, kind_cache_size, gc_heap_mb — from env.last_diag.
+        All arrays aligned to active_indices ordering.
         """
         if active_indices is None:
             active_indices = list(range(self.n_envs))
@@ -118,15 +120,27 @@ class VecEnv:
         step_wall_times = np.array([dt for dt, _ in ordered], dtype=np.float32)
         results = [r for _, r in ordered]
         (combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists,
-         damage_landed, hits_taken, step_game_times, step_real_times) = zip(*results)
+         damage_landed, hits_taken, hp_healed, step_game_times, step_real_times,
+         done_flags) = zip(*results)
 
         obs = self._batch_observations(list(zip(
             combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists)))
         damage_landed = np.array(damage_landed, dtype=np.float32)
         hits_taken = np.array(hits_taken, dtype=np.float32)
+        hp_healed = np.array(hp_healed, dtype=np.float32)
+        done_flags = np.array(done_flags, dtype=bool)
         step_game_times = np.array(step_game_times, dtype=np.float32)
         step_real_times = np.array(step_real_times, dtype=np.float32)
-        return obs, damage_landed, hits_taken, step_game_times, step_real_times, step_wall_times
+        # Collect diag in active_indices order. env.last_diag was set by
+        # step() inside the gather above, so it's current per env.
+        diag_envs = [self.envs[env_i].last_diag for env_i in active_indices]
+        diag = {
+            k: np.array([d[k] for d in diag_envs], dtype=np.float32)
+            for k in ("enemy_count", "attack_count", "terrain_count",
+                      "kind_cache_size", "gc_heap_mb")
+        }
+        return (obs, damage_landed, hits_taken, hp_healed, done_flags,
+                step_game_times, step_real_times, step_wall_times, diag)
 
     async def start_resets(self, reset_indices, levels=None, resume_indices=None):
         """Kick off background resets for reset_indices and synchronously

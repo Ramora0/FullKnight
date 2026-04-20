@@ -205,10 +205,18 @@ async def train(config: Config):
             buf_values_def = []
             buf_damage_landed = []
             buf_hits_taken = []
+            buf_hp_healed = []
+            buf_dones = []
             buf_hx = []
             buf_step_game_times = []
             buf_step_real_times = []
             buf_step_wall_times = []
+            # Leak probes from C#. Each is (T, N_active).
+            buf_diag_enemy = []
+            buf_diag_attack = []
+            buf_diag_terrain = []
+            buf_diag_kind_cache = []
+            buf_diag_gc_heap = []
 
             t_rollout_start = time.perf_counter()
 
@@ -232,8 +240,9 @@ async def train(config: Config):
                 ]
 
                 t_step = time.perf_counter()
-                (next_obs, damage_landed, hits_taken, step_game_times, step_real_times,
-                 step_wall_per_env) = await vec_env.step_all(
+                (next_obs, damage_landed, hits_taken, hp_healed, done_flags,
+                 step_game_times, step_real_times,
+                 step_wall_per_env, diag) = await vec_env.step_all(
                     action_vecs, active_indices=active_envs
                 )
                 wall_dt = time.perf_counter() - t_step
@@ -246,9 +255,16 @@ async def train(config: Config):
                 buf_values_def.append(values_def)
                 buf_damage_landed.append(damage_landed)
                 buf_hits_taken.append(hits_taken)
+                buf_hp_healed.append(hp_healed)
+                buf_dones.append(done_flags)
                 buf_step_game_times.append(step_game_times)
                 buf_step_real_times.append(step_real_times)
                 buf_step_wall_times.append(step_wall_per_env)
+                buf_diag_enemy.append(diag["enemy_count"])
+                buf_diag_attack.append(diag["attack_count"])
+                buf_diag_terrain.append(diag["terrain_count"])
+                buf_diag_kind_cache.append(diag["kind_cache_size"])
+                buf_diag_gc_heap.append(diag["gc_heap_mb"])
 
                 obs = next_obs
 
@@ -269,6 +285,8 @@ async def train(config: Config):
             # Stack buffers: (T, N)
             damage_landed_arr = np.stack(buf_damage_landed)
             hits_taken_arr = np.stack(buf_hits_taken)
+            hp_healed_arr = np.stack(buf_hp_healed)
+            dones_arr = np.stack(buf_dones)
             log_probs_arr = np.stack(buf_log_probs)
             values_atk_arr = np.stack(buf_values_atk)
             values_def_arr = np.stack(buf_values_def)
@@ -318,6 +336,59 @@ async def train(config: Config):
             overhead_ms = max(avg_wall_ms - real_avg_ms, 0.0)
             sim_pct = 100 * real_avg_ms / avg_wall_ms if avg_wall_ms > 0 else 0
 
+            # 4) Leak probes. Trend-over-hours signal: if any of these rise
+            #    monotonically while perf/sim_ms rises, the C# mod is the leak.
+            #    hb_*    : HitboxReader HashSet sizes. Terrain should plateau
+            #              per scene; enemy/attack growing indicates pooled
+            #              prefabs accumulating via ModHooks.ColliderCreateHook.
+            #    kind_*  : kindCache dict; entries for destroyed Unity objects
+            #              linger until scene change (Dict.Equals uses C# refs).
+            #    mono_*  : GC.GetTotalMemory — total managed heap. Rising =
+            #              actual allocation leak (not just Unity object refs).
+            #    rss_*   : OS-level resident memory from psutil. Rising while
+            #              mono_heap is flat → native/Unity leak (textures,
+            #              audio buffers, etc). Rising together → managed leak.
+            if buf_diag_enemy:
+                hb_enemy_arr = np.stack(buf_diag_enemy)       # (T, N_active)
+                hb_attack_arr = np.stack(buf_diag_attack)
+                hb_terrain_arr = np.stack(buf_diag_terrain)
+                kind_cache_arr = np.stack(buf_diag_kind_cache)
+                gc_heap_arr = np.stack(buf_diag_gc_heap)
+                hb_enemy_avg = float(hb_enemy_arr.mean())
+                hb_enemy_max = float(hb_enemy_arr.max())
+                hb_attack_avg = float(hb_attack_arr.mean())
+                hb_attack_max = float(hb_attack_arr.max())
+                hb_terrain_avg = float(hb_terrain_arr.mean())
+                hb_terrain_max = float(hb_terrain_arr.max())
+                kind_cache_avg = float(kind_cache_arr.mean())
+                kind_cache_max = float(kind_cache_arr.max())
+                mono_heap_avg = float(gc_heap_arr.mean())
+                mono_heap_max = float(gc_heap_arr.max())
+            else:
+                hb_enemy_avg = hb_enemy_max = 0.0
+                hb_attack_avg = hb_attack_max = 0.0
+                hb_terrain_avg = hb_terrain_max = 0.0
+                kind_cache_avg = kind_cache_max = 0.0
+                mono_heap_avg = mono_heap_max = 0.0
+
+            # OS-level per-process memory. Walks psutil.Process(pid) for every
+            # HK instance we launched; skips gracefully when instances are
+            # attached manually (mgr is None) or a process has died.
+            rss_mb_list = []
+            if mgr is not None:
+                try:
+                    import psutil as _psutil
+                    for p in getattr(mgr, "_procs", []):
+                        try:
+                            proc = _psutil.Process(p.pid)
+                            rss_mb_list.append(proc.memory_info().rss / (1024 * 1024))
+                        except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                            continue
+                except Exception:
+                    pass
+            hk_rss_avg = float(np.mean(rss_mb_list)) if rss_mb_list else 0.0
+            hk_rss_max = float(np.max(rss_mb_list)) if rss_mb_list else 0.0
+
             # 3) Per-boss avg step time: which bosses are slow stragglers?
             #    Helps decide which bosses to drop or load-balance.
             per_boss_step_ms = {}
@@ -348,6 +419,16 @@ async def train(config: Config):
                 for _ in range(envs_per_reset):
                     reset_indices.append(next_reset_env)
                     next_reset_env = (next_reset_env + 1) % config.n_envs
+
+            # Death-triggered resets: any env that emitted done=true during
+            # this rollout needs to be reset now, not when the step-budget
+            # counter gets around to it. HK has already started transitioning
+            # back to GG_Workshop; Reset() waits for that before dreaming in.
+            done_local = np.where(dones_arr.any(axis=0))[0]
+            for local_i in done_local:
+                env_i = active_envs[int(local_i)]
+                if env_i not in reset_indices:
+                    reset_indices.append(env_i)
             print(
                 f"  diag | active_envs {N_active}/{config.n_envs} | "
                 f"active_steps {active_steps}/{total_steps_epoch} "
@@ -362,6 +443,17 @@ async def train(config: Config):
                 f"{spread_p50_ms:.0f}/{spread_p90_ms:.0f}/{spread_p99_ms:.0f}/{spread_max_ms:.0f}ms | "
                 f"sim {real_avg_ms:.1f}ms ({sim_pct:.0f}%) overhead {overhead_ms:.1f}ms"
             )
+            # Leak-probe line. Print raw counts (no formatting tricks) so an
+            # upward trend over hours is visually obvious. Drop the line entirely
+            # when all diag fields are 0 (old C# DLL / mod-side opt-out).
+            if hb_enemy_avg or hb_terrain_avg or mono_heap_avg or hk_rss_avg:
+                print(
+                    f"  leak | hb_e/a/t avg {hb_enemy_avg:.0f}/{hb_attack_avg:.0f}/{hb_terrain_avg:.0f} "
+                    f"(max {hb_enemy_max:.0f}/{hb_attack_max:.0f}/{hb_terrain_max:.0f}) | "
+                    f"kcache {kind_cache_avg:.0f} | "
+                    f"mono_heap {mono_heap_avg:.1f}MB | "
+                    f"rss avg/max {hk_rss_avg:.0f}/{hk_rss_max:.0f}MB"
+                )
             if per_boss_step_ms:
                 boss_perf_str = " ".join(
                     f"{b.replace('GG_','')}:{per_boss_step_ms[b]:.0f}ms"
@@ -435,8 +527,9 @@ async def train(config: Config):
             t0 = time.perf_counter()
             metrics = agent.train_on_rollout(
                 buf_obs, actions_arr, log_probs_arr,
-                damage_landed_arr, hits_taken_arr,
+                damage_landed_arr, hits_taken_arr, hp_healed_arr,
                 values_atk_arr, values_def_arr, D_per_env, buf_hx_arr,
+                dones_arr,
             )
             torch.cuda.synchronize()
             t_train = time.perf_counter() - t0
@@ -485,8 +578,9 @@ async def train(config: Config):
             active_envs = [i for i in active_envs if i not in set(reset_indices)]
 
             # Logging — per-env curriculum reward uses per-env D.
+            heal_coef = config.heal_coef
             curriculum_reward = float(
-                (damage_landed_arr / D_per_env[None, :] - hits_taken_arr).mean()
+                (damage_landed_arr / D_per_env[None, :] - hits_taken_arr + heal_coef * hp_healed_arr).mean()
             )
             total_steps = env_steps_collected
             Ds = np.array([boss_state[b]["D"] for b in bosses], dtype=np.float64)
@@ -502,12 +596,17 @@ async def train(config: Config):
             # (T, N_active) rollout arrays.
             per_boss_landed_mean = []
             per_boss_taken_mean = []
+            per_boss_healed_mean = []
             for boss in set(active_boss):
                 env_mask = np.array([b == boss for b in active_boss])
                 per_boss_landed_mean.append(float(damage_landed_arr[:, env_mask].mean()))
                 per_boss_taken_mean.append(float(hits_taken_arr[:, env_mask].mean()))
+                per_boss_healed_mean.append(float(hp_healed_arr[:, env_mask].mean()))
             balanced_landed = float(np.mean(per_boss_landed_mean))
             balanced_taken = float(np.mean(per_boss_taken_mean))
+            balanced_healed = float(np.mean(per_boss_healed_mean))
+            # Episode stats
+            n_deaths = int(dones_arr.sum())
             log = {
                 "loss/surrogate": metrics["surrogate"],
                 "loss/value_atk": metrics["value_atk"],
@@ -523,6 +622,8 @@ async def train(config: Config):
                 "rollout/curriculum_reward": curriculum_reward,
                 "rollout/damage_landed": balanced_landed,
                 "rollout/hits_taken": balanced_taken,
+                "rollout/hp_healed": balanced_healed,
+                "rollout/deaths": n_deaths,
                 "diag/active_step_pct": 100 * active_steps / total_steps_epoch,
                 "diag/first_event_avg": np.mean(first_event_steps),
                 "diag/step0_ms": step0_ms,
@@ -538,6 +639,18 @@ async def train(config: Config):
                 "perf/sim_ms": real_avg_ms,
                 "perf/overhead_ms": overhead_ms,
                 "perf/sim_pct": sim_pct,
+                "perf/hb_enemy_avg": hb_enemy_avg,
+                "perf/hb_enemy_max": hb_enemy_max,
+                "perf/hb_attack_avg": hb_attack_avg,
+                "perf/hb_attack_max": hb_attack_max,
+                "perf/hb_terrain_avg": hb_terrain_avg,
+                "perf/hb_terrain_max": hb_terrain_max,
+                "perf/kind_cache_avg": kind_cache_avg,
+                "perf/kind_cache_max": kind_cache_max,
+                "perf/mono_heap_mb_avg": mono_heap_avg,
+                "perf/mono_heap_mb_max": mono_heap_max,
+                "perf/hk_rss_mb_avg": hk_rss_avg,
+                "perf/hk_rss_mb_max": hk_rss_max,
                 "perf/collect_norm_ms": t_norm * 1000,
                 "perf/collect_prep_ms": t_prep * 1000,
                 "perf/collect_h2d_ms": t_h2d * 1000,

@@ -82,6 +82,11 @@ class Config:
     D_max_delta: float = 0.03 # max relative change per 8192-step epoch (3%)
     D_window: int = 10        # rolling window size at 8192-step epochs (auto-widened for smaller rollouts)
 
+    # Heal reward: coefficient for HP restored. Unscaled by D (like defense).
+    # Pegged relative to defense penalty — 0.65 means healing undoes ~65% of
+    # the penalty for having taken that damage. Creates dodge > heal > tank ordering.
+    heal_coef: float = 0.65
+
 
     # PPO
     lr: float = 3e-4

@@ -35,6 +35,10 @@ class InstanceManager:
             raise FileNotFoundError("Could not find Hollow Knight executable")
 
         self.instances = []
+        # Popen handles for spawned HK processes. Kept so perf monitoring can
+        # read per-process memory (psutil.Process(p.pid).memory_info) without
+        # having to match by executable name each epoch.
+        self._procs = []
 
         # Locate Steam API DLL so we can disable it during multi-instance runs
         self._steam_api = os.path.join(self.root, self.data_dir, "Plugins", "x86_64", "steam_api64.dll")
@@ -110,7 +114,8 @@ class InstanceManager:
                     "-screen-fullscreen", "0",
                     "-nolog",
                 ]
-            subprocess.Popen(cmd)
+            proc = subprocess.Popen(cmd)
+            self._procs.append(proc)
             return True
         except Exception as e:
             print(f"Failed to start instance {name}: {e}")

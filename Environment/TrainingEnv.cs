@@ -17,6 +17,8 @@ namespace FullKnight.Environment
 		private int _timeScaleValue;
 		private int _hitsTakenInStep;
 		private float _damageLandedInStep;
+		private float _hpHealedInStep;
+		private int _knightHpAtStepStart;
 		private int _knightMaxHP;
 
 		// Eval mode: real damage, real death, episode ends on kill
@@ -93,6 +95,7 @@ namespace FullKnight.Environment
 			_evalMode = data.eval ?? false;
 			_hitsTakenInStep = 0;
 			_damageLandedInStep = 0;
+			_hpHealedInStep = 0;
 			_bossDied = false;
 			_episodeDone = false;
 			_episodeResult = null;
@@ -108,6 +111,12 @@ namespace FullKnight.Environment
 
 			// Unpause so scene transition and WaitForSeconds can proceed
 			Time.timeScale = _timeScaleValue;
+
+			// If a natural death transition is still in flight — knight or boss
+			// just died and HK is auto-returning to GG_Workshop — let it settle
+			// before we fire our own scene load. LoadBossScene then sees we're
+			// already in GG_Workshop and skips the bounce.
+			yield return new WaitForFinishedEnteringScene();
 
 			yield return SceneHooks.LoadBossScene(_level);
 
@@ -160,6 +169,7 @@ namespace FullKnight.Environment
 				data.global_state = new float[22];
 				data.damage_landed = 0;
 				data.hits_taken = 0;
+				data.hp_healed = 0;
 				data.step_game_time = 0;
 				data.step_real_time = 0;
 				SendMessage(new Message { type = "step", data = data });
@@ -170,9 +180,8 @@ namespace FullKnight.Environment
 
 			ActionDecoder.ApplyAction(_inputShim, data.action_vec);
 
-			// In training mode, restore knight HP each step for infinite fighting
-			if (!_evalMode)
-				PlayerData.instance.health = _knightMaxHP;
+			// Track HP at step start for heal detection
+			_knightHpAtStepStart = PlayerData.instance.health;
 
 			float gameTimeElapsed = 0f;
 			float realTimeElapsed = 0f;
@@ -181,8 +190,8 @@ namespace FullKnight.Environment
 				yield return null;
 				gameTimeElapsed += Time.deltaTime;
 				realTimeElapsed += Time.unscaledDeltaTime;
-				// In eval mode, break early on death
-				if (_evalMode && (_bossDied || PlayerData.instance.health <= 0))
+				// Break early on death (both modes now have real HP)
+				if (_bossDied || PlayerData.instance.health <= 0)
 					break;
 			}
 
@@ -228,8 +237,8 @@ namespace FullKnight.Environment
 			data.step_game_time = gameTimeElapsed;
 			data.step_real_time = realTimeElapsed;
 
-			// Check for episode end in eval mode
-			if (_evalMode && !_episodeDone)
+			// Check for episode end (both modes now have real HP and death)
+			if (!_episodeDone)
 			{
 				if (_bossDied)
 				{
@@ -243,11 +252,28 @@ namespace FullKnight.Environment
 				}
 			}
 
+			// Compute HP healed this step (positive delta = healing occurred)
+			int hpNow = PlayerData.instance.health;
+			int hpDelta = hpNow - _knightHpAtStepStart;
+			_hpHealedInStep = hpDelta > 0 ? (float)hpDelta : 0f;
+
 			// Record reward signals
 			data.damage_landed = _damageLandedInStep;
 			data.hits_taken = _hitsTakenInStep;
+			data.hp_healed = _hpHealedInStep;
 			_hitsTakenInStep = 0;
 			_damageLandedInStep = 0;
+			_hpHealedInStep = 0;
+
+			// Long-run leak probes. Cheap: cache sizes are integer field reads,
+			// GC.GetTotalMemory(false) is non-blocking (no collection). Populated
+			// even on episode-done steps so epoch averaging stays unbiased.
+			var sizes = _hitboxObserver.GetCacheSizes();
+			data.diag_enemy_count = (ushort)System.Math.Min(sizes.EnemyCount, ushort.MaxValue);
+			data.diag_attack_count = (ushort)System.Math.Min(sizes.AttackCount, ushort.MaxValue);
+			data.diag_terrain_count = (ushort)System.Math.Min(sizes.TerrainCount, ushort.MaxValue);
+			data.diag_kind_cache_size = sizes.KindCacheCount;
+			data.diag_gc_heap_mb = System.GC.GetTotalMemory(false) / (1024f * 1024f);
 
 			if (_episodeDone)
 			{
@@ -452,8 +478,8 @@ namespace FullKnight.Environment
 		private int OnKnightDamaged(int damageType, int damage)
 		{
 			_hitsTakenInStep++;
-			// Eval: let real damage through. Training: minimal damage (HP restored next step)
-			return _evalMode ? damage : 1;
+			// Real damage in both modes now (no HP clamping)
+			return damage;
 		}
 
 		private void OnBossDamaged(On.HealthManager.orig_TakeDamage orig, HealthManager self, HitInstance hitInstance)
@@ -473,32 +499,19 @@ namespace FullKnight.Environment
 			int n = _bossHMs.Count;
 			_damageLandedInStep += hitInstance.DamageDealt / (float)(n * maxHP) * 100f;
 
-			if (!_evalMode)
+			// Real damage in both modes — episode ends when all bosses are dead
+			bool wouldDie = self.hp - hitInstance.DamageDealt <= 0;
+			orig(self, hitInstance);
+			if (wouldDie)
 			{
-				// Training: prevent boss death, restore HP for infinite fighting.
-				if (self.hp - hitInstance.DamageDealt <= 0)
-					self.hp = maxHP;
-				orig(self, hitInstance);
-				self.hp = maxHP;
-			}
-			else
-			{
-				// Eval: let damage through. Episode ends only when every boss in
-				// the set is dead — handles multi-boss arenas where the fight
-				// continues until the last one falls.
-				bool wouldDie = self.hp - hitInstance.DamageDealt <= 0;
-				orig(self, hitInstance);
-				if (wouldDie)
+				bool allDead = true;
+				foreach (var hm in _bossHMs)
 				{
-					bool allDead = true;
-					foreach (var hm in _bossHMs)
-					{
-						if (hm == null) continue;
-						if (hm == self) continue;
-						if (hm.hp > 0) { allDead = false; break; }
-					}
-					if (allDead) _bossDied = true;
+					if (hm == null) continue;
+					if (hm == self) continue;
+					if (hm.hp > 0) { allDead = false; break; }
 				}
+				if (allDead) _bossDied = true;
 			}
 		}
 

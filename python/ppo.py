@@ -89,13 +89,16 @@ class PPO:
         # LR annealing is now step-based and driven from train.py via
         # set_lr(); no torch LR scheduler needed.
 
-    def get_advantages(self, damage_landed, hits_taken, values_atk, values_def, D):
+    def get_advantages(self, damage_landed, hits_taken, hp_healed, values_atk, values_def, D, heal_coef, dones=None):
         """GAE with decomposed value heads and curriculum scaling.
 
         Values are trained on stationary rewards, D scales at advantage time.
         damage_landed is % of boss max HP dealt (1.0 = 1% of boss HP).
         D is % boss HP we deal per hit taken against us.
-        δ_t = δ_attack_t / D - δ_defense_t
+        hp_healed is raw HP restored this step.
+        heal_coef scales hp_healed (unscaled by D, like defense).
+        dones[t] = True means episode ended at step t; bootstrap to 0.
+        δ_t = δ_attack_t / D - δ_defense_t + heal_coef * hp_healed_t
         """
         T = len(damage_landed)
         gamma = self.config.gamma
@@ -109,16 +112,27 @@ class PPO:
         lastgaelam_def = 0
 
         for t in reversed(range(T)):
-            # Stationary TD errors for each head
-            delta_atk = damage_landed[t] + gamma * values_atk[t + 1] - values_atk[t]
-            delta_def = hits_taken[t] + gamma * values_def[t + 1] - values_def[t]
+            # Terminal state: bootstrap to 0
+            if dones is not None and dones[t]:
+                next_vatk = 0
+                next_vdef = 0
+                lastgaelam = 0
+                lastgaelam_atk = 0
+                lastgaelam_def = 0
+            else:
+                next_vatk = values_atk[t + 1]
+                next_vdef = values_def[t + 1]
 
-            # Curriculum-scaled advantage
-            delta = delta_atk / D - delta_def
+            # Stationary TD errors for each head
+            delta_atk = damage_landed[t] + gamma * next_vatk - values_atk[t]
+            delta_def = hits_taken[t] + gamma * next_vdef - values_def[t]
+
+            # Curriculum-scaled advantage with heal reward
+            delta = delta_atk / D - delta_def + heal_coef * hp_healed[t]
             lastgaelam = delta + gamma * lam * lastgaelam
             advantages[t] = lastgaelam
 
-            # Stationary returns for value loss (no D)
+            # Stationary returns for value loss (no D, no heal — value heads track raw signals)
             lastgaelam_atk = delta_atk + gamma * lam * lastgaelam_atk
             atk_returns[t] = lastgaelam_atk + values_atk[t]
             lastgaelam_def = delta_def + gamma * lam * lastgaelam_def
@@ -295,18 +309,20 @@ class PPO:
         return result
 
     def train_on_rollout(self, obs_buf, actions_arr, log_probs_arr,
-                         damage_landed_arr, hits_taken_arr,
-                         values_atk_arr, values_def_arr, D_per_env, buf_hx):
+                         damage_landed_arr, hits_taken_arr, hp_healed_arr,
+                         values_atk_arr, values_def_arr, D_per_env, buf_hx,
+                         dones_arr=None):
         """Train on a collected rollout with chunked truncated BPTT.
 
         obs_buf: list of length T, each element a per-step Observation with
                  leading dim (N, ...). Combined into (T, N, ...) here.
         actions_arr: dict of (T, N) numpy arrays
         log_probs_arr: (T, N)
-        damage_landed_arr, hits_taken_arr: (T, N)
+        damage_landed_arr, hits_taken_arr, hp_healed_arr: (T, N)
         values_atk_arr, values_def_arr: (T+1, N)
         D_per_env: (N,) per-env curriculum scaling factor (one D per boss assignment)
         buf_hx: (T, N, hidden_dim) GRU hidden states at each timestep
+        dones_arr: (T, N) boolean array, True if episode ended at that step
         """
         T, N = damage_landed_arr.shape
         cfg = self.config
@@ -330,11 +346,14 @@ class PPO:
         all_advantages = np.empty((T, N), dtype=np.float32)
         all_atk_returns = np.empty((T, N), dtype=np.float32)
         all_def_returns = np.empty((T, N), dtype=np.float32)
+        heal_coef = cfg.heal_coef
         for env_i in range(N):
+            env_dones = dones_arr[:, env_i] if dones_arr is not None else None
             adv, atk_ret, def_ret = self.get_advantages(
                 damage_landed_arr[:, env_i], hits_taken_arr[:, env_i],
+                hp_healed_arr[:, env_i],
                 values_atk_arr[:, env_i], values_def_arr[:, env_i],
-                float(D_per_env[env_i]),
+                float(D_per_env[env_i]), heal_coef, env_dones,
             )
             all_advantages[:, env_i] = adv
             all_atk_returns[:, env_i] = atk_ret
