@@ -503,10 +503,10 @@ async def train(config: Config):
                             bs["D"] * (1 + D_max_delta_eff),
                         ))
                 elif window_landed == 0 and window_taken > 0:
-                    # Strong signal: policy is taking hits but landing nothing.
-                    # Curriculum is too hard — drop D aggressively (2x clamp rate).
+                    # Policy is taking hits but landing nothing.
+                    # Curriculum is too hard — drop D at the normal clamp rate.
                     bs["D"] = float(max(
-                        bs["D"] * (1 - 2 * D_max_delta_eff),
+                        bs["D"] * (1 - D_max_delta_eff),
                         config.D_min,
                     ))
                 elif window_landed > 0 and window_taken == 0:

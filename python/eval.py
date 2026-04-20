@@ -18,16 +18,17 @@ from vocab import KindVocab
 from observation import Observation, GS, CB
 
 
-async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
+async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
                     level="GG_Mega_Moss_Charger", record=None, hk_path=None,
                     duration=0, no_agent=False, visualize=False):
     config = Config(n_envs=1, level=level)
-    # Scale frames_per_wait to preserve game-time-per-step from training.
-    # Training: time_scale=3, frames_per_wait=5 → 15 frame-equivalents per step.
-    # At eval time_scale=1: need frames_per_wait=15 for same observation spacing.
-    train_game_time = config.time_scale * config.frames_per_wait
-    config.time_scale = time_scale
-    config.frames_per_wait = train_game_time // time_scale
+    # Default to training time_scale so physics/animation/collision behavior
+    # matches exactly what the agent was trained on. Override with --time-scale
+    # if you want real-time viewing (accepts the distribution shift).
+    if time_scale is not None:
+        train_game_time = config.time_scale * config.frames_per_wait
+        config.time_scale = time_scale
+        config.frames_per_wait = train_game_time // time_scale
 
     agent = None
     vocab = KindVocab(max_size=config.kind_vocab_size)
@@ -38,7 +39,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=1,
         agent.load_checkpoint(checkpoint_path, vocab=vocab)
         agent.policy.eval()
         print(f"Loaded checkpoint: {checkpoint_path}")
-    print(f"Level: {level} | Time scale: {time_scale}x | frames_per_wait: {config.frames_per_wait} | Deterministic: {deterministic}")
+    print(f"Level: {level} | Time scale: {config.time_scale}x | frames_per_wait: {config.frames_per_wait} | Deterministic: {deterministic}")
 
     vis = None
     if visualize:
@@ -230,7 +231,7 @@ def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_par
 
 @torch.no_grad()
 def get_action(agent, raw_obs, config, deterministic, hx, vocab):
-    """Get action from the policy using frozen normalizers (no stats update).
+    """Get action from the policy with online normalizer updates (matching training).
     Returns (action_vec, hx_new). raw_obs is the per-env wire tuple."""
     combat_hb_list, terrain_hb_list, gs, combat_kinds, combat_parents = raw_obs
     kind_ids = vocab.encode_list(combat_kinds)
@@ -238,33 +239,21 @@ def get_action(agent, raw_obs, config, deterministic, hx, vocab):
     np_obs = batch_obs(
         combat_hb_list, terrain_hb_list, gs, kind_ids, parent_ids, config)
 
-    # Normalize global state (continuous features only, flags pass through)
+    # Normalize global state (continuous features only, flags pass through).
+    # Update running stats first, matching training's collect_action.
     n_cont = config.global_state_dim - config.n_binary_flags
+    agent.obs_normalizer.update(np_obs.global_state[..., :n_cont])
     gs_norm = np.empty_like(np_obs.global_state)
     gs_norm[..., :n_cont] = agent.obs_normalizer.normalize(np_obs.global_state[..., :n_cont])
     gs_norm[..., n_cont:] = np_obs.global_state[..., n_cont:]
     np_obs = np_obs.replace(global_state=gs_norm)
 
-    # Normalize hitboxes — combat normalizer covers only the leading
-    # combat_normalized_dims (spatial) columns; binary flags pass through raw
-    # and the hp_raw / hp_max_raw columns get log1p compression to keep them
-    # in the same magnitude band as the z-scored features (see
-    # PPO._log_compress_combat_hp).
-    n_norm_c = config.combat_normalized_dims
-    chb = np_obs.combat_hb
-    cm = np_obs.combat_mask
-    for i in range(chb.shape[0]):
-        nc = int(cm[i].sum())
-        if nc > 0:
-            chb[i, :nc, :n_norm_c] = agent.combat_normalizer.normalize(chb[i, :nc, :n_norm_c])
-    PPO._log_compress_combat_hp(chb)
-    n_norm_t = config.terrain_normalized_dims
-    thb = np_obs.terrain_hb
-    tm = np_obs.terrain_mask
-    for i in range(thb.shape[0]):
-        nt = int(tm[i].sum())
-        if nt > 0:
-            thb[i, :nt, :n_norm_t] = agent.terrain_normalizer.normalize(thb[i, :nt, :n_norm_t])
+    # Normalize hitboxes via _normalize_hitboxes (updates running stats then
+    # normalizes), matching training's collect_action exactly.
+    chb_norm = agent._normalize_hitboxes(np_obs.combat_hb, np_obs.combat_mask, agent.combat_normalizer)
+    PPO._log_compress_combat_hp(chb_norm)
+    thb_norm = agent._normalize_hitboxes(np_obs.terrain_hb, np_obs.terrain_mask, agent.terrain_normalizer)
+    np_obs = np_obs.replace(combat_hb=chb_norm, terrain_hb=thb_norm)
 
     device = agent.device
     obs_t = Observation(
@@ -424,8 +413,8 @@ def main():
     parser.add_argument("--no-deterministic", dest="deterministic", action="store_false",
                         help="Use stochastic sampling instead of greedy argmax")
     parser.set_defaults(deterministic=True)
-    parser.add_argument("--time-scale", type=int, default=1,
-                        help="Game speed multiplier (default: 1 for real-time, frames_per_wait auto-scaled)")
+    parser.add_argument("--time-scale", type=int, default=None,
+                        help="Game speed multiplier (default: training time_scale for matched physics; use 1 for real-time viewing)")
     parser.add_argument("--level", default="GG_Mega_Moss_Charger",
                         help="Boss scene name (default: GG_Mega_Moss_Charger)")
     parser.add_argument("--record", metavar="FILE", default="fight.mp4",
