@@ -260,19 +260,6 @@ namespace FullKnight.Environment
 			// Track HP at step start for heal detection
 			_knightHpAtStepStart = PlayerData.instance.health;
 
-			// Force per-frame dt to a fixed value during the agent's frame-skip
-			// loop. captureDeltaTime overrides Time.deltaTime regardless of
-			// real wallclock between frames or Time.timeScale, so any future
-			// per-frame Update() speedup translates to wallclock throughput
-			// rather than changing dt — preserving agent dynamics by
-			// construction. Disabled outside this loop because (a) Unity
-			// ignores timeScale=0 under capture (would break the inter-step
-			// pause) and (b) the intro-skip fast-forward (timeScale=20) needs
-			// real-time. Value is calibrated against the pre-uncap baseline:
-			// baseline rtime_mean=12.9ms − ~0.5ms I/O = ~12.4ms for 5 frames =
-			// ~2.5ms/frame at scaled fps × timeScale=3 → dt ≈ 0.0075s/frame.
-			Time.captureDeltaTime = 0.0075f;
-
 			float frameSkipT0 = Time.realtimeSinceStartup;
 			float gameTimeElapsed = 0f;
 			float realTimeElapsed = 0f;
@@ -287,7 +274,6 @@ namespace FullKnight.Environment
 				if (_bossDied || PlayerData.instance.health <= 0)
 					break;
 			}
-			Time.captureDeltaTime = 0;  // restore real-time so timeScale=0 pauses
 			float frameSkipMs = (Time.realtimeSinceStartup - frameSkipT0) * 1000f;
 
 			// If boss intro is still playing, fast-forward until combat starts
@@ -327,15 +313,11 @@ namespace FullKnight.Environment
 				// Clear any accidental reward signals from intro
 				_hitsTakenInStep = 0;
 				_damageLandedInStep = 0;
-				// Run one normal frame skip at real speed so first obs is clean.
-				// Capture mode here too so the settle window matches a normal
-				// agent step's per-frame game-time.
+				// Run one normal frame skip at real speed so first obs is clean
 				float settleT0 = Time.realtimeSinceStartup;
 				Time.timeScale = _timeScaleValue;
-				Time.captureDeltaTime = 0.0075f;
 				for (int i = 0; i < _frameSkipCount; i++)
 					yield return null;
-				Time.captureDeltaTime = 0;
 				introSettleMs = (Time.realtimeSinceStartup - settleT0) * 1000f;
 			}
 			float introTotalMs = (Time.realtimeSinceStartup - introT0) * 1000f;
