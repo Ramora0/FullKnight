@@ -111,15 +111,28 @@ class InstanceManager:
             if graphical:
                 cmd = [self._instance_exe(name)]
             else:
+                # `-nographics` forces graphicsDeviceType=Null and skips the
+                # render thread entirely, on top of `-batchmode`'s windowless
+                # mode. A/B/C measurement on Moss Charger (autoresearch/sim
+                # results.tsv, sim/may8 branch) showed this combo wins on every
+                # metric vs `-batchmode` alone: +11.7% throughput, −15% RAM
+                # initial, identical CPU sat / rtime / GC heap, and quality CIs
+                # that overlap (and overlap graphical too). Set FK_KEEP_GFX=1
+                # to fall back to bare `-batchmode` if a future scene exercises
+                # an HK FSM that touches RenderTextures and breaks under null
+                # device.
                 cmd = [
                     self._instance_exe(name),
                     "-batchmode",
+                    "-nographics",
                     "-screen-width", "64",
                     "-screen-height", "64",
                     "-screen-quality", "0",
                     "-screen-fullscreen", "0",
                     "-nolog",
                 ]
+                if os.environ.get("FK_KEEP_GFX"):
+                    cmd.remove("-nographics")
             proc = subprocess.Popen(cmd)
             self._procs.append(proc)
             return True
