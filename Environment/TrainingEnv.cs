@@ -569,17 +569,12 @@ namespace FullKnight.Environment
 				yield break;
 			}
 
-			// Fixed-timestep + uncapped frame loop. captureFramerate=60 forces
-			// Time.deltaTime = 1/60 every frame regardless of wallclock between
-			// frames; Time.timeScale=3 (set later from MessageData) then makes
-			// per-frame game-time exactly 1/60 × 3 = 0.05s, identical to the old
-			// 60fps-capped behavior every checkpoint was trained on. Per-frame
-			// physics substep count, animation increment, and coroutine progress
-			// all match the old baseline byte-for-byte. The only thing that
-			// changes: how fast Update() ticks in wallclock — vSync=0 +
-			// targetFrameRate=-1 lets the loop run as fast as CPU permits, so
-			// env-steps/sec scales with CPU rather than display refresh.
-			Time.captureFramerate = 60;
+			// Uncap Unity's frame loop. With -nographics there's no display to
+			// vsync against; the only thing throttling Update() is targetFrameRate
+			// (default 60 on Windows). cpu_machine_sat=28% on the merged-baseline
+			// run says we're not CPU-bound — we're frame-rate-bound. Setting
+			// vSyncCount=0 + targetFrameRate=-1 lets Unity tick the main loop as
+			// fast as the CPU can carry it, which directly raises env-steps/sec.
 			QualitySettings.vSyncCount = 0;
 			Application.targetFrameRate = -1;
 
