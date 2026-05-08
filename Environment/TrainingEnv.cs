@@ -260,20 +260,6 @@ namespace FullKnight.Environment
 			// Track HP at step start for heal detection
 			_knightHpAtStepStart = PlayerData.instance.health;
 
-			// Decouple per-frame game-time from wallclock FPS. captureDeltaTime
-			// forces Time.deltaTime = constant every frame, ignoring real elapsed
-			// time. With dt = 1/60 × _timeScaleValue (game-time per frame matches
-			// the pre-uncap 60fps-capped baseline byte-for-byte), the agent's
-			// per-step game-time stays at frames_per_wait × 0.05s = 0.25s
-			// regardless of how fast Update() ticks. Future per-frame Update
-			// optimizations now translate to wallclock speedups instead of
-			// changing dt, so behavior is preserved by construction.
-			//
-			// Capture mode is OFF outside this loop because (a) it ignores
-			// timeScale=0 — would break the pause between agent steps — and (b)
-			// the intro-skip fast-forward (timeScale=20) needs real-time.
-			Time.captureDeltaTime = (1f / 60f) * _timeScaleValue;
-
 			float frameSkipT0 = Time.realtimeSinceStartup;
 			float gameTimeElapsed = 0f;
 			float realTimeElapsed = 0f;
@@ -288,7 +274,6 @@ namespace FullKnight.Environment
 				if (_bossDied || PlayerData.instance.health <= 0)
 					break;
 			}
-			Time.captureDeltaTime = 0;  // restore real-time
 			float frameSkipMs = (Time.realtimeSinceStartup - frameSkipT0) * 1000f;
 
 			// If boss intro is still playing, fast-forward until combat starts
@@ -328,15 +313,11 @@ namespace FullKnight.Environment
 				// Clear any accidental reward signals from intro
 				_hitsTakenInStep = 0;
 				_damageLandedInStep = 0;
-				// Run one normal frame skip at real speed so first obs is clean.
-				// Capture mode here too so the settle window's per-frame game-time
-				// matches the agent's normal step (consistent obs settling).
+				// Run one normal frame skip at real speed so first obs is clean
 				float settleT0 = Time.realtimeSinceStartup;
 				Time.timeScale = _timeScaleValue;
-				Time.captureDeltaTime = (1f / 60f) * _timeScaleValue;
 				for (int i = 0; i < _frameSkipCount; i++)
 					yield return null;
-				Time.captureDeltaTime = 0;
 				introSettleMs = (Time.realtimeSinceStartup - settleT0) * 1000f;
 			}
 			float introTotalMs = (Time.realtimeSinceStartup - introT0) * 1000f;
