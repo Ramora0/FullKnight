@@ -569,6 +569,15 @@ namespace FullKnight.Environment
 				yield break;
 			}
 
+			// Uncap Unity's frame loop. With -nographics there's no display to
+			// vsync against; the only thing throttling Update() is targetFrameRate
+			// (default 60 on Windows). cpu_machine_sat=28% on the merged-baseline
+			// run says we're not CPU-bound — we're frame-rate-bound. Setting
+			// vSyncCount=0 + targetFrameRate=-1 lets Unity tick the main loop as
+			// fast as the CPU can carry it, which directly raises env-steps/sec.
+			QualitySettings.vSyncCount = 0;
+			Application.targetFrameRate = -1;
+
 			On.GameManager.SaveGame += SaveFileProxy.DisableSaveGame;
 			SaveFileProxy.LoadCompletedSave();
 			GameManager.instance.ContinueGame();
