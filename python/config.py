@@ -19,16 +19,7 @@ class Config:
     level: str = "GG_Mega_Moss_Charger"  # used by eval
     boss_levels: str = "GG_False_Knight,GG_Mega_Moss_Charger,GG_Gruz_Mother,GG_Hornet_1"  # comma-separated pool for training
     frames_per_wait: int = 5
-    # 9 (not 3) compensates for the uncapped Unity frame loop in the C#
-    # mod (commit e094f23). Capped FPS at timeScale=3 gave per-frame
-    # dt ≈ 0.008s game time; uncap raised loop speed ~3× so per-frame dt
-    # dropped to ~0.0025s, breaking the per-step game-time the agent was
-    # trained on. timeScale=9 restores per-frame dt to ~0.0075s and
-    # per-step game-time to ~0.04s, matching the pre-uncap baseline.
-    # Pause still works (timeScale=0 zeroes deltaTime regardless of capture
-    # mode), unlike Time.captureFramerate which fixes deltaTime even when
-    # paused (commit ae23d10 / reverted in c0a5634).
-    time_scale: int = 9
+    time_scale: int = 3
     # Staggered reset cadence: every `steps_per_reset` accumulated env-steps,
     # schedule a reset for max(1, n_envs // envs_per_reset_div) envs. Resets
     # run as background asyncio tasks overlapping the next rollout; scheduled
