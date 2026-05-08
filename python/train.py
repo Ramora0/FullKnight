@@ -70,6 +70,59 @@ def seed_everything(seed: int):
         torch.backends.cudnn.benchmark = False
 
 
+async def hard_restart_all(vec_env, mgr, env_boss, agent, graphical=False):
+    """Synchronously kill and relaunch every HK instance, then reset to bosses.
+
+    Patches multi-hour env-state drift that the policy starts exploiting.
+    Pauses training for the duration (~30s typical). Returns the new full
+    Observation. Caller is responsible for resetting active_envs to all slots
+    and discarding any pending staggered-reset bookkeeping (those tasks are
+    cancelled here because their websockets are dying anyway)."""
+    n = vec_env.n_envs
+    print(f"  hard-restart | killing all {n} HK instances...")
+
+    # Cancel pending background level-reset tasks — their websockets are
+    # about to be torn down, awaiting them would deadlock.
+    for task in list(vec_env._reset_tasks.values()):
+        task.cancel()
+    vec_env._reset_tasks.clear()
+
+    # Best-effort close server-side websockets so HK exits cleanly first.
+    for ws in list(vec_env._ws_connections):
+        if ws is not None:
+            try:
+                await asyncio.wait_for(ws.close(), timeout=1.0)
+            except Exception:
+                pass
+
+    # Kill the OS processes (psutil terminate + 10s wait per instance).
+    mgr.stop_all()
+
+    # Reset vec_env's per-slot state — _on_connect fills these as instances
+    # reconnect. Slot identity may permute (first-to-connect wins each slot),
+    # which is fine because env_boss is reassigned via reset_all below.
+    vec_env._ws_connections = [None] * n
+    vec_env.envs = [None] * n
+    for ev in vec_env.connected:
+        ev.clear()
+
+    # Relaunch processes; _disable_steam_api is idempotent (no-op second time).
+    print(f"  hard-restart | relaunching {n} HK instances...")
+    mgr.start_all(graphical=graphical)
+
+    # Wait for all to reconnect via the existing _on_connect handler.
+    await asyncio.gather(*[ev.wait() for ev in vec_env.connected])
+    print(f"  hard-restart | all {n} reconnected; resetting to bosses...")
+
+    # Drive every env to its assigned boss scene; returns batched Observation.
+    obs = await vec_env.reset_all(levels=env_boss)
+
+    # Zero hidden state across all envs — fresh-launch is an episode boundary.
+    agent.reset_hidden(n)
+    print(f"  hard-restart | done.")
+    return obs
+
+
 async def train(config: Config):
     if config.seed:
         seed_everything(config.seed)
@@ -744,6 +797,17 @@ async def train(config: Config):
                 )
                 print(f"  Saved checkpoint: {path}")
                 last_save_step = env_steps_collected
+
+            # Synchronous hard restart of every HK instance every N epochs.
+            # Discards the staggered-reset bookkeeping above (those processes
+            # are about to die) and reactivates all slots after relaunch.
+            if (config.hard_restart_every_epochs > 0
+                    and (epoch + 1) % config.hard_restart_every_epochs == 0):
+                obs_full = await hard_restart_all(
+                    vec_env, mgr, env_boss, agent,
+                    graphical=(config.n_envs == 1),
+                )
+                active_envs = list(range(config.n_envs))
 
         # Print summary (used by autoresearch pipeline)
         if recent:
