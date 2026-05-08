@@ -44,6 +44,14 @@ class Config:
     combat_normalized_dims: int = 4  # first N combat columns get z-scored; binary flags pass raw; hp cols get log1p
     terrain_feature_dim: int = 8 # [mx, my, hdx, hdy, npx, npy, dist, is_trigger]
     terrain_normalized_dims: int = 7  # is_trigger passes through raw
+    # Terrain visibility gate — knight-relative axis-aligned box (world units)
+    # roughly approximating the HK camera frame. Segments whose nearest point
+    # falls outside the box are dropped before reaching the model. Trims
+    # ~600 → ~30 tokens per step in typical boss arenas: speeds up the
+    # terrain encoder and regularizes the input set to "what's nearby and
+    # on-screen". Set either to 0 to disable.
+    view_w: float = 30.0
+    view_h: float = 17.0
     global_state_dim: int = 22   # vel(2), hp, soul, knight_bounds(2), 7 ability flags, 9 validity flags
     n_binary_flags: int = 16     # 7 ability unlock + 9 action validity (not normalized)
 

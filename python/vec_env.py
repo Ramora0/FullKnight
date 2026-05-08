@@ -5,7 +5,7 @@ import websockets
 
 from env import HKEnv
 from vocab import KindVocab
-from observation import Observation
+from observation import Observation, filter_terrain_in_view
 
 
 class VecEnv:
@@ -62,12 +62,19 @@ class VecEnv:
             self.connected[idx].clear()
 
     async def _timed_op(self, label, idx, coro, loud=False):
-        """Wrap a coroutine with per-env timing. Prints immediately on completion."""
+        """Wrap a coroutine with per-env timing. Prints immediately on completion.
+
+        For loud ops (resets), also prints a "starting" line with a wall-clock
+        timestamp so a long reset can be correlated against C#-side phase logs.
+        """
+        boss = self.env_levels[idx] if idx < len(self.env_levels) else "?"
         t0 = time.perf_counter()
+        if loud:
+            ts = time.strftime("%H:%M:%S", time.localtime())
+            print(f"  {label} env {idx} ({boss}): starting at {ts}", flush=True)
         result = await coro
         dt = time.perf_counter() - t0
         if loud or dt > 2.0:
-            boss = self.env_levels[idx] if idx < len(self.env_levels) else "?"
             print(f"  {label} env {idx} ({boss}): done in {dt:.1f}s", flush=True)
         return idx, dt, result
 
@@ -233,7 +240,12 @@ class VecEnv:
         combat_kind_ids/parent_ids: int32 (B, max_combat); padding rows are 0 ("unknown").
         """
         combat_lists = [obs[0] for obs in obs_list]
-        terrain_lists = [obs[1] for obs in obs_list]
+        # View-box gate: drop offscreen terrain at observation construction time
+        # so train/eval/visualizer all see the same filtered set.
+        terrain_lists = [
+            filter_terrain_in_view(obs[1], self.config.view_w, self.config.view_h)
+            for obs in obs_list
+        ]
         gs_list = [obs[2] for obs in obs_list]
         kind_lists = [obs[3] if len(obs) > 3 else [] for obs in obs_list]
         parent_lists = [obs[4] if len(obs) > 4 else [] for obs in obs_list]

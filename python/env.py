@@ -1,9 +1,16 @@
+import time
 import numpy as np
 from binary_protocol import (
     pack_init, pack_reset, pack_action, pack_pause, pack_resume,
     unpack_reset, unpack_step, pop_last_terrain_debug, pop_last_diag, MSG_CLOSE,
 )
 import struct
+
+# Threshold (seconds) above which a step's send/recv breakdown is printed.
+# Send is normally <1ms; recv is dominated by the C# coroutine. If a slow step
+# shows large send time, IPC is the issue; if recv dominates, look at the
+# C# [Step-Timing] / [Phase-Timing] logs from the same epoch.
+_SLOW_OP_THRESHOLD_S = 2.0
 
 
 class HKEnv:
@@ -34,12 +41,19 @@ class HKEnv:
     async def reset(self, eval_mode=False, level=None):
         """Reset environment.
         Returns (combat_hb, terrain_hb, global_state, combat_kinds, combat_parents)."""
+        t0 = time.perf_counter()
         await self.ws.send(pack_reset(
             level if level is not None else self.config.level,
             self.config.frames_per_wait,
             self.config.time_scale, eval_mode=eval_mode,
         ))
+        t1 = time.perf_counter()
         data = await self.ws.recv()
+        t2 = time.perf_counter()
+        if (t2 - t0) > _SLOW_OP_THRESHOLD_S:
+            print(f"    [reset-wire] level={level} send={(t1-t0)*1000:.0f}ms"
+                  f" recv={(t2-t1)*1000:.0f}ms total={(t2-t0)*1000:.0f}ms",
+                  flush=True)
         result = unpack_reset(data)
         self.last_terrain_debug = pop_last_terrain_debug()
         return result
@@ -50,8 +64,15 @@ class HKEnv:
                  damage_landed, hits_taken, hp_healed, step_game_time, step_real_time, done,
                  committed).
         """
+        t0 = time.perf_counter()
         await self.ws.send(pack_action(action_vec))
+        t1 = time.perf_counter()
         data = await self.ws.recv()
+        t2 = time.perf_counter()
+        if (t2 - t0) > _SLOW_OP_THRESHOLD_S:
+            print(f"    [step-wire] action={action_vec} send={(t1-t0)*1000:.0f}ms"
+                  f" recv={(t2-t1)*1000:.0f}ms total={(t2-t0)*1000:.0f}ms",
+                  flush=True)
         (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
          damage_landed, hits_taken, hp_healed, game_time, real_time, done,
          committed) = unpack_step(data)

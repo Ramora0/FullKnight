@@ -44,6 +44,12 @@ class InstanceManager:
         self._steam_api = os.path.join(self.root, self.data_dir, "Plugins", "x86_64", "steam_api64.dll")
         self._steam_api_bak = self._steam_api + ".bak"
 
+        # Always reap spawned HK procs on interpreter exit. atexit fires on
+        # normal return, sys.exit, and unhandled KeyboardInterrupt — covers
+        # the case where ^C lands outside a try/finally (e.g. while waiting
+        # for the websocket connection before the eval loop's try block).
+        atexit.register(self.stop_all)
+
     def _instance_exe(self, name):
         exe_basename = os.path.basename(self.exe)
         return os.path.join(self.root, exe_basename.replace(os.path.splitext(exe_basename)[0], name))
@@ -154,6 +160,24 @@ class InstanceManager:
             self.start_instance(name, graphical=graphical)
 
     def stop_all(self):
+        # Kill via Popen handles first — authoritative and avoids the slow
+        # psutil scan. Then fall back to the name-matching path to catch
+        # orphans we don't hold a handle for.
+        for proc in self._procs:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        for proc in self._procs:
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._procs.clear()
         for name in reversed(self.instances):
             self.stop_instance(name)
         self._restore_steam_api()

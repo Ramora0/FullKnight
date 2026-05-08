@@ -4,6 +4,7 @@ using System.Text;
 using FullKnight.Net;
 using FullKnight.Game;
 using HutongGames.PlayMaker;
+using HutongGames.PlayMaker.Actions;
 using InControl;
 using Modding;
 using UnityEngine;
@@ -46,6 +47,15 @@ namespace FullKnight.Environment
 
 		// Diagnostics: count resets so logs are correlatable across episodes
 		private int _resetCount;
+		// Diagnostics: count steps within an episode for slow-step correlation
+		private int _stepCount;
+		// Phase-timing scratch state. Stopwatch-style (Time.realtimeSinceStartup is
+		// wall time, unaffected by Time.timeScale) so we can attribute wall-time
+		// stalls to a specific sub-phase of Reset/Step. _phaseStart marks the
+		// beginning of the current operation; _phaseLast marks the most recent
+		// LogPhase call so each line shows both delta and total.
+		private float _phaseStart;
+		private float _phaseLast;
 
 		private HitboxObserver _hitboxObserver = new();
 		private InputDeviceShim _inputShim = new();
@@ -93,6 +103,7 @@ namespace FullKnight.Environment
 
 		private IEnumerator Reset(MessageData data)
 		{
+			PhaseBegin();
 			_level = data.level ?? _level;
 			_frameSkipCount = data.frames_per_wait ?? _frameSkipCount;
 			_timeScaleValue = data.time_scale ?? _timeScaleValue;
@@ -100,6 +111,7 @@ namespace FullKnight.Environment
 			_hitsTakenInStep = 0;
 			_damageLandedInStep = 0;
 			_hpHealedInStep = 0;
+			_stepCount = 0;
 			// Capture episode-end flags before clearing — the suicide-vs-wait
 			// branch below depends on whether this reset follows a natural end
 			// (boss death = win, knight death = loss) or a mid-fight cut. Note:
@@ -114,6 +126,7 @@ namespace FullKnight.Environment
 			_resetCount++;
 
 			LogBossDiag($"reset#{_resetCount} PRE-UNLOAD (still in old scene)");
+			LogPhase("Reset", "PRE-UNLOAD");
 
 			// Release any inputs held over from the previous episode before the
 			// scene transition unfreezes time — otherwise a stuck "left" or "jump"
@@ -148,6 +161,7 @@ namespace FullKnight.Environment
 			{
 				// Cleanup already landed; nothing to wait for.
 				LogBossDiag($"reset#{_resetCount} ALREADY-IN-WORKSHOP");
+				LogPhase("Reset", "ALREADY-IN-WORKSHOP");
 			}
 			else if (naturalEnd)
 			{
@@ -155,20 +169,24 @@ namespace FullKnight.Environment
 				yield return WaitForSceneChange(preScene);
 				var afterScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
 				LogBossDiag($"reset#{_resetCount} NATURAL-END DONE (now in {afterScene})");
+				LogPhase("Reset", $"NATURAL-END (pre={preScene} post={afterScene})");
 			}
 			else
 			{
 				LogBossDiag($"reset#{_resetCount} PRE-SUICIDE (alive in {preScene})");
 				yield return KillKnight();
 				LogBossDiag($"reset#{_resetCount} POST-SUICIDE");
+				LogPhase("Reset", $"SUICIDE (pre={preScene})");
 			}
 
 			// Let any in-flight transition (the one that just left the arena, or
 			// any post-load scene wiring) settle before LoadBossScene kicks off
 			// our own. LoadBossScene then bounces through GG_Workshop if needed.
 			yield return new WaitForFinishedEnteringScene();
+			LogPhase("Reset", "WaitForFinishedEnteringScene (settle)");
 
 			yield return SceneHooks.LoadBossScene(_level);
+			LogPhase("Reset", "LoadBossScene");
 
 			LogBossDiag($"reset#{_resetCount} POST-SCENELOAD (before reader recreate)");
 
@@ -177,9 +195,11 @@ namespace FullKnight.Environment
 			// we explicitly rebuild the reader here and yield a frame for Start() to scan.
 			_hitboxObserver.RecreateReader();
 			yield return null;
+			LogPhase("Reset", "RecreateReader+frame");
 
 			InitBossRefs();
 			LogBossDiag($"reset#{_resetCount} POST-INITBOSSREFS");
+			LogPhase("Reset", "InitBossRefs");
 			// One-line pass/fail signal for the same-scene-reload bug. Grep for
 			// "[BounceCheck]" to audit every reset at a glance.
 			bool bossAwake = HasActiveCombatHitboxes();
@@ -203,12 +223,17 @@ namespace FullKnight.Environment
 			data.global_state = gs;
 
 			Time.timeScale = 0;
+			LogPhase("Reset", "obs+freeze (final)");
+			float resetTotalMs = (Time.realtimeSinceStartup - _phaseStart) * 1000f;
+			Log($"[Reset-Timing] reset#{_resetCount} TOTAL {resetTotalMs:F0}ms level={_level}");
 			SendMessage(new Message { type = "reset", data = data });
 			yield break;
 		}
 
 		private IEnumerator Step(MessageData data)
 		{
+			PhaseBegin();
+			_stepCount++;
 			// If episode already ended, keep returning done
 			if (_episodeDone)
 			{
@@ -235,24 +260,32 @@ namespace FullKnight.Environment
 			// Track HP at step start for heal detection
 			_knightHpAtStepStart = PlayerData.instance.health;
 
+			float frameSkipT0 = Time.realtimeSinceStartup;
 			float gameTimeElapsed = 0f;
 			float realTimeElapsed = 0f;
+			int frameSkipFrames = 0;
 			for (int i = 0; i < _frameSkipCount; i++)
 			{
 				yield return null;
+				frameSkipFrames++;
 				gameTimeElapsed += Time.deltaTime;
 				realTimeElapsed += Time.unscaledDeltaTime;
 				// Break early on death (both modes now have real HP)
 				if (_bossDied || PlayerData.instance.health <= 0)
 					break;
 			}
+			float frameSkipMs = (Time.realtimeSinceStartup - frameSkipT0) * 1000f;
 
 			// If boss intro is still playing, fast-forward until combat starts
+			float introT0 = Time.realtimeSinceStartup;
+			int introFrames = 0;
+			bool introSkipRan = !_combatStarted;
+			bool introSkipTimedOut = false;
+			float introSettleMs = 0f;
 			if (!_combatStarted)
 			{
 				LogBossDiag($"reset#{_resetCount} INTRO-SKIP START");
 				Time.timeScale = 20f;
-				int introFrames = 0;
 				while (!HasActiveCombatHitboxes())
 				{
 					introFrames++;
@@ -270,6 +303,7 @@ namespace FullKnight.Environment
 							+ $"enemy={hb[HitboxType.Enemy].Count} terrain={hb[HitboxType.Terrain].Count} "
 							+ $"scene={UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}");
 						LogBossDiag($"reset#{_resetCount} INTRO-SKIP TIMEOUT");
+						introSkipTimedOut = true;
 						break;
 					}
 					yield return null;
@@ -280,10 +314,13 @@ namespace FullKnight.Environment
 				_hitsTakenInStep = 0;
 				_damageLandedInStep = 0;
 				// Run one normal frame skip at real speed so first obs is clean
+				float settleT0 = Time.realtimeSinceStartup;
 				Time.timeScale = _timeScaleValue;
 				for (int i = 0; i < _frameSkipCount; i++)
 					yield return null;
+				introSettleMs = (Time.realtimeSinceStartup - settleT0) * 1000f;
 			}
+			float introTotalMs = (Time.realtimeSinceStartup - introT0) * 1000f;
 
 			Time.timeScale = 0;
 			data.step_game_time = gameTimeElapsed;
@@ -327,6 +364,25 @@ namespace FullKnight.Environment
 			data.diag_kind_cache_size = sizes.KindCacheCount;
 			data.diag_gc_heap_mb = System.GC.GetTotalMemory(false) / (1024f * 1024f);
 
+			// Slow-step diagnostic. Wall time is dominated by the frame-skip and
+			// intro-skip loops; obs build / hooks / GC probes are <1ms. Always
+			// log the first step after a reset (intro-skip lives there) and any
+			// step over 1s wall. Emitted before the done-branch so dying-during-
+			// intro-skip steps get attributed too.
+			float stepWallMs = (Time.realtimeSinceStartup - _phaseStart) * 1000f;
+			if (stepWallMs > 1000f || introSkipRan)
+			{
+				Log($"[Step-Timing] reset#{_resetCount} step#{_stepCount} "
+					+ $"total={stepWallMs:F0}ms frameSkip={frameSkipMs:F0}ms"
+					+ $"({frameSkipFrames}f) "
+					+ $"introSkip={(introSkipRan ? introTotalMs : 0):F0}ms"
+					+ $"({introFrames}f, settle={introSettleMs:F0}ms"
+					+ (introSkipTimedOut ? ", TIMEOUT" : "")
+					+ $") gameTime={gameTimeElapsed * 1000:F0}ms "
+					+ $"realTime={realTimeElapsed * 1000:F0}ms "
+					+ $"timeScale={_timeScaleValue} done={_episodeDone}");
+			}
+
 			if (_episodeDone)
 			{
 				data.done = true;
@@ -355,6 +411,26 @@ namespace FullKnight.Environment
 		}
 
 		private void Log(string msg) => FullKnight.Instance.Log($"[TrainingEnv] {msg}");
+
+		// Phase timing helpers. PhaseBegin() resets the stopwatch at the start of
+		// Reset() / Step(); LogPhase() emits a "[Phase-Timing]" line with the
+		// delta since the last call and the cumulative total. Wall-clock based
+		// (Time.realtimeSinceStartup) so Time.timeScale gymnastics during reset
+		// don't confuse the readings.
+		private void PhaseBegin()
+		{
+			_phaseStart = Time.realtimeSinceStartup;
+			_phaseLast = _phaseStart;
+		}
+
+		private void LogPhase(string scope, string label)
+		{
+			float now = Time.realtimeSinceStartup;
+			float deltaMs = (now - _phaseLast) * 1000f;
+			float totalMs = (now - _phaseStart) * 1000f;
+			_phaseLast = now;
+			Log($"[Phase-Timing] {scope}#{_resetCount} {label}: +{deltaMs:F0}ms (total {totalMs:F0}ms)");
+		}
 
 		/// <summary>
 		/// Dump every piece of state useful for diagnosing boss-reset bugs:

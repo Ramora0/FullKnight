@@ -6,21 +6,26 @@ import os
 import platform
 import subprocess
 import sys
+import time as _time
 import numpy as np
 import torch
 import websockets
+from tqdm import tqdm
 
 from config import Config
 from ppo import PPO
 from instance_manager import InstanceManager
 from env import HKEnv
+from vec_env import VecEnv
 from vocab import KindVocab
-from observation import Observation, GS, CB
+from observation import Observation, filter_terrain_in_view
+from train import merge_obs_padded
 
 
 async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
                     level="GG_Mega_Moss_Charger", record=None, hk_path=None,
-                    duration=0, no_agent=False, visualize=False):
+                    duration=0, no_agent=False, visualize=False,
+                    terrain_max_dist=None, view_w=None, view_h=None):
     config = Config(n_envs=1, level=level)
     # Default to training time_scale so physics/animation/collision behavior
     # matches exactly what the agent was trained on. Override with --time-scale
@@ -29,6 +34,10 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
         train_game_time = config.time_scale * config.frames_per_wait
         config.time_scale = time_scale
         config.frames_per_wait = train_game_time // time_scale
+    if view_w is not None:
+        config.view_w = view_w
+    if view_h is not None:
+        config.view_h = view_h
 
     agent = None
     vocab = KindVocab(max_size=config.kind_vocab_size)
@@ -44,7 +53,17 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
     vis = None
     if visualize:
         from visualizer import Visualizer
-        vis = Visualizer(vocab=vocab)
+        # Pass config view-box to the visualizer so the outline matches the
+        # active data-path gate. With the gate on, terrain handed to the
+        # visualizer is already filtered, so the dim-ghost branch is a no-op
+        # — kept only so disabling the gate (view_w=0) restores the preview.
+        vis_w = config.view_w if config.view_w > 0 else None
+        vis_h = config.view_h if config.view_h > 0 else None
+        vis = Visualizer(
+            vocab=vocab,
+            terrain_max_dist=terrain_max_dist,
+            view_w=vis_w, view_h=vis_h,
+        )
 
     # Launch game instance with full graphics
     mgr = None
@@ -81,12 +100,6 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
     # no-agent viewer mode we stay in the infinite-fight training distribution
     # so nothing dies while you poke around.
     raw_obs = await env.reset(eval_mode=not no_agent)
-    # Capture max knight HP from first obs (right after reset = full health).
-    # Boss HP is now per-hitbox (hp_raw column); we record the per-target max
-    # on first sight so we can spoof targets back to full each step (matching the
-    # infinite-fight training distribution where boss HP is restored every frame).
-    max_knight_hp = raw_obs[2][GS.HP]
-    target_max_hp = {}          # kind string -> max hp_raw seen
     hx = np.zeros((1, config.gru_dim), dtype=np.float32)
 
     # Start screen recording
@@ -111,19 +124,6 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
             if no_agent:
                 action_vec = [2, 2, 7, 1]  # idle: no move/dir/action/jump
             else:
-                # Spoof knight HP so agent sees max like during training.
-                raw_obs[2][GS.HP] = max_knight_hp
-                # Spoof every is_target hitbox's hp_raw back to its observed max.
-                combat_hb_now = raw_obs[0]
-                combat_kinds_now = raw_obs[3]
-                for hb_i in range(len(combat_hb_now)):
-                    row = combat_hb_now[hb_i]
-                    if row[CB.IS_TARGET] > 0.5:
-                        key = combat_kinds_now[hb_i] if hb_i < len(combat_kinds_now) else ""
-                        cur = float(row[CB.HP_RAW])
-                        if cur > target_max_hp.get(key, 0.0):
-                            target_max_hp[key] = cur
-                        row[CB.HP_RAW] = target_max_hp.get(key, cur)
                 action_vec, hx = get_action(agent, raw_obs, config, deterministic, hx, vocab)
 
             if vis is not None:
@@ -197,8 +197,369 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
         await server.wait_closed()
 
 
+def _bootstrap_ci_mean(data, B=4000, alpha=0.05, seed=0):
+    """Percentile-bootstrap 95% CI on the mean. Returns (mean, lo, hi).
+    Returns NaN bounds if <2 samples."""
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.size < 2:
+        m = float(arr.mean()) if arr.size else float("nan")
+        return m, float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, arr.size, size=(B, arr.size))
+    boot_means = arr[idx].mean(axis=1)
+    lo, hi = np.percentile(boot_means, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(arr.mean()), float(lo), float(hi)
+
+
+def _bootstrap_diff_ci(data_a, data_b, B=4000, alpha=0.05, seed=0):
+    """Percentile-bootstrap CI on (mean(b) - mean(a)). Returns (diff, lo, hi).
+    Convention: positive diff means B is larger than A."""
+    a = np.asarray(data_a, dtype=np.float64)
+    b = np.asarray(data_b, dtype=np.float64)
+    if a.size < 2 or b.size < 2:
+        return float("nan"), float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    ai = rng.integers(0, a.size, size=(B, a.size))
+    bi = rng.integers(0, b.size, size=(B, b.size))
+    diffs = b[bi].mean(axis=1) - a[ai].mean(axis=1)
+    lo, hi = np.percentile(diffs, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(b.mean() - a.mean()), float(lo), float(hi)
+
+
+def _print_run_summary(label, results):
+    """Print a single run's metrics with bootstrap CIs over completed episodes."""
+    n_envs = results["n_envs"]
+    steps_done = results["steps_done"]
+    total_env_steps = steps_done * n_envs
+    ep_dmg = results["ep_dmg"]
+    ep_hits = results["ep_hits"]
+    ep_steps = results["ep_steps"]
+
+    # Per-step rates within episodes — one sample per completed episode. This
+    # is the unit we bootstrap over (more independent than per-step samples).
+    ep_dmg_per_step = [d / s for d, s in zip(ep_dmg, ep_steps) if s > 0]
+    ep_hits_per_step = [h / s for h, s in zip(ep_hits, ep_steps) if s > 0]
+
+    dmg_mean, dmg_lo, dmg_hi = _bootstrap_ci_mean(ep_dmg)
+    hit_mean, hit_lo, hit_hi = _bootstrap_ci_mean(ep_hits)
+    dps_mean, dps_lo, dps_hi = _bootstrap_ci_mean(ep_dmg_per_step)
+    hps_mean, hps_lo, hps_hi = _bootstrap_ci_mean(ep_hits_per_step)
+
+    print()
+    print(f"{'=' * 70}")
+    print(f"  {label}")
+    print(f"{'-' * 70}")
+    print(f"  n_envs={n_envs}  steps/env={steps_done}  total={total_env_steps}  "
+          f"wall={results['wall']:.1f}s  episodes={len(ep_dmg)}")
+    print(f"  per-env damage:   {[round(float(x), 1) for x in results['total_damage']]}")
+    print(f"  per-env hits:     {results['total_hits'].tolist()}")
+    print(f"  mean dmg/step (over all env-steps): "
+          f"{results['total_damage'].sum() / max(total_env_steps, 1):.5f}")
+    print(f"  mean hits/step (over all env-steps): "
+          f"{results['total_hits'].sum() / max(total_env_steps, 1):.5f}")
+    total_d = float(results['total_damage'].sum())
+    total_h = int(results['total_hits'].sum())
+    D_ratio = total_d / max(total_h, 1)
+    print(f"  D = damage_landed / hits_taken (matches training curriculum): "
+          f"{D_ratio:.2f}  (landed={total_d:.1f}  taken={total_h})")
+    # Step-timing stats. Mismatch between training and eval here = different
+    # effective decision rate for the same model — see distribution-shift
+    # diagnostic. Training reference at the saved checkpoint can be inferred
+    # from saved boss_state windows; print numbers here for direct compare.
+    g = np.asarray(results.get('gtime_samples', []), dtype=np.float64)
+    r = np.asarray(results.get('rtime_samples', []), dtype=np.float64)
+    if g.size:
+        print(f"  step game_time (s):  mean={g.mean():.4f}  "
+              f"p50={np.percentile(g, 50):.4f}  "
+              f"p95={np.percentile(g, 95):.4f}  "
+              f"p99={np.percentile(g, 99):.4f}")
+    if r.size:
+        print(f"  step real_time (s):  mean={r.mean():.4f}  "
+              f"p50={np.percentile(r, 50):.4f}  "
+              f"p95={np.percentile(r, 95):.4f}  "
+              f"p99={np.percentile(r, 99):.4f}")
+    if g.size and r.size:
+        ratio = g.sum() / max(r.sum(), 1e-9)
+        print(f"  effective time_scale (game_time/real_time): {ratio:.3f}  "
+              f"(configured: {3})")
+    if len(ep_dmg) >= 2:
+        print(f"  per-episode damage:  mean={dmg_mean:.2f}  95% CI [{dmg_lo:.2f}, {dmg_hi:.2f}]  (n={len(ep_dmg)})")
+        print(f"  per-episode hits:    mean={hit_mean:.2f}  95% CI [{hit_lo:.2f}, {hit_hi:.2f}]")
+        print(f"  per-episode dmg/step: mean={dps_mean:.5f}  95% CI [{dps_lo:.5f}, {dps_hi:.5f}]")
+        print(f"  per-episode hits/step: mean={hps_mean:.5f}  95% CI [{hps_lo:.5f}, {hps_hi:.5f}]")
+    else:
+        print(f"  (only {len(ep_dmg)} episode(s) completed — no CI available; rerun with more steps)")
+    print(f"{'=' * 70}")
+
+
+def _print_comparison(label_a, results_a, label_b, results_b):
+    """Bootstrap diff CI: positive diff = B - A. If 0 not in CI → significant."""
+    def _per_ep_rates(r):
+        return ([d / s for d, s in zip(r["ep_dmg"], r["ep_steps"]) if s > 0],
+                [h / s for h, s in zip(r["ep_hits"], r["ep_steps"]) if s > 0])
+
+    dmg_a = results_a["ep_dmg"]
+    dmg_b = results_b["ep_dmg"]
+    hits_a = results_a["ep_hits"]
+    hits_b = results_b["ep_hits"]
+    dps_a, hps_a = _per_ep_rates(results_a)
+    dps_b, hps_b = _per_ep_rates(results_b)
+
+    print()
+    print(f"{'=' * 70}")
+    print(f"  COMPARISON: ({label_b}) − ({label_a})")
+    print(f"  Positive = B is larger. 95% CI excluding 0 → significant.")
+    print(f"{'-' * 70}")
+    if len(dmg_a) < 2 or len(dmg_b) < 2:
+        print(f"  Insufficient episodes (A={len(dmg_a)}, B={len(dmg_b)}). Rerun with more steps.")
+        print(f"{'=' * 70}")
+        return
+
+    for name, a, b in [
+        ("per-episode damage     ", dmg_a, dmg_b),
+        ("per-episode hits       ", hits_a, hits_b),
+        ("per-episode dmg/step   ", dps_a, dps_b),
+        ("per-episode hits/step  ", hps_a, hps_b),
+    ]:
+        diff, lo, hi = _bootstrap_diff_ci(a, b)
+        sig = "★ SIGNIFICANT" if (lo > 0 or hi < 0) else "  ns"
+        print(f"  {name}  Δ={diff:+.5f}  95% CI [{lo:+.5f}, {hi:+.5f}]   {sig}")
+    print(f"{'=' * 70}")
+
+
+async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
+                        level="GG_Mega_Moss_Charger", hk_path=None, no_agent=False,
+                        graphical=None, label="extended",
+                        view_w=None, view_h=None):
+    """Run K parallel envs through the training collection path (`collect_action`,
+    sampled actions, batched policy forward) for `n_steps` steps per env, with
+    synchronous reset on done. Tracks per-episode damage/hits/length.
+
+    Returns a dict with totals + per-episode lists. If `graphical` is None,
+    defaults to True only when n_envs==1; else respects the bool."""
+    if graphical is None:
+        graphical = (n_envs == 1)
+    config = Config(n_envs=n_envs, level=level)
+    if time_scale is not None:
+        train_game_time = config.time_scale * config.frames_per_wait
+        config.time_scale = time_scale
+        config.frames_per_wait = max(1, train_game_time // time_scale)
+    if view_w is not None:
+        config.view_w = view_w
+    if view_h is not None:
+        config.view_h = view_h
+
+    agent = None
+    vocab = KindVocab(max_size=config.kind_vocab_size)
+    if not no_agent:
+        agent = PPO(config)
+        agent.load_checkpoint(checkpoint_path, vocab=vocab)
+        agent.policy.eval()
+        print(f"[{label}] Loaded checkpoint: {checkpoint_path}")
+    print(f"[{label}] n_envs={n_envs} | n_steps={n_steps} | level={level} | "
+          f"time_scale={config.time_scale}x | frames_per_wait={config.frames_per_wait} | "
+          f"graphical={graphical}")
+
+    mgr = None
+    launch_path = hk_path or config.hk_path
+    if launch_path and os.path.exists(launch_path):
+        print(f"[{label}] Spawning {n_envs} HK instance(s) (graphical={graphical})...")
+        mgr = InstanceManager(launch_path, config.hk_data_dir)
+        mgr.spawn_n(n_envs)
+        mgr._disable_steam_api()
+        mgr.start_all(graphical=graphical)
+    else:
+        print(f"[{label}] hk_path not found ({launch_path}) — launch HK manually.")
+
+    vec_env = VecEnv(config)
+    vec_env.vocab = vocab  # share vocab loaded from checkpoint
+    await vec_env.start_server()
+
+    obs = await vec_env.reset_all(levels=[level] * n_envs)
+    if not no_agent:
+        agent.reset_hidden(n_envs)
+
+    total_damage = np.zeros(n_envs, dtype=np.float64)
+    total_hits = np.zeros(n_envs, dtype=np.int64)
+
+    # Per-episode accumulators. running_* track the current (incomplete) episode
+    # in each env; on `done` we push to ep_* and reset. Trailing partial
+    # episodes at end-of-run are discarded (would bias the mean).
+    running_dmg = np.zeros(n_envs, dtype=np.float64)
+    running_hits = np.zeros(n_envs, dtype=np.int64)
+    running_steps = np.zeros(n_envs, dtype=np.int64)
+    ep_dmg, ep_hits, ep_steps = [], [], []
+    # Step-timing samples for distribution-shift diagnostics. game_time is
+    # Time.deltaTime accumulated across frames_per_wait Unity frames (depends
+    # on fps); real_time is wallclock for the same frames. Their ratio is
+    # roughly time_scale; both depend on fps, which depends on CPU contention
+    # (n_envs) and graphics. Mismatch between training and eval = different
+    # effective decision rate for the same model.
+    gtime_samples = []
+    rtime_samples = []
+
+    print(f"[{label}] Running {n_steps} steps per env ({n_steps * n_envs} total)...", flush=True)
+    # Snapshot existing tasks so we can identify (and cancel) only the ones
+    # spawned inside this extended_eval run during cleanup.
+    tasks_at_start = set(asyncio.all_tasks())
+    t_start = _time.perf_counter()
+    step = -1
+
+    pbar = tqdm(total=n_steps, desc=f"[{label}]", unit="step",
+                dynamic_ncols=True, mininterval=0.5)
+
+    try:
+        for step in range(n_steps):
+            if no_agent:
+                action_vecs = [[2, 2, 7, 1] for _ in range(n_envs)]
+            else:
+                actions_np, _, _, _, _ = agent.collect_action(obs)
+                action_vecs = [
+                    [int(actions_np["movement"][i]),
+                     int(actions_np["direction"][i]),
+                     int(actions_np["action"][i]),
+                     int(actions_np["jump"][i])]
+                    for i in range(n_envs)
+                ]
+
+            (next_obs, damage, hits, hp_healed, done_flags,
+             committed, gtimes, rtimes, wtimes, diag) = await vec_env.step_all(action_vecs)
+
+            total_damage += damage
+            total_hits += hits.astype(np.int64)
+            running_dmg += damage
+            running_hits += hits.astype(np.int64)
+            running_steps += 1
+            gtime_samples.extend(gtimes.tolist())
+            rtime_samples.extend(rtimes.tolist())
+
+            if done_flags.any():
+                done_indices = np.where(done_flags)[0].tolist()
+                for ei in done_indices:
+                    ep_dmg.append(float(running_dmg[ei]))
+                    ep_hits.append(int(running_hits[ei]))
+                    ep_steps.append(int(running_steps[ei]))
+                    running_dmg[ei] = 0.0
+                    running_hits[ei] = 0
+                    running_steps[ei] = 0
+                # Synchronous reset for any env that finished.
+                reset_results = await asyncio.gather(*[
+                    vec_env.envs[ei].reset(level=level) for ei in done_indices
+                ])
+                reset_batch = vec_env._batch_observations(reset_results)
+                next_obs = merge_obs_padded(next_obs, reset_batch, done_indices)
+                if not no_agent:
+                    agent.reset_hidden_for(done_indices)
+
+            obs = next_obs
+
+            pbar.update(1)
+            pbar.set_postfix({
+                "dmg": f"{total_damage.sum():.1f}",
+                "hits": int(total_hits.sum()),
+                "eps": len(ep_dmg),
+            })
+
+    except KeyboardInterrupt:
+        print(f"\n[{label}] Interrupted.")
+    finally:
+        pbar.close()
+        wall = _time.perf_counter() - t_start
+        steps_done = max(step + 1, 0)
+
+        # 1) Tell each game we're closing (best-effort, short timeout).
+        for env in vec_env.envs:
+            if env is None:
+                continue
+            try:
+                await asyncio.wait_for(env.close(), timeout=1.0)
+            except Exception:
+                pass
+
+        # 2) Kill HK processes. Releases their TCP sockets, which lets the
+        #    server-side _on_connect handlers exit (they're parked on
+        #    asyncio.Future() and only unblock on ConnectionClosed).
+        if mgr:
+            mgr.stop_all()
+
+        # 3) Force-close any server-side websockets that didn't drop yet.
+        for ws in vec_env._ws_connections:
+            if ws is None:
+                continue
+            try:
+                await asyncio.wait_for(ws.close(), timeout=1.0)
+            except Exception:
+                pass
+
+        # 4) Close server with a hard timeout. wait_closed() blocks until all
+        #    handlers finish; if one is stuck we don't want to hang forever.
+        if vec_env._server is not None:
+            vec_env._server.close()
+            try:
+                await asyncio.wait_for(vec_env._server.wait_closed(), timeout=3.0)
+            except asyncio.TimeoutError:
+                print(f"[{label}] server close timed out — continuing anyway.")
+            except Exception:
+                pass
+
+        # 5) Cancel any pending tasks that were spawned inside this run (the
+        #    keep-alive Future inside _on_connect, websocket protocol tasks).
+        #    Skip tasks that existed before this run started — those belong
+        #    to the caller (e.g. the outer compare_graphics coroutine).
+        cur = asyncio.current_task()
+        for task in asyncio.all_tasks() - tasks_at_start:
+            if task is cur or task.done():
+                continue
+            task.cancel()
+        # Yield once so cancellations propagate before we return.
+        await asyncio.sleep(0)
+
+    return {
+        "label": label,
+        "n_envs": n_envs,
+        "n_steps": n_steps,
+        "steps_done": steps_done,
+        "wall": wall,
+        "total_damage": total_damage,
+        "total_hits": total_hits,
+        "ep_dmg": ep_dmg,
+        "ep_hits": ep_hits,
+        "ep_steps": ep_steps,
+        "gtime_samples": gtime_samples,
+        "rtime_samples": rtime_samples,
+    }
+
+
+async def compare_graphics(checkpoint_path, n_envs, n_steps, time_scale=None,
+                           level="GG_Mega_Moss_Charger", hk_path=None, no_agent=False,
+                           order="headless_first", view_w=None, view_h=None):
+    """Run extended_eval twice — once headless, once graphical — and print a
+    bootstrap-CI comparison. `order` controls which runs first (mostly to let
+    the user check whether a warmup/order effect explains a difference).
+    """
+    runs = ("headless", "graphical") if order == "headless_first" else ("graphical", "headless")
+    results = {}
+    for mode in runs:
+        graphical = (mode == "graphical")
+        results[mode] = await extended_eval(
+            checkpoint_path, n_envs=n_envs, n_steps=n_steps,
+            time_scale=time_scale, level=level, hk_path=hk_path,
+            no_agent=no_agent, graphical=graphical, label=mode,
+            view_w=view_w, view_h=view_h,
+        )
+
+    _print_run_summary("HEADLESS", results["headless"])
+    _print_run_summary("GRAPHICAL", results["graphical"])
+    _print_comparison("HEADLESS", results["headless"],
+                      "GRAPHICAL", results["graphical"])
+
+
 def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_parent_ids_arr, config) -> Observation:
     """Pack single-env raw obs into a batched (B=1) Observation."""
+    # View-box gate matches what training applies in vec_env._batch_observations.
+    terrain_hb_arr = filter_terrain_in_view(
+        terrain_hb_arr, config.view_w, config.view_h,
+    )
     n_combat = max(len(combat_hb_arr), 1)
     n_terrain = max(len(terrain_hb_arr), 1)
 
@@ -410,6 +771,18 @@ def main():
                         help="Skip PPO entirely; send noop actions. Intended for the observation viewer.")
     parser.add_argument("--visualize", action="store_true",
                         help="Open the live hitbox viewer (matplotlib).")
+    parser.add_argument("--terrain-max-dist", type=float, default=None,
+                        help="Visualizer-only preview: dim terrain segments with nearest-point distance > N"
+                             " world units. Does NOT affect the agent's input.")
+    parser.add_argument("--view-w", type=float, default=None,
+                        help="Override Config.view_w (knight-relative box width, world units) for this run."
+                             " Affects the agent's input — terrain outside the box is dropped before the model"
+                             " sees it. Pair with --view-h. Pass 0 to disable the gate.")
+    parser.add_argument("--view-h", type=float, default=None,
+                        help="Override Config.view_h. Pair with --view-w. Pass 0 to disable.")
+    parser.add_argument("--all-hitboxes", action="store_true",
+                        help="Disable the view-box terrain gate entirely (sets view_w=view_h=0)."
+                             " Use when evaluating a checkpoint trained without the gate.")
     parser.add_argument("--no-deterministic", dest="deterministic", action="store_false",
                         help="Use stochastic sampling instead of greedy argmax")
     parser.set_defaults(deterministic=True)
@@ -425,12 +798,73 @@ def main():
                         help="Max run time in seconds (default: 0 = no limit, ends on death)")
     parser.add_argument("--hk-path", default=None,
                         help="Path to Hollow Knight install (overrides config default)")
+    parser.add_argument("--n-envs", type=int, default=1,
+                        help="Extended-eval mode: number of parallel envs (default 1)."
+                             " Triggers extended eval when used with --n-steps.")
+    parser.add_argument("--n-steps", type=int, default=0,
+                        help="Extended-eval mode: steps PER ENV (auto-resets on done)."
+                             " When >0, switches to batched-policy eval via VecEnv;"
+                             " ignores --duration/--record/--visualize/--deterministic.")
+    parser.add_argument("--graphical", dest="graphical", action="store_const", const=True,
+                        help="Force graphical for extended eval (default: only when n_envs=1).")
+    parser.add_argument("--headless", dest="graphical", action="store_const", const=False,
+                        help="Force headless for extended eval.")
+    parser.set_defaults(graphical=None)
+    parser.add_argument("--compare-graphics", action="store_true",
+                        help="Run extended eval twice (headless then graphical) and"
+                             " print a bootstrap-CI comparison of damage/hits.")
+    parser.add_argument("--compare-order", choices=["headless_first", "graphical_first"],
+                        default="headless_first",
+                        help="Order for --compare-graphics (default: headless_first).")
     args = parser.parse_args()
 
     if not args.no_agent and not args.checkpoint:
         parser.error("checkpoint is required unless --no-agent is passed")
     if args.no_agent and args.record == "fight.mp4":
         args.record = None  # don't default-record in viewer mode
+    if (args.view_w is None) != (args.view_h is None):
+        parser.error("--view-w and --view-h must be set together")
+    if args.all_hitboxes:
+        if args.view_w is not None or args.view_h is not None:
+            parser.error("--all-hitboxes is mutually exclusive with --view-w/--view-h")
+        args.view_w = 0.0
+        args.view_h = 0.0
+
+    if args.compare_graphics:
+        if args.n_steps <= 0:
+            parser.error("--compare-graphics requires --n-steps > 0")
+        asyncio.run(compare_graphics(
+            args.checkpoint,
+            n_envs=args.n_envs,
+            n_steps=args.n_steps,
+            time_scale=args.time_scale,
+            level=args.level,
+            hk_path=args.hk_path,
+            no_agent=args.no_agent,
+            order=args.compare_order,
+            view_w=args.view_w, view_h=args.view_h,
+        ))
+        return
+
+    if args.n_steps > 0 or args.n_envs > 1:
+        # Extended eval: VecEnv-driven batched collection. Both single (n_envs=1)
+        # and batched (n_envs>1) runs go through the same code path so the
+        # comparison isolates batch effects.
+        if args.n_steps <= 0:
+            parser.error("--n-envs > 1 requires --n-steps > 0")
+        results = asyncio.run(extended_eval(
+            args.checkpoint,
+            n_envs=args.n_envs,
+            n_steps=args.n_steps,
+            time_scale=args.time_scale,
+            level=args.level,
+            hk_path=args.hk_path,
+            no_agent=args.no_agent,
+            graphical=args.graphical,
+            view_w=args.view_w, view_h=args.view_h,
+        ))
+        _print_run_summary("EXTENDED EVAL", results)
+        return
 
     asyncio.run(eval_play(
         args.checkpoint,
@@ -442,6 +876,9 @@ def main():
         duration=args.duration,
         no_agent=args.no_agent,
         visualize=args.visualize,
+        terrain_max_dist=args.terrain_max_dist,
+        view_w=args.view_w,
+        view_h=args.view_h,
     ))
 
 

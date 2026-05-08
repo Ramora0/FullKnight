@@ -14,6 +14,17 @@ namespace FullKnight.Game
 			var HC = HeroController.instance;
 			var GM = GameManager.instance;
 
+			float t0 = Time.realtimeSinceStartup;
+			float tLast = t0;
+			void LogStage(string stage)
+			{
+				float now = Time.realtimeSinceStartup;
+				FullKnight.Instance.Log(
+					$"[Phase-Timing] LoadBossScene {stage}: +{(now - tLast) * 1000f:F0}ms"
+					+ $" (total {(now - t0) * 1000f:F0}ms)");
+				tLast = now;
+			}
+
 			// Boss-to-boss transitions are unreliable: the wake FSM can miss its
 			// intro event (observed: Gruz Mother's 'Big Fly Control' stuck in 'Wake'
 			// with the boss sleeping on the ceiling) on both same-scene reloads AND
@@ -29,6 +40,7 @@ namespace FullKnight.Game
 				yield return BounceThroughWorkshop();
 				string postBounce = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
 				FullKnight.Instance.Log($"[SceneHooks] bounce complete, now in {postBounce}");
+				LogStage("BounceThroughWorkshop");
 			}
 
 			PlayMakerFSM.BroadcastEvent("DREAM ENTER");
@@ -58,13 +70,17 @@ namespace FullKnight.Game
 				Visualization = GameManager.SceneLoadVisualizations.GodsAndGlory,
 				PreventCameraFadeOut = true
 			});
+			LogStage("BeginSceneTransition (boss)");
 			yield return FixSoul();
+			LogStage("FixSoul");
 			yield return new WaitForSeconds(2f);
+			LogStage("WaitForSeconds(2)");
 		}
 
 		private static IEnumerator BounceThroughWorkshop()
 		{
 			var GM = GameManager.instance;
+			float t0 = Time.realtimeSinceStartup;
 			GM.BeginSceneTransition(new GameManager.SceneLoadInfo
 			{
 				SceneName = "GG_Workshop",
@@ -73,17 +89,32 @@ namespace FullKnight.Game
 				Visualization = GameManager.SceneLoadVisualizations.GodsAndGlory,
 				PreventCameraFadeOut = true
 			});
+			float t1 = Time.realtimeSinceStartup;
 			yield return new WaitForSceneLoad("GG_Workshop");
+			float t2 = Time.realtimeSinceStartup;
 			yield return new WaitForFinishedEnteringScene();
+			float t3 = Time.realtimeSinceStartup;
+			FullKnight.Instance.Log(
+				$"[Phase-Timing] BounceThroughWorkshop: BeginTransition={(t1 - t0) * 1000f:F0}ms"
+				+ $" WaitForSceneLoad={(t2 - t1) * 1000f:F0}ms"
+				+ $" WaitForFinishedEnteringScene={(t3 - t2) * 1000f:F0}ms"
+				+ $" total={(t3 - t0) * 1000f:F0}ms");
 		}
 
 		private static IEnumerator FixSoul()
 		{
+			float t0 = Time.realtimeSinceStartup;
 			yield return new WaitForFinishedEnteringScene();
+			float t1 = Time.realtimeSinceStartup;
 			yield return null;
 			yield return new WaitForSeconds(1f);
+			float t2 = Time.realtimeSinceStartup;
 			HeroController.instance.AddMPCharge(1);
 			HeroController.instance.AddMPCharge(-1);
+			FullKnight.Instance.Log(
+				$"[Phase-Timing] FixSoul: WaitForFinishedEnteringScene={(t1 - t0) * 1000f:F0}ms"
+				+ $" WaitForSeconds(1)+frame={(t2 - t1) * 1000f:F0}ms"
+				+ $" total={(t2 - t0) * 1000f:F0}ms");
 		}
 
 		public class WaitForSceneLoad : CustomYieldInstruction, IDisposable

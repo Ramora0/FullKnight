@@ -194,3 +194,34 @@ def mirror_observation(obs: "Observation") -> "Observation":
 def mirror_movement(movement):
     """Swap movement labels: 0 (left) ↔ 1 (right); 2 (none) unchanged."""
     return torch.where(movement == 2, movement, 1 - movement)
+
+
+# ---------------------------------------------------------------------------
+# Terrain view-box gate. Drops segments whose nearest point lies outside the
+# knight-relative axis-aligned box (view_w × view_h). Used uniformly by
+# rollout collection (vec_env) and eval (batch_obs) so train/eval distributions
+# match. Operates on raw (pre-normalization) terrain rows where NPX/NPY are
+# in world units.
+# ---------------------------------------------------------------------------
+
+def filter_terrain_in_view(terrain_hb, view_w, view_h, kinds=None, parents=None):
+    """Filter terrain rows whose nearest-point lies inside the knight-relative
+    box (|NPX| <= view_w/2, |NPY| <= view_h/2). Returns the filtered terrain
+    array; if `kinds`/`parents` are provided, also returns aligned filtered
+    lists. No-op when view_w or view_h is falsy or when there are no rows.
+    """
+    arr = np.asarray(terrain_hb, dtype=np.float32) if not isinstance(terrain_hb, np.ndarray) else terrain_hb
+    if not view_w or not view_h or arr.shape[0] == 0:
+        if kinds is None and parents is None:
+            return arr
+        return arr, kinds, parents
+    npx = arr[:, TR.NPX]
+    npy = arr[:, TR.NPY]
+    keep = (np.abs(npx) <= view_w / 2.0) & (np.abs(npy) <= view_h / 2.0)
+    out = arr[keep]
+    if kinds is None and parents is None:
+        return out
+    keep_idx = np.where(keep)[0].tolist()
+    fk = [kinds[i] for i in keep_idx] if kinds is not None else None
+    fp = [parents[i] for i in keep_idx] if parents is not None else None
+    return out, fk, fp

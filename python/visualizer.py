@@ -21,8 +21,11 @@ class Visualizer:
     KNIGHT_EDGE = (40, 70, 200)
     VEL = (40, 70, 200)
     TERRAIN = (20, 20, 20)
+    TERRAIN_DIM = (210, 210, 210)  # filtered-out terrain (gate would drop)
     TRIGGER = (70, 130, 180)
+    TRIGGER_DIM = (200, 215, 225)
     NEAREST = (0, 191, 255)
+    VIEW_BOX = (90, 110, 200)
     TEXT = (35, 35, 35)
 
     # Combat colors mirror the matplotlib version:
@@ -34,7 +37,7 @@ class Visualizer:
     COLOR_PEACEFUL = ( 60, 180,  60)
     COLOR_ATTACK   = (235, 215,  20)
 
-    def __init__(self, vocab=None):
+    def __init__(self, vocab=None, terrain_max_dist=None, view_w=None, view_h=None):
         pygame.display.init()
         pygame.font.init()
         pygame.display.set_caption("FullKnight Observation Viewer")
@@ -42,6 +45,12 @@ class Visualizer:
         self.font = pygame.font.SysFont("consolas", 11)
         self.title_font = pygame.font.SysFont("consolas", 14, bold=True)
         self.vocab = vocab
+        # Optional terrain-gating preview: segments outside the gate are still
+        # drawn but dimmed, so the user can eyeball how much is filtered before
+        # baking the gate into the C# observer.
+        self.terrain_max_dist = terrain_max_dist
+        self.view_w = view_w
+        self.view_h = view_h
         self._closed = False
         self._cx = self.WIDTH // 2
         self._cy = self.HEIGHT // 2
@@ -96,17 +105,56 @@ class Visualizer:
         hp = float(gs[GS.HP])
         knight_w = float(gs[GS.KNIGHT_W]); knight_h = float(gs[GS.KNIGHT_H])
 
-        # Terrain segments
+        # Terrain segments. Two-pass: dimmed (gate-filtered) first so kept
+        # segments paint on top.
         t_hb = obs.terrain_hb[0]
         t_mask = obs.terrain_mask[0]
+        gate_active = (
+            self.terrain_max_dist is not None
+            or (self.view_w is not None and self.view_h is not None)
+        )
+        terrain_total = 0
+        terrain_kept = 0
+        kept_rows = []
         for i in range(len(t_mask)):
             if t_mask[i] < 0.5:
                 continue
             row = t_hb[i]
+            terrain_total += 1
             mx = float(row[TR.MX]); my = float(row[TR.MY])
             hdx = float(row[TR.HDX]); hdy = float(row[TR.HDY])
             npx = float(row[TR.NPX]); npy = float(row[TR.NPY])
-            color = self.TRIGGER if row[TR.IS_TRIGGER] > 0.5 else self.TERRAIN
+            is_trigger = row[TR.IS_TRIGGER] > 0.5
+
+            keep = True
+            if self.terrain_max_dist is not None:
+                if float(row[TR.DIST]) > self.terrain_max_dist:
+                    keep = False
+            if keep and self.view_w is not None and self.view_h is not None:
+                if abs(npx) > self.view_w / 2 or abs(npy) > self.view_h / 2:
+                    keep = False
+
+            if keep:
+                terrain_kept += 1
+                kept_rows.append((mx, my, hdx, hdy, npx, npy, is_trigger))
+            else:
+                # Dim style for gate-dropped segments
+                color = self.TRIGGER_DIM if is_trigger else self.TERRAIN_DIM
+                pygame.draw.line(
+                    screen, color,
+                    self._w2s(mx - hdx, my - hdy),
+                    self._w2s(mx + hdx, my + hdy),
+                    1,
+                )
+
+        # Camera-box outline when a view-box gate is set
+        if self.view_w is not None and self.view_h is not None:
+            box_rect = self._world_rect(0, 0, self.view_w, self.view_h)
+            pygame.draw.rect(screen, self.VIEW_BOX, box_rect, 1)
+
+        # Kept terrain on top, in normal style
+        for (mx, my, hdx, hdy, npx, npy, is_trigger) in kept_rows:
+            color = self.TRIGGER if is_trigger else self.TERRAIN
             pygame.draw.line(
                 screen, color,
                 self._w2s(mx - hdx, my - hdy),
@@ -173,10 +221,19 @@ class Visualizer:
             screen.blit(tsurf, (lx + 2, ly - tsurf.get_height() - 1))
 
         # Title bar
+        terrain_str = (
+            f"{terrain_kept}/{terrain_total}" if gate_active else f"{terrain_total}"
+        )
+        gate_bits = []
+        if self.terrain_max_dist is not None:
+            gate_bits.append(f"dist≤{self.terrain_max_dist:g}")
+        if self.view_w is not None and self.view_h is not None:
+            gate_bits.append(f"box {self.view_w:g}×{self.view_h:g}")
+        gate_str = f"   gate: {', '.join(gate_bits)}" if gate_bits else ""
         title = (
             f"HP: {hp:.0f}   "
-            f"Combat: {int(c_mask.sum())}   Terrain: {int(t_mask.sum())}   "
-            f"Vel: ({vel_x:.1f}, {vel_y:.1f})"
+            f"Combat: {int(c_mask.sum())}   Terrain: {terrain_str}   "
+            f"Vel: ({vel_x:.1f}, {vel_y:.1f}){gate_str}"
         )
         screen.blit(self.title_font.render(title, True, self.TEXT), (8, 6))
 
