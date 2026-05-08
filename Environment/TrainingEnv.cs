@@ -212,7 +212,7 @@ namespace FullKnight.Environment
 			if (_timeManager != null) _timeManager.Dispose();
 			_timeManager = new Game.TimeScale(_timeScaleValue);
 
-			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs);
+			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs, emitTerrainDebug: _evalMode);
 			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
 
 			data.combat_hitboxes = obs.CombatHitboxes;
@@ -395,7 +395,7 @@ namespace FullKnight.Environment
 			}
 
 			// Build observation
-			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs);
+			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs, emitTerrainDebug: _evalMode);
 			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
 
 			data.combat_hitboxes = obs.CombatHitboxes;

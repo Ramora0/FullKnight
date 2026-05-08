@@ -627,7 +627,8 @@ namespace FullKnight.Game
 		///   don't physically collide on their own.
 		/// Knight: bounds only (width, height), folded into global state.
 		/// </summary>
-		public SplitObservation GetSplitFeatures(System.Collections.Generic.HashSet<HealthManager> bossHms = null)
+		public SplitObservation GetSplitFeatures(System.Collections.Generic.HashSet<HealthManager> bossHms = null,
+			bool emitTerrainDebug = false)
 		{
 			var hitboxes = _hook.GetHitboxes();
 			var reader = _hook.GetReader();
@@ -711,7 +712,16 @@ namespace FullKnight.Game
 						try { absorbed = col.usedByComposite; } catch { }
 						if (absorbed) continue;
 
-						string baseDebug = BuildTerrainDebug(col, knightPos, knightCol);
+						// BuildTerrainDebug fires Physics2D.Linecast / OverlapPointAll /
+						// Distance / IsTouching / GetIgnoreCollision queries per terrain
+						// collider — pure cost on the per-step path. The output is only
+						// consumed by python/visualizer.py during eval recording, so when
+						// the visualizer isn't watching we pass an empty baseDebug and
+						// EmitTerrainSegments still emits the geometry features the model
+						// actually trains on (mx, my, hdx, hdy, npx, npy, dist, is_trigger).
+						string baseDebug = emitTerrainDebug
+							? BuildTerrainDebug(col, knightPos, knightCol)
+							: "";
 						EmitTerrainSegments(col, knightPos, terrain, terrainDebug, baseDebug);
 					}
 				}
