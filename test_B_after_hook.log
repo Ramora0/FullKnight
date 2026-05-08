@@ -1,0 +1,65 @@
+Spawning 8 HK instance(s)...
+WebSocket server started on ws://localhost:8765
+Waiting for 8 game instances to connect...
+Instance 0 connected.
+Instance 1 connected.
+Instance 2 connected.
+Instance 3 connected.
+Instance 4 connected.
+Instance 5 connected.
+Instance 6 connected.
+Instance 7 connected.
+All 8 instances connected.
+D curriculum: step_scale=0.5000 window=20 ema=0.9950 max_delta=0.0150 (from config 10/0.99/0.03)
+Boss pool: ['GG_False_Knight', 'GG_Mega_Moss_Charger', 'GG_Gruz_Mother', 'GG_Hornet_1']
+Initial env_boss: ['GG_Hornet_1', 'GG_Gruz_Mother', 'GG_False_Knight', 'GG_False_Knight', 'GG_Gruz_Mother', 'GG_False_Knight', 'GG_Hornet_1', 'GG_Gruz_Mother']
+Using device: cuda
+Model parameters: 360,402
+reset_all: 8 envs in 1.2s
+[vocab] new kind #2: 'Hero Damager'
+[vocab] new kind #3: 'Giant Fly'
+[vocab] new kind #4: 'False Knight New'
+[vocab] new kind #5: 'Hornet Boss 1'
+[vocab] new kind #6: 'Slash'
+[vocab] new kind #7: 'AltSlash'
+[vocab] new kind #8: 'UpSlash'
+[vocab] new kind #9: 'DownSlash'
+[vocab] new kind #10: 'Hit L'
+[vocab] new kind #11: 'Hit R'
+[vocab] new kind #12: 'Hit U'
+[vocab] new kind #13: 'Hit GDash'
+[vocab] new kind #14: 'Needle'
+[vocab] new kind #15: 'Q Fall Damage'
+[vocab] new kind #16: 'Hitter'
+[vocab] new kind #17: 'Fireball2 Spiral'
+[vocab] new kind #18: 'Shockwave Spurt L'
+[vocab] new kind #19: 'Hit ADash'
+[vocab] new kind #20: 'Sphere Ball'
+[vocab] new kind #21: 'Shockwave Spurt'
+[vocab] new kind #22: 'WallSlash'
+  diag | active_envs 8/8 | active_steps 92/4096 (2.2%) | first_event [121, 10, 258, 83, 89, 89, 91, 10] | step0 32ms | avg_step 15.9ms | reset_budget 0/4096 | reset_envs [0]
+  perf | spread P50/P90/P99/max 3/4/8/13ms | sim 13.0ms (82%) overhead 2.9ms
+  leak | hb_e/a/t avg 23/68/16 (max 37/68/21) | kcache 8 | mono_heap 137.5MB | rss avg/max 617/628MB
+  perf | per_boss_step False_Knight:16ms Hornet_1:16ms Gruz_Mother:16ms
+  train | T=512 N=8 L=16 chunks=256 chunks/batch=8 iters=2 | max combat hb=12 terrain hb=97 | samples=4,096 × iters=2 = 8,192 passes
+  train:   0%|          | 0.00/8.19k [00:00<?, ?pass/s]  train:   2%|1         | 128/8.19k [00:00<00:09, 892pass/s]  train:   2%|1         | 128/8.19k [00:00<00:09, 892pass/s, surr=-0.181 kl=0.000]  train:   3%|3         | 256/8.19k [00:00<00:08, 892pass/s, surr=-0.071 kl=0.002]  train:   5%|4         | 384/8.19k [00:00<00:08, 892pass/s, surr=-0.107 kl=0.007]  train:   6%|6         | 512/8.19k [00:00<00:08, 892pass/s, surr=+0.004 kl=0.007]  train:   8%|7         | 640/8.19k [00:00<00:02, 2.78kpass/s, surr=+0.004 kl=0.007]  train:   8%|7         | 640/8.19k [00:00<00:02, 2.78kpass/s, surr=+0.186 kl=0.011]  train:   9%|9         | 768/8.19k [00:00<00:02, 2.78kpass/s, surr=+0.237 kl=0.006]  train:  11%|#         | 896/8.19k [00:00<00:02, 2.78kpass/s, surr=+0.087 kl=0.008]  train:  12%|#2        | 1.02k/8.19k [00:00<00:02, 2.78kpass/s, surr=+0.282 kl=0.011]  train:  14%|#4        | 1.15k/8.19k [00:00<00:02, 2.78kpass/s, surr=-0.629 kl=0.007]  train:  16%|#5        | 1.28k/8.19k [00:00<00:01, 3.87kpass/s, surr=-0.629 kl=0.007]  train:  16%|#5        | 1.28k/8.19k [00:00<00:01, 3.87kpass/s, surr=-0.218 kl=0.008]  train:  17%|#7        | 1.41k/8.19k [00:00<00:01, 3.87kpass/s, surr=-0.049 kl=0.007]  train:  19%|#8        | 1.54k/8.19k [00:00<00:01, 3.87kpass/s, surr=+0.098 kl=0.007]  train:  20%|##        | 1.66k/8.19k [00:00<00:01, 3.87kpass/s, surr=+0.156 kl=0.011]  train:  22%|##1       | 1.79k/8.19k [00:00<00:01, 3.87kpass/s, surr=+0.358 kl=0.008]  train:  23%|##3       | 1.92k/8.19k [00:00<00:01, 4.40kpass/s, surr=+0.358 kl=0.008]  train:  23%|##3       | 1.92k/8.19k [00:00<00:01, 4.40kpass/s, surr=+0.097 kl=0.010]  train:  25%|##5       | 2.05k/8.19k [00:00<00:01, 4.40kpass/s, surr=+0.463 kl=0.009]  train:  27%|##6       | 2.18k/8.19k [00:00<00:01, 4.40kpass/s, surr=-0.242 kl=0.005]  train:  28%|##8       | 2.30k/8.19k [00:00<00:01, 4.40kpass/s, surr=+0.055 kl=0.005]  train:  30%|##9       | 2.43k/8.19k [00:00<00:01, 4.40kpass/s, surr=-0.645 kl=0.006]  train:  31%|###1      | 2.56k/8.19k [00:00<00:01, 4.69kpass/s, surr=-0.645 kl=0.006]  train:  31%|###1      | 2.56k/8.19k [00:00<00:01, 4.69kpass/s, surr=+0.054 kl=0.007]  train:  33%|###2      | 2.69k/8.19k [00:00<00:01, 4.69kpass/s, surr=+0.049 kl=0.007]  train:  34%|###4      | 2.82k/8.19k [00:00<00:01, 4.69kpass/s, surr=-0.259 kl=0.010]  train:  36%|###5      | 2.94k/8.19k [00:00<00:01, 4.69kpass/s, surr=-0.015 kl=0.009]  train:  38%|###7      | 3.07k/8.19k [00:00<00:01, 4.69kpass/s, surr=+0.095 kl=0.009]  train:  39%|###9      | 3.20k/8.19k [00:00<00:01, 4.95kpass/s, surr=+0.095 kl=0.009]  train:  39%|###9      | 3.20k/8.19k [00:00<00:01, 4.95kpass/s, surr=+0.059 kl=0.011]  train:  41%|####      | 3.33k/8.19k [00:00<00:00, 4.95kpass/s, surr=+0.171 kl=0.005]  train:  42%|####2     | 3.46k/8.19k [00:00<00:00, 4.95kpass/s, surr=+0.065 kl=0.010]  train:  44%|####3     | 3.58k/8.19k [00:00<00:00, 4.95kpass/s, surr=+0.129 kl=0.009]  train:  45%|####5     | 3.71k/8.19k [00:00<00:00, 4.98kpass/s, surr=+0.129 kl=0.009]  train:  45%|####5     | 3.71k/8.19k [00:00<00:00, 4.98kpass/s, surr=+0.012 kl=0.009]  train:  47%|####6     | 3.84k/8.19k [00:00<00:00, 4.98kpass/s, surr=+0.072 kl=0.011]  train:  48%|####8     | 3.97k/8.19k [00:00<00:00, 4.98kpass/s, surr=-0.284 kl=0.017]  train:  50%|#####     | 4.10k/8.19k [00:00<00:00, 4.98kpass/s, surr=+0.023 kl=0.014]  train:  52%|#####1    | 4.22k/8.19k [00:00<00:00, 4.98kpass/s, surr=-0.034 kl=0.014]  train:  53%|#####3    | 4.35k/8.19k [00:00<00:00, 5.10kpass/s, surr=-0.034 kl=0.014]  train:  53%|#####3    | 4.35k/8.19k [00:00<00:00, 5.10kpass/s, surr=-0.159 kl=0.016]  train:  55%|#####4    | 4.48k/8.19k [00:00<00:00, 5.10kpass/s, surr=+0.153 kl=0.014]  train:  56%|#####6    | 4.61k/8.19k [00:01<00:00, 5.10kpass/s, surr=+0.259 kl=0.016]  train:  58%|#####7    | 4.74k/8.19k [00:01<00:00, 5.10kpass/s, surr=+0.159 kl=0.014]  train:  59%|#####9    | 4.86k/8.19k [00:01<00:00, 5.10kpass/s, surr=-0.016 kl=0.020]  train:  61%|######    | 4.99k/8.19k [00:01<00:00, 5.16kpass/s, surr=-0.016 kl=0.020]  train:  61%|######    | 4.99k/8.19k [00:01<00:00, 5.16kpass/s, surr=-0.111 kl=0.012]  train:  62%|######2   | 5.12k/8.19k [00:01<00:00, 5.16kpass/s, surr=-0.129 kl=0.012]  train:  64%|######4   | 5.25k/8.19k [00:01<00:00, 5.16kpass/s, surr=+0.160 kl=0.012]  train:  66%|######5   | 5.38k/8.19k [00:01<00:00, 5.16kpass/s, surr=+0.122 kl=0.010]  train:  67%|######7   | 5.50k/8.19k [00:01<00:00, 5.16kpass/s, surr=+0.124 kl=0.006]  train:  69%|######8   | 5.63k/8.19k [00:01<00:00, 5.16kpass/s, surr=+0.124 kl=0.006]  train:  69%|######8   | 5.63k/8.19k [00:01<00:00, 5.16kpass/s, surr=+0.129 kl=0.006]  train:  70%|#######   | 5.76k/8.19k [00:01<00:00, 5.16kpass/s, surr=+0.171 kl=0.008]  train:  72%|#######1  | 5.89k/8.19k [00:01<00:00, 5.16kpass/s, surr=-0.075 kl=0.012]  train:  73%|#######3  | 6.02k/8.19k [00:01<00:00, 5.16kpass/s, surr=+0.062 kl=0.012]  train:  75%|#######5  | 6.14k/8.19k [00:01<00:00, 5.16kpass/s, surr=-0.230 kl=0.012]  train:  77%|#######6  | 6.27k/8.19k [00:01<00:00, 5.20kpass/s, surr=-0.230 kl=0.012]  train:  77%|#######6  | 6.27k/8.19k [00:01<00:00, 5.20kpass/s, surr=-0.013 kl=0.013]  train:  78%|#######8  | 6.40k/8.19k [00:01<00:00, 5.20kpass/s, surr=+0.333 kl=0.011]  train:  80%|#######9  | 6.53k/8.19k [00:01<00:00, 5.20kpass/s, surr=-0.219 kl=0.016]  train:  81%|########1 | 6.66k/8.19k [00:01<00:00, 5.20kpass/s, surr=+0.118 kl=0.011]  train:  83%|########2 | 6.78k/8.19k [00:01<00:00, 5.20kpass/s, surr=-0.336 kl=0.009]  train:  84%|########4 | 6.91k/8.19k [00:01<00:00, 5.17kpass/s, surr=-0.336 kl=0.009]  train:  84%|########4 | 6.91k/8.19k [00:01<00:00, 5.17kpass/s, surr=-0.038 kl=0.009]  train:  86%|########5 | 7.04k/8.19k [00:01<00:00, 5.17kpass/s, surr=-0.420 kl=0.009]  train:  88%|########7 | 7.17k/8.19k [00:01<00:00, 5.17kpass/s, surr=+0.114 kl=0.005]  train:  89%|########9 | 7.30k/8.19k [00:01<00:00, 5.17kpass/s, surr=+0.061 kl=0.006]  train:  91%|######### | 7.42k/8.19k [00:01<00:00, 5.17kpass/s, surr=+0.219 kl=0.005]  train:  92%|#########2| 7.55k/8.19k [00:01<00:00, 5.23kpass/s, surr=+0.219 kl=0.005]  train:  92%|#########2| 7.55k/8.19k [00:01<00:00, 5.23kpass/s, surr=+0.008 kl=0.005]  train:  94%|#########3| 7.68k/8.19k [00:01<00:00, 5.23kpass/s, surr=-0.053 kl=0.005]  train:  95%|#########5| 7.81k/8.19k [00:01<00:00, 5.23kpass/s, surr=-0.369 kl=0.005]  train:  97%|#########6| 7.94k/8.19k [00:01<00:00, 5.23kpass/s, surr=-0.026 kl=0.008]  train:  98%|#########8| 8.06k/8.19k [00:01<00:00, 5.23kpass/s, surr=-0.108 kl=0.010]  train: 100%|##########| 8.19k/8.19k [00:01<00:00, 5.27kpass/s, surr=-0.108 kl=0.010]  train: 100%|##########| 8.19k/8.19k [00:01<00:00, 5.27kpass/s, surr=+0.232 kl=0.013]                                                                                        timing | rollout 15.68s | hk 9.25s | collect 6.43s | train 1.84s | total 17.52s
+  collect | norm 278ms | prep 28ms | h2d 323ms | fwd 5627ms | d2h 171ms
+epoch    0 | steps     4096 | D[Knight:8.95 Charger:2.00 Mother:10.79 1:4.47] | D_geo   5.42 | hits/boss   23.2 | curr_rew  0.0000 | dmg  0.071 | taken  0.009 | surr  0.0022 | kl 0.0094
+
+---
+curriculum_reward:      0.000000
+avg_damage_landed:      0.0710
+avg_hits_taken:         0.0089
+final_D_geomean:        5.42
+final_avg_hits_per_boss: 23.2
+final_D/GG_False_Knight: 8.95
+final_D/GG_Mega_Moss_Charger: 2.00
+final_D/GG_Gruz_Mother: 10.79
+final_D/GG_Hornet_1: 4.47
+final_entropy:       -3.212372
+final_kl:            0.009370
+final_surrogate:     0.002188
+pct_samples_trained: 100.0
+epochs_completed:    1
+training_seconds:    18.7
+Cleaning up instances...

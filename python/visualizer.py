@@ -1,304 +1,190 @@
-import json
-import os
-import time
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import numpy as np
+import pygame
 
 from observation import Observation, GS, CB, TR
 
 
-_TERRAIN_DEBUG_FIELDS = [
-    "name", "path", "col_type", "layer",
-    "enabled", "active", "trigger", "used_by_composite",
-    "world_bounds",
-]
-
-
-def parse_terrain_debug(s: str) -> dict:
-    """Split a pipe-delimited terrain_debug string into a dict.
-
-    Layout:
-      - First N fields are positional (see _TERRAIN_DEBUG_FIELDS).
-      - Any remaining field of the form "k=v" is stored as out[k]=v.
-      - The special "segments" key is expanded into a list of (x1,y1,x2,y2)
-        tuples, the rest stay as strings (caller can cast if needed)."""
-    if not s:
-        return {}
-    parts = s.split("|")
-    positional = [p for p in parts if "=" not in p]
-    kv = [p for p in parts if "=" in p]
-    out: dict = {}
-    for i, key in enumerate(_TERRAIN_DEBUG_FIELDS):
-        if i < len(positional):
-            out[key] = positional[i]
-    for p in kv:
-        k, _, v = p.partition("=")
-        if k == "segments":
-            segs = []
-            for tri in v.split(";"):
-                if not tri:
-                    continue
-                xs = tri.split(",")
-                if len(xs) != 4:
-                    continue
-                try:
-                    segs.append((float(xs[0]), float(xs[1]), float(xs[2]), float(xs[3])))
-                except ValueError:
-                    pass
-            out["segments"] = segs
-        else:
-            out[k] = v
-    return out
-
-
 class Visualizer:
-    """Live visualization of the exact observations the model receives.
+    """Live pygame visualization of env 0's observation.
 
-    Shows env 0 only. Knight at origin, combat hitboxes in red/orange,
-    terrain in gray, with global state info in the title.
+    Knight at origin, combat hitboxes color-coded by behavioral flags,
+    terrain segments as line strokes with nearest-point dots.
     """
 
+    WIDTH = 1200
+    HEIGHT = 600
+    SCALE = 6.0  # pixels per world unit
+
+    BG = (245, 245, 245)
+    GRID = (225, 225, 225)
+    AXIS = (180, 180, 220)
+    KNIGHT_FILL = (130, 220, 230)
+    KNIGHT_EDGE = (40, 70, 200)
+    VEL = (40, 70, 200)
+    TERRAIN = (20, 20, 20)
+    TRIGGER = (70, 130, 180)
+    NEAREST = (0, 191, 255)
+    TEXT = (35, 35, 35)
+
+    # Combat colors mirror the matplotlib version:
+    # red=target, orange=damageable enemy, magenta=hazard,
+    # green=peaceful damageable, yellow=knight attack.
+    COLOR_TARGET   = (220,  40,  40)
+    COLOR_ENEMY    = (255, 140,  20)
+    COLOR_HAZARD   = (220,  60, 200)
+    COLOR_PEACEFUL = ( 60, 180,  60)
+    COLOR_ATTACK   = (235, 215,  20)
+
     def __init__(self, vocab=None):
-        plt.ion()
-        self.fig, self.ax = plt.subplots(1, 1, figsize=(10, 8))
-        self.fig.canvas.manager.set_window_title("FullKnight Observation Viewer")
+        pygame.display.init()
+        pygame.font.init()
+        pygame.display.set_caption("FullKnight Observation Viewer")
+        self.screen = pygame.display.set_mode((self.WIDTH, self.HEIGHT))
+        self.font = pygame.font.SysFont("consolas", 11)
+        self.title_font = pygame.font.SysFont("consolas", 14, bold=True)
         self.vocab = vocab
-        # Latest inputs — kept so the 's' key handler can dump them.
-        self._last_obs = None
-        self._last_terrain_debug = []
-        self._snapshot_dir = "debug_snapshots"
-        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        self._closed = False
+        self._cx = self.WIDTH // 2
+        self._cy = self.HEIGHT // 2
+
+    def _w2s(self, x, y):
+        return self._cx + int(x * self.SCALE), self._cy - int(y * self.SCALE)
+
+    def _world_rect(self, cx, cy, w, h):
+        sx = self._cx + int((cx - w / 2) * self.SCALE)
+        sy = self._cy - int((cy + h / 2) * self.SCALE)
+        sw = max(1, int(w * self.SCALE))
+        sh = max(1, int(h * self.SCALE))
+        return pygame.Rect(sx, sy, sw, sh)
+
+    def _combat_color(self, gives, takes, is_target):
+        if is_target:
+            return self.COLOR_TARGET
+        if gives and takes:
+            return self.COLOR_ENEMY
+        if gives:
+            return self.COLOR_HAZARD
+        if takes:
+            return self.COLOR_PEACEFUL
+        return self.COLOR_ATTACK
 
     def update(self, obs: Observation, terrain_debug=None):
-        """Redraw with the current Observation (env 0 only)."""
-        self._last_obs = obs
-        self._last_terrain_debug = list(terrain_debug or [])
-        ax = self.ax
-        ax.clear()
+        if self._closed:
+            return
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                self._closed = True
+                return
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                self._closed = True
+                return
+
+        screen = self.screen
+        screen.fill(self.BG)
+
+        # Grid + origin axes
+        for x in range(-100, 101, 10):
+            sx, _ = self._w2s(x, 0)
+            pygame.draw.line(screen, self.GRID, (sx, 0), (sx, self.HEIGHT))
+        for y in range(-50, 51, 10):
+            _, sy = self._w2s(0, y)
+            pygame.draw.line(screen, self.GRID, (0, sy), (self.WIDTH, sy))
+        pygame.draw.line(screen, self.AXIS, (0, self._cy), (self.WIDTH, self._cy))
+        pygame.draw.line(screen, self.AXIS, (self._cx, 0), (self._cx, self.HEIGHT))
 
         gs = obs.global_state[0]
-        vel_x, vel_y = gs[GS.VEL_X], gs[GS.VEL_Y]
-        hp = gs[GS.HP]
-        knight_w = gs[GS.KNIGHT_W]
-        knight_h = gs[GS.KNIGHT_H]
+        vel_x = float(gs[GS.VEL_X]); vel_y = float(gs[GS.VEL_Y])
+        hp = float(gs[GS.HP])
+        knight_w = float(gs[GS.KNIGHT_W]); knight_h = float(gs[GS.KNIGHT_H])
 
-        # Terrain segments — each row of terrain_hb is one line segment in
-        # knight-relative world space, parameterized as
-        # (mx, my, hdx, hdy, npx, npy, is_trigger). Endpoints recover as
-        # midpoint ± half-vector. Nearest point on the clamped segment to
-        # the knight is drawn as a small dot so reachability reads at a
-        # glance. Colliders that decompose to N segments will have N rows
-        # here with the same base debug string (seg_idx differs).
+        # Terrain segments
         t_hb = obs.terrain_hb[0]
         t_mask = obs.terrain_mask[0]
-        seen_names = set()
         for i in range(len(t_mask)):
             if t_mask[i] < 0.5:
                 continue
             row = t_hb[i]
-            mx, my = row[TR.MX], row[TR.MY]
-            hdx, hdy = row[TR.HDX], row[TR.HDY]
-            npx, npy = row[TR.NPX], row[TR.NPY]
-            is_trig = row[TR.IS_TRIGGER] > 0.5
-            x1, y1 = mx - hdx, my - hdy
-            x2, y2 = mx + hdx, my + hdy
-            color = "steelblue" if is_trig else "black"
-            ax.plot(
-                [x1, x2], [y1, y2],
-                color=color, linewidth=1.4, alpha=0.85, solid_capstyle="round",
+            mx = float(row[TR.MX]); my = float(row[TR.MY])
+            hdx = float(row[TR.HDX]); hdy = float(row[TR.HDY])
+            npx = float(row[TR.NPX]); npy = float(row[TR.NPY])
+            color = self.TRIGGER if row[TR.IS_TRIGGER] > 0.5 else self.TERRAIN
+            pygame.draw.line(
+                screen, color,
+                self._w2s(mx - hdx, my - hdy),
+                self._w2s(mx + hdx, my + hdy),
+                2,
             )
-            ax.plot(npx, npy, marker="o", markersize=2.5,
-                    color="deepskyblue", alpha=0.8)
+            pygame.draw.circle(screen, self.NEAREST, self._w2s(npx, npy), 2)
 
-            dbg = parse_terrain_debug(
-                self._last_terrain_debug[i]
-                if i < len(self._last_terrain_debug) else ""
-            )
-            # Label each collider once (seg_idx=0) to keep the plot readable;
-            # remaining segments share the group. Labels sit near the midpoint.
-            name = dbg.get("name", "")
-            seg_idx = dbg.get("seg_idx", "0")
-            if seg_idx == "0" and name and name not in seen_names:
-                seen_names.add(name)
-                flags = []
-                if dbg.get("layer_ignore") == "1": flags.append("layer!")
-                if dbg.get("pair_ignore") == "1": flags.append("pair!")
-                if is_trig: flags.append("trig")
-                label = f"{name} [{','.join(flags)}]" if flags else name
-                ax.text(
-                    mx, my, label,
-                    fontsize=6, color="black",
-                    bbox=dict(facecolor="lightgray", alpha=0.5, edgecolor="none", pad=1),
-                    verticalalignment="center", horizontalalignment="center",
-                )
-
-        # Combat hitboxes — colors encode the three behavioral flags:
-        #   red    = boss target (gives + takes + is_target)
-        #   orange = damageable enemy that's not the goal (gives + takes, no target)
-        #   magenta = pure projectile / hazard (gives, no takes)
-        #   green  = peaceful target (takes / target, no gives) — chests, exits, future
-        #   yellow = knight's own attack (no gives, no takes)
+        # Combat hitboxes — collect labels and draw after so text sits on top.
         c_hb = obs.combat_hb[0]
         c_mask = obs.combat_mask[0]
         c_kid = obs.combat_kind_ids[0]
         c_pid = obs.combat_parent_ids[0]
+        labels = []
         for i in range(len(c_mask)):
             if c_mask[i] < 0.5:
                 continue
             row = c_hb[i]
-            rx, ry, w, h = row[CB.REL_X], row[CB.REL_Y], row[CB.W], row[CB.H]
-            gives = row[CB.GIVES_DAMAGE]
-            takes = row[CB.TAKES_DAMAGE]
-            is_target = row[CB.IS_TARGET]
-            hp_raw = row[CB.HP_RAW]
-            hp_max_raw = row[CB.HP_MAX_RAW]
-            if is_target > 0.5:
-                color = "red"
-            elif gives > 0.5 and takes > 0.5:
-                color = "orange"
-            elif gives > 0.5:
-                color = "magenta"
-            elif takes > 0.5:
-                color = "green"
-            else:
-                color = "yellow"
-            rect = patches.Rectangle(
-                (rx - w / 2, ry - h / 2), w, h,
-                linewidth=2, edgecolor=color, facecolor=color, alpha=0.3,
+            rx = float(row[CB.REL_X]); ry = float(row[CB.REL_Y])
+            w = float(row[CB.W]); h = float(row[CB.H])
+            color = self._combat_color(
+                row[CB.GIVES_DAMAGE] > 0.5,
+                row[CB.TAKES_DAMAGE] > 0.5,
+                row[CB.IS_TARGET] > 0.5,
             )
-            ax.add_patch(rect)
+            rect = self._world_rect(rx, ry, w, h)
+            fill = pygame.Surface(rect.size, pygame.SRCALPHA)
+            fill.fill((*color, 90))
+            screen.blit(fill, rect.topleft)
+            pygame.draw.rect(screen, color, rect, 2)
 
-            # Kind+parent id label + raw HP if damageable, anchored to top-left of the box.
-            kid = int(c_kid[i])
-            pid = int(c_pid[i])
+            kid = int(c_kid[i]); pid = int(c_pid[i])
             if self.vocab is not None:
-                kname = self.vocab._i2s[kid] if 0 <= kid < len(self.vocab) else str(kid)
-                pname = self.vocab._i2s[pid] if 0 <= pid < len(self.vocab) else str(pid)
+                vlen = len(self.vocab)
+                kname = self.vocab._i2s[kid] if 0 <= kid < vlen else str(kid)
+                pname = self.vocab._i2s[pid] if 0 <= pid < vlen else str(pid)
                 label = f"{kname}<{pname}>" if pid > 0 else kname
             else:
                 label = f"{kid}<{pid}>" if pid > 0 else f"{kid}"
-            if takes > 0.5:
-                label += f" hp={int(hp_raw)}/{int(hp_max_raw)}"
-            ax.text(
-                rx - w / 2, ry + h / 2, label,
-                fontsize=7, color="black",
-                bbox=dict(facecolor=color, alpha=0.7, edgecolor="none", pad=1),
-                verticalalignment="bottom", horizontalalignment="left",
-            )
+            if row[CB.TAKES_DAMAGE] > 0.5:
+                label += f" hp={int(row[CB.HP_RAW])}/{int(row[CB.HP_MAX_RAW])}"
+            labels.append((rect.topleft, label, color))
 
         # Knight at origin
-        knight_rect = patches.Rectangle(
-            (-knight_w / 2, -knight_h / 2), knight_w, knight_h,
-            linewidth=2, edgecolor="blue", facecolor="cyan", alpha=0.5,
-        )
-        ax.add_patch(knight_rect)
+        kr = self._world_rect(0, 0, knight_w, knight_h)
+        kfill = pygame.Surface(kr.size, pygame.SRCALPHA)
+        kfill.fill((*self.KNIGHT_FILL, 130))
+        screen.blit(kfill, kr.topleft)
+        pygame.draw.rect(screen, self.KNIGHT_EDGE, kr, 2)
 
         # Velocity arrow
         if abs(vel_x) > 0.01 or abs(vel_y) > 0.01:
-            ax.arrow(0, 0, vel_x, vel_y, head_width=0.15, head_length=0.1,
-                     fc="blue", ec="blue", alpha=0.6)
+            pygame.draw.line(
+                screen, self.VEL,
+                self._w2s(0, 0), self._w2s(vel_x, vel_y), 2,
+            )
 
-        ax.set_title(
-            f"HP: {hp:.0f}  "
-            f"Combat: {int(c_mask.sum())}  Terrain: {int(t_mask.sum())}  "
+        # Combat labels on top
+        for (lx, ly), text, color in labels:
+            tsurf = self.font.render(text, True, self.TEXT)
+            bg = pygame.Surface((tsurf.get_width() + 4, tsurf.get_height() + 2), pygame.SRCALPHA)
+            bg.fill((*color, 200))
+            screen.blit(bg, (lx, ly - tsurf.get_height() - 2))
+            screen.blit(tsurf, (lx + 2, ly - tsurf.get_height() - 1))
+
+        # Title bar
+        title = (
+            f"HP: {hp:.0f}   "
+            f"Combat: {int(c_mask.sum())}   Terrain: {int(t_mask.sum())}   "
             f"Vel: ({vel_x:.1f}, {vel_y:.1f})"
         )
-        ax.set_aspect("equal")
-        ax.set_xlim(-100, 100)
-        ax.set_ylim(-50, 50)
-        ax.grid(True, alpha=0.3)
-        ax.axhline(y=0, color="blue", linewidth=0.5, alpha=0.3)
-        ax.axvline(x=0, color="blue", linewidth=0.5, alpha=0.3)
+        screen.blit(self.title_font.render(title, True, self.TEXT), (8, 6))
 
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.flush_events()
+        pygame.display.flip()
 
     def close(self):
-        plt.close(self.fig)
-
-    def _on_key(self, event):
-        if event.key == "s":
-            path = self.save_snapshot()
-            if path:
-                print(f"[viewer] snapshot saved: {path}")
-
-    def save_snapshot(self, path=None):
-        """Dump the last observation + terrain debug to a JSON file.
-        Returns the written path or None if there's nothing to save."""
-        if self._last_obs is None:
-            return None
-        os.makedirs(self._snapshot_dir, exist_ok=True)
-        if path is None:
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(self._snapshot_dir, f"snapshot_{ts}.json")
-
-        obs = self._last_obs
-        gs = obs.global_state[0]
-        payload: dict = {
-            "global_state": {
-                "vel_x": float(gs[GS.VEL_X]),
-                "vel_y": float(gs[GS.VEL_Y]),
-                "hp": float(gs[GS.HP]),
-                "soul": float(gs[GS.SOUL]),
-                "knight_w": float(gs[GS.KNIGHT_W]),
-                "knight_h": float(gs[GS.KNIGHT_H]),
-                "raw": [float(x) for x in gs],
-            },
-            "combat": [],
-            "terrain": [],
-        }
-
-        c_hb = obs.combat_hb[0]
-        c_mask = obs.combat_mask[0]
-        c_kid = obs.combat_kind_ids[0]
-        c_pid = obs.combat_parent_ids[0]
-        for i in range(len(c_mask)):
-            if c_mask[i] < 0.5:
-                continue
-            row = c_hb[i]
-            kid = int(c_kid[i])
-            pid = int(c_pid[i])
-            kname = self.vocab._i2s[kid] if (self.vocab is not None and 0 <= kid < len(self.vocab._i2s)) else str(kid)
-            pname = self.vocab._i2s[pid] if (self.vocab is not None and 0 <= pid < len(self.vocab._i2s)) else str(pid)
-            payload["combat"].append({
-                "kind": kname,
-                "parent": pname,
-                "rel_x": float(row[CB.REL_X]),
-                "rel_y": float(row[CB.REL_Y]),
-                "w": float(row[CB.W]),
-                "h": float(row[CB.H]),
-                "is_trigger": bool(row[CB.IS_TRIGGER] > 0.5),
-                "gives_damage": bool(row[CB.GIVES_DAMAGE] > 0.5),
-                "takes_damage": bool(row[CB.TAKES_DAMAGE] > 0.5),
-                "is_target": bool(row[CB.IS_TARGET] > 0.5),
-                "hp_raw": float(row[CB.HP_RAW]),
-            })
-
-        t_hb = obs.terrain_hb[0]
-        t_mask = obs.terrain_mask[0]
-        for i in range(len(t_mask)):
-            if t_mask[i] < 0.5:
-                continue
-            row = t_hb[i]
-            dbg = parse_terrain_debug(
-                self._last_terrain_debug[i]
-                if i < len(self._last_terrain_debug) else ""
-            )
-            payload["terrain"].append({
-                "mx": float(row[TR.MX]),
-                "my": float(row[TR.MY]),
-                "hdx": float(row[TR.HDX]),
-                "hdy": float(row[TR.HDY]),
-                "npx": float(row[TR.NPX]),
-                "npy": float(row[TR.NPY]),
-                "dist": float(row[TR.DIST]),
-                "is_trigger": bool(row[TR.IS_TRIGGER] > 0.5),
-                "debug": dbg,
-            })
-
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
-        return path
+        if self._closed:
+            return
+        self._closed = True
+        pygame.display.quit()
+        pygame.font.quit()

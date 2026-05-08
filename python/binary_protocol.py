@@ -147,7 +147,11 @@ def pop_last_diag():
 def unpack_step(data):
     """Unpack a step response.
     Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-             damage_landed, hits_taken, hp_healed, game_time, real_time, done).
+             damage_landed, hits_taken, hp_healed, game_time, real_time, done,
+             committed).
+    `committed`: True iff action[2] was overridden by the C#-side hard-commit
+    state machine this step. Python masks the action-head policy gradient on
+    these steps. Defaults to False if absent (older C# DLL).
     Diag fields are stashed in _last_diag — read via pop_last_diag()."""
     global _last_terrain_debug, _last_diag
     combat_hb, terrain_hb, gs, n_combat, offset = unpack_obs(data)
@@ -155,6 +159,8 @@ def unpack_step(data):
     damage_landed, hits_taken, game_time, real_time, hp_healed = struct.unpack_from('<fffff', data, offset)
     offset += 20
     done = data[offset] != 0
+    offset += 1
+    committed = data[offset] != 0
     offset += 1
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
     combat_parents, offset = unpack_kinds(data, offset, n_combat)
@@ -175,7 +181,8 @@ def unpack_step(data):
             "kind_cache_size": 0, "gc_heap_mb": 0.0,
         }
     return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-            damage_landed, hits_taken, hp_healed, game_time, real_time, done)
+            damage_landed, hits_taken, hp_healed, game_time, real_time, done,
+            committed)
 
 def unpack_reset(data):
     """Unpack a reset response.

@@ -139,7 +139,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
                 )
 
             (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-             damage, hits, _, _, done) = await env.step_eval(action_vec)
+             damage, hits, _, _, _, done, _) = await env.step_eval(action_vec)
 
             total_damage += damage
             total_hits += int(hits)
@@ -280,7 +280,7 @@ def get_action(agent, raw_obs, config, deterministic, hx, vocab):
         a_a = logits_a.argmax(-1).item()
         a_j = logits_j.argmax(-1).item()
     else:
-        actions, _, _, _, _, hx_new = agent.policy.get_action_and_value(
+        actions, _, _, _, _, hx_new, _, _ = agent.policy.get_action_and_value(
             obs_t, hx=hx_t
         )
         a_m = actions["movement"].item()

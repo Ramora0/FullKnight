@@ -78,8 +78,8 @@ class Config:
     # size differs, so D's wallclock behavior stays consistent.
     D_min: float = 0.01       # floor (0.01% boss HP per hit) — prevents reward blowup early
     D_initial: float = 2.0    # starting difficulty (% boss HP dealt per hit taken)
-    D_ema: float = 0.97       # smoothing at 8192-step epochs: D moves 3% toward new value per epoch
-    D_max_delta: float = 0.03 # max relative change per 8192-step epoch (3%)
+    D_ema: float = 0.95       # smoothing at 8192-step epochs: D moves 5% toward new value per epoch
+    D_max_delta: float = 0.05 # max relative change per 8192-step epoch (5%)
     D_window: int = 10        # rolling window size at 8192-step epochs (auto-widened for smaller rollouts)
 
     # Heal reward: coefficient for HP restored. Unscaled by D (like defense).
@@ -95,7 +95,6 @@ class Config:
     clip_eps: float = 0.2
     value_coeff: float = 0.5
     entropy_coeff: float = 0.02
-    max_value_loss: float = 10.0
     max_grad_norm: float = 0.5
     target_kl: float = 0.0
 
@@ -104,7 +103,7 @@ class Config:
     # Replaces the old epoch-based budget; makes LR annealing, save cadence,
     # and termination independent of wall-clock epoch size.
     total_env_steps: int = 18_000_000
-    total_steps_per_epoch: int = 256
+    total_steps_per_epoch: int = 1024
     batch_size: int = 128
     train_iters: int = 2
     anneal_lr: bool = True

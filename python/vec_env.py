@@ -98,7 +98,10 @@ class VecEnv:
                         only those envs are stepped and returned arrays are
                         sized len(active_indices). Defaults to all envs.
         Returns (Observation, damage_landed, hits_taken, hp_healed, done_flags,
+                 committed_flags,
                  step_game_times, step_real_times, step_wall_times, diag).
+        `committed_flags`: (N_active,) bool — True where the C# action decoder
+        overrode action[2] this step (hard-commit lock active).
         `diag` is a dict of (N_active,) arrays: enemy_count, attack_count,
         terrain_count, kind_cache_size, gc_heap_mb — from env.last_diag.
         All arrays aligned to active_indices ordering.
@@ -121,7 +124,7 @@ class VecEnv:
         results = [r for _, r in ordered]
         (combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists,
          damage_landed, hits_taken, hp_healed, step_game_times, step_real_times,
-         done_flags) = zip(*results)
+         done_flags, committed_flags) = zip(*results)
 
         obs = self._batch_observations(list(zip(
             combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists)))
@@ -129,6 +132,7 @@ class VecEnv:
         hits_taken = np.array(hits_taken, dtype=np.float32)
         hp_healed = np.array(hp_healed, dtype=np.float32)
         done_flags = np.array(done_flags, dtype=bool)
+        committed_flags = np.array(committed_flags, dtype=bool)
         step_game_times = np.array(step_game_times, dtype=np.float32)
         step_real_times = np.array(step_real_times, dtype=np.float32)
         # Collect diag in active_indices order. env.last_diag was set by
@@ -140,6 +144,7 @@ class VecEnv:
                       "kind_cache_size", "gc_heap_mb")
         }
         return (obs, damage_landed, hits_taken, hp_healed, done_flags,
+                committed_flags,
                 step_game_times, step_real_times, step_wall_times, diag)
 
     async def start_resets(self, reset_indices, levels=None, resume_indices=None):

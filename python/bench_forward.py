@@ -101,7 +101,7 @@ with torch.no_grad():
             terrain_mask=torch.from_numpy(np_obs.terrain_mask).float().to(device),
             global_state=torch.from_numpy(np_obs.global_state).float().to(device),
         )
-        actions, lp, _, va, vd, _ = model.get_action_and_value(gpu_obs)
+        actions, lp, _, va, vd, _, _, _ = model.get_action_and_value(gpu_obs)
         _ = {k: v.cpu().numpy() for k, v in actions.items()}
         _ = lp.cpu().numpy()
         _ = va.cpu().numpy()

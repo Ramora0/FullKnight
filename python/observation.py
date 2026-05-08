@@ -7,6 +7,7 @@ require touching every function signature in the repo.
 from dataclasses import dataclass, fields, replace
 from typing import Any, List
 import numpy as np
+import torch
 
 
 # ---------------------------------------------------------------------------
@@ -152,3 +153,44 @@ class Observation:
 
     def field_names(self) -> list:
         return [f.name for f in fields(self)]
+
+
+# ---------------------------------------------------------------------------
+# Horizontal-mirror augmentation. Hollow Knight is left/right symmetric, so
+# every (obs, action) pair has a valid mirror twin under x-axis negation —
+# free 2x data exposure in expectation when applied stochastically during
+# training.
+# ---------------------------------------------------------------------------
+
+def mirror_observation(obs: "Observation") -> "Observation":
+    """World x-axis flip on a torch-tensor Observation.
+
+    - global_state: vel_x flips; hp/soul/sizes/ability+validity flags pass through.
+    - combat: rel_x flips; size/flags/hp pass through. Masks/kind/parent ids unchanged.
+    - terrain: mx, npx flip (knight-relative). hdy flips iff hdx > 0 to keep
+      the canonical hdx ≥ 0 invariant after mirroring (geometrically the same
+      segment, just represented from the opposite endpoint). Padded rows
+      (hdx == 0, hdy == 0) stay zero.
+    """
+    gs = obs.global_state.clone()
+    gs[..., GS.VEL_X] = -gs[..., GS.VEL_X]
+
+    chb = obs.combat_hb.clone()
+    chb[..., CB.REL_X] = -chb[..., CB.REL_X]
+
+    thb = obs.terrain_hb.clone()
+    thb[..., TR.MX] = -thb[..., TR.MX]
+    thb[..., TR.NPX] = -thb[..., TR.NPX]
+    hdx = thb[..., TR.HDX]
+    thb[..., TR.HDY] = torch.where(hdx > 0, -thb[..., TR.HDY], thb[..., TR.HDY])
+
+    return obs.replace(
+        global_state=gs,
+        combat_hb=chb,
+        terrain_hb=thb,
+    )
+
+
+def mirror_movement(movement):
+    """Swap movement labels: 0 (left) ↔ 1 (right); 2 (none) unchanged."""
+    return torch.where(movement == 2, movement, 1 - movement)

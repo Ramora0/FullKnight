@@ -5,7 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 from model import FullKnightActorCritic
-from observation import Observation, CB
+from observation import Observation, CB, mirror_observation, mirror_movement
 
 
 class RunningNormalizer:
@@ -289,9 +289,8 @@ class PPO:
         h2d_end.record()
 
         fwd_start.record()
-        actions, log_prob, _, value_atk, value_def, hx_new = self.policy.get_action_and_value(
-            gpu_obs, hx=hx_t
-        )
+        (actions, log_prob, _, value_atk, value_def, hx_new,
+         log_prob_action, _) = self.policy.get_action_and_value(gpu_obs, hx=hx_t)
         fwd_end.record()
 
         hx_new_np = hx_new.cpu().numpy()
@@ -302,27 +301,44 @@ class PPO:
 
         d2h_start.record()
         actions_np = {k: v.cpu().numpy() for k, v in actions.items()}
-        result = actions_np, log_prob.cpu().numpy(), value_atk.cpu().numpy(), value_def.cpu().numpy()
+        result = (actions_np, log_prob.cpu().numpy(),
+                  log_prob_action.cpu().numpy(),
+                  value_atk.cpu().numpy(), value_def.cpu().numpy())
         d2h_end.record()
 
         self._event_log.append((h2d_start, h2d_end, fwd_start, fwd_end, d2h_start, d2h_end))
         return result
 
     def train_on_rollout(self, obs_buf, actions_arr, log_probs_arr,
+                         log_probs_action_arr,
                          damage_landed_arr, hits_taken_arr, hp_healed_arr,
                          values_atk_arr, values_def_arr, D_per_env, buf_hx,
-                         dones_arr=None):
+                         dones_arr=None, valid_arr=None, committed_arr=None):
         """Train on a collected rollout with chunked truncated BPTT.
 
         obs_buf: list of length T, each element a per-step Observation with
                  leading dim (N, ...). Combined into (T, N, ...) here.
         actions_arr: dict of (T, N) numpy arrays
-        log_probs_arr: (T, N)
+        log_probs_arr: (T, N) summed log_prob over all 4 action heads.
+        log_probs_action_arr: (T, N) action-head log_prob alone (subtracted
+                              out on hard-commit steps so the action-head
+                              gradient is zero — the agent didn't freely choose
+                              that action).
         damage_landed_arr, hits_taken_arr, hp_healed_arr: (T, N)
         values_atk_arr, values_def_arr: (T+1, N)
         D_per_env: (N,) per-env curriculum scaling factor (one D per boss assignment)
         buf_hx: (T, N, hidden_dim) GRU hidden states at each timestep
         dones_arr: (T, N) boolean array, True if episode ended at that step
+        valid_arr: (T, N) boolean array, True for steps that should contribute
+                   to the loss. Post-death filler steps (frozen all-zero obs
+                   between death and end-of-rollout reset) are masked out.
+                   None = all steps valid.
+        committed_arr: (T, N) boolean array, True iff action[2] was overridden
+                       by the C# hard-commit state machine on that step. The
+                       action head's policy-loss and entropy contributions are
+                       masked to zero on committed steps; movement/direction/
+                       jump heads remain free and contribute normally.
+                       None = no commits this rollout.
         """
         T, N = damage_landed_arr.shape
         cfg = self.config
@@ -359,14 +375,24 @@ class PPO:
             all_atk_returns[:, env_i] = atk_ret
             all_def_returns[:, env_i] = def_ret
 
+        if valid_arr is None:
+            valid_arr = np.ones((T, N), dtype=bool)
+        valid_bool = valid_arr.astype(bool)
+
         # Explained variance at rollout time: how well did the critic predict
         # returns using the values it produced during collection. Scale-free,
-        # so atk and def are directly comparable (unlike raw MSE).
-        def _ev(returns, values):
-            var = returns.var()
-            return float(1.0 - (returns - values).var() / var) if var > 1e-8 else 0.0
-        ev_atk = _ev(all_atk_returns, values_atk_arr[:T])
-        ev_def = _ev(all_def_returns, values_def_arr[:T])
+        # so atk and def are directly comparable (unlike raw MSE). Masked to
+        # exclude post-death zero-obs samples that bias both numerator and
+        # denominator toward 0.
+        def _ev(returns, values, mask):
+            r = returns[mask]
+            v = values[mask]
+            if r.size == 0:
+                return 0.0
+            var = r.var()
+            return float(1.0 - (r - v).var() / var) if var > 1e-8 else 0.0
+        ev_atk = _ev(all_atk_returns, values_atk_arr[:T], valid_bool)
+        ev_def = _ev(all_def_returns, values_def_arr[:T], valid_bool)
 
         # --- Chunk (T, N) arrays into (total_chunks, L) ---
         def chunk_tn(arr):
@@ -377,7 +403,12 @@ class PPO:
         atk_ret_chunks = chunk_tn(all_atk_returns)
         def_ret_chunks = chunk_tn(all_def_returns)
         lp_chunks = chunk_tn(log_probs_arr)
+        lp_a_chunks = chunk_tn(log_probs_action_arr)
         act_chunks = {k: chunk_tn(actions_arr[k]) for k in actions_arr}
+        valid_chunks = chunk_tn(valid_arr.astype(np.float32))
+        if committed_arr is None:
+            committed_arr = np.zeros((T, N), dtype=bool)
+        committed_chunks = chunk_tn(committed_arr.astype(np.float32))
 
         # Hidden states at chunk boundaries
         chunk_starts = np.arange(n_chunks_per_env) * L
@@ -439,10 +470,35 @@ class PPO:
         tm_chunks = chunk_obs(flat_tm)
         gs_chunks = chunk_obs(flat_gs)
 
-        # Normalize advantages
+        # Normalize advantages over valid samples only (filler-step advantages
+        # are degenerate small values that would shift the mean toward 0).
+        # Capture pre-normalization std as a diagnostic — tells you whether
+        # clip_eps is sized right for the current curriculum-scaled adv regime.
         flat_adv = adv_chunks.reshape(-1)
-        flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
+        flat_valid_np = valid_chunks.reshape(-1)
+        valid_count = float(flat_valid_np.sum())
+        adv_std_raw = 0.0
+        if valid_count > 1:
+            adv_mean = float((flat_adv * flat_valid_np).sum() / valid_count)
+            adv_var = float(((flat_adv - adv_mean) ** 2 * flat_valid_np).sum() / valid_count)
+            adv_std_raw = float(np.sqrt(adv_var))
+            flat_adv = (flat_adv - adv_mean) / (adv_std_raw + 1e-8)
         adv_chunks = flat_adv.reshape(total_chunks, L)
+
+        # Per-rollout return variance for scale-invariant value loss. atk and def
+        # returns differ by ~10x in magnitude; without normalization, atk MSE
+        # dominates the gradient and the (now-removed) max_value_loss clamp had
+        # to truncate the bulk of it. Computed once per rollout from valid
+        # samples; used as a fixed scalar across all minibatches so the loss is
+        # stable within the rollout. Floored with a small epsilon to stay sane
+        # if returns happen to be near-constant.
+        if valid_bool.any():
+            atk_var = float(all_atk_returns[valid_bool].var())
+            def_var = float(all_def_returns[valid_bool].var())
+        else:
+            atk_var = def_var = 0.0
+        atk_var_eff = atk_var + 1e-3
+        def_var_eff = def_var + 1e-3
 
         # Move to device — bundle into a single (total_chunks, L, ...) Observation
         # so the inner training loop can index obs_t[idx] in one shot.
@@ -459,8 +515,11 @@ class PPO:
         atk_ret_t = torch.from_numpy(atk_ret_chunks).float().to(self.device)
         def_ret_t = torch.from_numpy(def_ret_chunks).float().to(self.device)
         old_lp_t = torch.from_numpy(lp_chunks).float().to(self.device)
+        old_lp_a_t = torch.from_numpy(lp_a_chunks).float().to(self.device)
         act_t = {k: torch.from_numpy(v).long().to(self.device) for k, v in act_chunks.items()}
         hx_t = torch.from_numpy(hx_chunks).float().to(self.device)
+        valid_t = torch.from_numpy(valid_chunks).float().to(self.device)
+        committed_t = torch.from_numpy(committed_chunks).float().to(self.device)
 
         # --- Training loop: shuffle chunks, process in minibatches ---
         CPB = cfg.chunks_per_batch
@@ -493,33 +552,66 @@ class PPO:
                     terrain_mask=obs_t.terrain_mask[idx],
                     global_state=obs_t.global_state[idx],
                 )
-                new_lp, entropy, v_atk, v_def, gru_info = self.policy.forward_sequence(
-                    obs_mb, hx_mb, {k: v[idx] for k, v in act_t.items()},
+                act_mb = {k: v[idx] for k, v in act_t.items()}
+
+                # Horizontal-mirror augmentation (50% per minibatch). Flips
+                # x-axis obs fields and swaps movement left↔right; old log_probs
+                # are reused. The IS-ratio is exact when π_old is mirror-
+                # equivariant — and the augmentation itself drives the policy
+                # toward that equilibrium, so the approximation tightens during
+                # training. GRU initial hidden state is left un-mirrored (we
+                # don't have an equivariant permutation for it); the chunk
+                # length L absorbs that initial-state imperfection.
+                if np.random.rand() < 0.5:
+                    obs_mb = mirror_observation(obs_mb)
+                    act_mb["movement"] = mirror_movement(act_mb["movement"])
+
+                (new_lp, entropy, v_atk, v_def, gru_info,
+                 new_lp_a, ent_a) = self.policy.forward_sequence(
+                    obs_mb, hx_mb, act_mb,
                 )
 
                 # Flatten (B, L) -> (B*L,) for loss
                 new_lp_flat = new_lp.reshape(-1)
+                new_lp_a_flat = new_lp_a.reshape(-1)
                 entropy_flat = entropy.reshape(-1)
+                ent_a_flat = ent_a.reshape(-1)
                 v_atk_flat = v_atk.reshape(-1)
                 v_def_flat = v_def.reshape(-1)
                 adv_flat = adv_t[idx].reshape(-1)
                 atk_ret_flat = atk_ret_t[idx].reshape(-1)
                 def_ret_flat = def_ret_t[idx].reshape(-1)
                 old_lp_flat = old_lp_t[idx].reshape(-1)
+                old_lp_a_flat = old_lp_a_t[idx].reshape(-1)
+                valid_flat = valid_t[idx].reshape(-1)
+                committed_flat = committed_t[idx].reshape(-1)
+                valid_sum = valid_flat.sum().clamp(min=1.0)
 
-                log_ratio = new_lp_flat - old_lp_flat
+                # Hard-commit masking: on committed steps, the action head's
+                # log_prob and entropy contributions are subtracted out so the
+                # PPO ratio and entropy bonus are computed over m + d + j only.
+                # Movement/direction/jump heads stay free and get normal gradient.
+                new_lp_eff = new_lp_flat - committed_flat * new_lp_a_flat
+                old_lp_eff = old_lp_flat - committed_flat * old_lp_a_flat
+                entropy_eff = entropy_flat - committed_flat * ent_a_flat
+
+                log_ratio = new_lp_eff - old_lp_eff
                 ratio = torch.exp(log_ratio)
                 clipped = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps)
-                surrogate = -torch.min(ratio * adv_flat, clipped * adv_flat).mean()
+                surrogate_per = -torch.min(ratio * adv_flat, clipped * adv_flat)
+                surrogate = (surrogate_per * valid_flat).sum() / valid_sum
 
+                # Raw squared error for logging (dashboard continuity); the
+                # actual loss divides by per-head return variance so atk and
+                # def contribute equal magnitudes regardless of return scale.
                 atk_vloss = (v_atk_flat - atk_ret_flat).pow(2)
                 def_vloss = (v_def_flat - def_ret_flat).pow(2)
                 value_loss = (
-                    torch.clamp(atk_vloss, max=cfg.max_value_loss).mean()
-                    + torch.clamp(def_vloss, max=cfg.max_value_loss).mean()
+                    (atk_vloss * valid_flat).sum() / (valid_sum * atk_var_eff)
+                    + (def_vloss * valid_flat).sum() / (valid_sum * def_var_eff)
                 )
 
-                entropy_loss = -entropy_flat.mean()
+                entropy_loss = -(entropy_eff * valid_flat).sum() / valid_sum
 
                 loss = (
                     surrogate
@@ -534,15 +626,16 @@ class PPO:
 
                 n_updates += 1
                 total_metrics["surrogate"] += surrogate.item()
-                total_metrics["value_atk"] += atk_vloss.mean().item()
-                total_metrics["value_def"] += def_vloss.mean().item()
+                total_metrics["value_atk"] += ((atk_vloss * valid_flat).sum() / valid_sum).item()
+                total_metrics["value_def"] += ((def_vloss * valid_flat).sum() / valid_sum).item()
                 total_metrics["entropy"] += entropy_loss.item()
                 total_metrics["gru_norm"] += gru_info["gru_norm"]
 
                 with torch.no_grad():
-                    kl = ((ratio - 1) - log_ratio).mean().item()
-                    total_metrics["kl"] += kl
-                    iter_kl_sum += kl
+                    kl = (((ratio - 1) - log_ratio) * valid_flat).sum() / valid_sum
+                    kl_val = kl.item()
+                    total_metrics["kl"] += kl_val
+                    iter_kl_sum += kl_val
                     iter_kl_n += 1
 
                 passes_done += len(idx) * L
@@ -565,6 +658,9 @@ class PPO:
         out["ev_atk"] = ev_atk
         out["ev_def"] = ev_def
         out["pass_frac"] = passes_done / max(total_passes, 1)
+        out["adv_std_raw"] = adv_std_raw
+        out["atk_return_var"] = atk_var
+        out["def_return_var"] = def_var
         return out
 
     def set_lr(self, lr: float):

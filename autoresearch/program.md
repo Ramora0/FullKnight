@@ -54,7 +54,7 @@ bash autoresearch/run_experiment.sh
 - **`gae_lambda`** — current 0.95. Safe to perturb; trades variance vs bias in the advantage estimate.
 - **`batch_size`**, **`chunks_per_batch`**, **`seq_len`**, **`train_iters`** — all safe mid-run. With 8192 steps/epoch and batch_size 128, that's a specific sample-reuse ratio; try wider ranges.
 - **`frames_per_wait`** — current 5. Boss attacks are fast; this is on the table if you have a specific hypothesis, but it changes the effective time horizon so watch KL carefully.
-- **`max_grad_norm`**, **`target_kl`**, **`value_coeff`**, **`max_value_loss`** — all safe mid-run.
+- **`max_grad_norm`**, **`target_kl`**, **`value_coeff`** — all safe mid-run.
 
 **The goal is simple: get the highest `final_D_geomean`** (geomean of per-boss D over the last 20 epochs). Fixed time budget + same resume point = experiments are directly comparable. D is the adaptive curriculum scale — it converges to damage_landed/hits_taken — so a higher geomean across the boss pool means the policy is doing better per hit taken on average across bosses.
 

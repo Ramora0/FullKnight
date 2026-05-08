@@ -47,16 +47,19 @@ class HKEnv:
     async def step(self, action_vec):
         """Take a step. action_vec = [movement, direction, action, jump].
         Returns (combat_hb, terrain_hb, global_state, combat_kinds, combat_parents,
-                 damage_landed, hits_taken, hp_healed, step_game_time, step_real_time, done).
+                 damage_landed, hits_taken, hp_healed, step_game_time, step_real_time, done,
+                 committed).
         """
         await self.ws.send(pack_action(action_vec))
         data = await self.ws.recv()
         (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-         damage_landed, hits_taken, hp_healed, game_time, real_time, done) = unpack_step(data)
+         damage_landed, hits_taken, hp_healed, game_time, real_time, done,
+         committed) = unpack_step(data)
         self.last_terrain_debug = pop_last_terrain_debug()
         self.last_diag = pop_last_diag()
         return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-                damage_landed, hits_taken, hp_healed, game_time, real_time, done)
+                damage_landed, hits_taken, hp_healed, game_time, real_time, done,
+                committed)
 
     async def step_eval(self, action_vec):
         """Like step() but also returns done flag. For eval mode."""

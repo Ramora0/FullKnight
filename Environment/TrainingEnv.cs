@@ -26,6 +26,10 @@ namespace FullKnight.Environment
 		private bool _bossDied;
 		private bool _episodeDone;
 		private string _episodeResult;
+		// Set during synthetic suicide (Reset path) so OnKnightDamaged skips
+		// the hit-taken counter — otherwise the forced kill would inject a
+		// phantom -1 hit penalty into the next step's reward.
+		private bool _syntheticKill;
 		// Set of HealthManagers considered the "true target(s)" for is_target and
 		// reward. Populated from BossSceneController.bosses on each reset; used by
 		// HitboxObserver.GetSplitFeatures to flag which combat hitboxes the agent
@@ -96,6 +100,13 @@ namespace FullKnight.Environment
 			_hitsTakenInStep = 0;
 			_damageLandedInStep = 0;
 			_hpHealedInStep = 0;
+			// Capture episode-end flags before clearing — the suicide-vs-wait
+			// branch below depends on whether this reset follows a natural end
+			// (boss death = win, knight death = loss) or a mid-fight cut. Note:
+			// reading PlayerData.instance.health here is unreliable, since HK's
+			// death sequence may have already restored HP between the death step
+			// and the time Reset() arrives.
+			bool naturalEnd = _bossDied || _episodeResult == "loss";
 			_bossDied = false;
 			_episodeDone = false;
 			_episodeResult = null;
@@ -107,15 +118,54 @@ namespace FullKnight.Environment
 			// Release any inputs held over from the previous episode before the
 			// scene transition unfreezes time — otherwise a stuck "left" or "jump"
 			// runs the knight for the entire transition + intro-skip window.
-			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 });
+			// Also clear any hard-commit lock left over from a mid-charge death.
+			_inputShim.ResetCommit();
+			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 },
+				_frameSkipCount, _timeScaleValue);
 
 			// Unpause so scene transition and WaitForSeconds can proceed
 			Time.timeScale = _timeScaleValue;
 
-			// If a natural death transition is still in flight — knight or boss
-			// just died and HK is auto-returning to GG_Workshop — let it settle
-			// before we fire our own scene load. LoadBossScene then sees we're
-			// already in GG_Workshop and skips the bounce.
+			// Three paths out of the boss arena:
+			//  (a) Already out — death/win cleanup landed before reset arrived.
+			//      Nothing to wait for.
+			//  (b) Natural end (win or loss) — HK's own DoDreamReturn / death
+			//      transition is queued and time just resumed, so it's about to
+			//      run. We don't care WHERE it sends the knight (boss-complete
+			//      can land in a non-Workshop scene like a pantheon completion
+			//      room); we just need them out of the arena before LoadBossScene
+			//      fires. Wait for the scene to change away from preScene; the
+			//      LoadBossScene bounce handles getting back to GG_Workshop from
+			//      wherever HK dropped us. Suiciding here would race the queued
+			//      natural transition and corrupt state — that was the original
+			//      "boss killed but never re-entered arena" bug.
+			//  (c) Mid-fight (step-budget reset on a live knight + live boss) —
+			//      yanking that state into a new scene leaves FSMs / HUD
+			//      inconsistent. Force a synthetic suicide so HK's natural death
+			//      cleanup brings us home cleanly.
+			var preScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+			if (preScene == "GG_Workshop")
+			{
+				// Cleanup already landed; nothing to wait for.
+				LogBossDiag($"reset#{_resetCount} ALREADY-IN-WORKSHOP");
+			}
+			else if (naturalEnd)
+			{
+				LogBossDiag($"reset#{_resetCount} NATURAL-END WAIT (in {preScene})");
+				yield return WaitForSceneChange(preScene);
+				var afterScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+				LogBossDiag($"reset#{_resetCount} NATURAL-END DONE (now in {afterScene})");
+			}
+			else
+			{
+				LogBossDiag($"reset#{_resetCount} PRE-SUICIDE (alive in {preScene})");
+				yield return KillKnight();
+				LogBossDiag($"reset#{_resetCount} POST-SUICIDE");
+			}
+
+			// Let any in-flight transition (the one that just left the arena, or
+			// any post-load scene wiring) settle before LoadBossScene kicks off
+			// our own. LoadBossScene then bounces through GG_Workshop if needed.
 			yield return new WaitForFinishedEnteringScene();
 
 			yield return SceneHooks.LoadBossScene(_level);
@@ -178,7 +228,9 @@ namespace FullKnight.Environment
 
 			Time.timeScale = _timeScaleValue;
 
-			ActionDecoder.ApplyAction(_inputShim, data.action_vec);
+			bool committedThisStep = ActionDecoder.ApplyAction(
+				_inputShim, data.action_vec, _frameSkipCount, _timeScaleValue);
+			data.action_committed = committedThisStep;
 
 			// Track HP at step start for heal detection
 			_knightHpAtStepStart = PlayerData.instance.health;
@@ -465,23 +517,24 @@ namespace FullKnight.Environment
 
 		private void HookDamage()
 		{
-			ModHooks.TakeDamageHook += OnKnightDamaged;
+			ModHooks.AfterTakeDamageHook += OnKnightDamaged;
 			On.HealthManager.TakeDamage += OnBossDamaged;
 		}
 
 		private void UnhookDamage()
 		{
-			ModHooks.TakeDamageHook -= OnKnightDamaged;
+			ModHooks.AfterTakeDamageHook -= OnKnightDamaged;
 			On.HealthManager.TakeDamage -= OnBossDamaged;
 		}
 
-		// TakeDamageHook (before): return value replaces the damage the game
-		// will apply. AfterTakeDamageHook (what we used before) fires post-HP
-		// subtraction and re-applies its return as additional damage, which
-		// doubled every hit once the training HP clamp was removed.
-		private int OnKnightDamaged(ref int hazardType, int damage)
+		// AfterTakeDamageHook fires past HeroController.TakeDamage's iframe
+		// short-circuit, so it only ticks on hits that actually land — using
+		// TakeDamageHook here counted iframe-blocked contacts and inflated
+		// hits_taken ~16×, wrecking the reward signal. Return value replaces
+		// the applied damage; pass `damage` through unchanged.
+		private int OnKnightDamaged(int damageType, int damage)
 		{
-			_hitsTakenInStep++;
+			if (!_syntheticKill) _hitsTakenInStep++;
 			return damage;
 		}
 
@@ -515,6 +568,57 @@ namespace FullKnight.Environment
 					if (hm.hp > 0) { allDead = false; break; }
 				}
 				if (allDead) _bossDied = true;
+			}
+		}
+
+		// Force-kill the knight via HK's natural damage path. Step-budget resets
+		// fire mid-fight on a live knight + live boss; yanking that into a new
+		// scene leaves FSM coroutines / HUD bindings in inconsistent states
+		// (missing healthbar, stuck-on-ceiling boss). Riding the death sequence
+		// gives HK its blessed cleanup: death anim → DreamReturn → GG_Workshop.
+		// The _syntheticKill guard suppresses hit-counter inflation in
+		// OnKnightDamaged for both this fatal hit and any incidental damage
+		// during the death animation.
+		private IEnumerator KillKnight()
+		{
+			_syntheticKill = true;
+			HeroController.instance.TakeDamage(
+				HeroController.instance.gameObject,
+				GlobalEnums.CollisionSide.other,
+				9999, 0);
+			int timeoutFrames = 2000;
+			while (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name != "GG_Workshop"
+				&& --timeoutFrames > 0)
+			{
+				yield return null;
+			}
+			if (timeoutFrames <= 0)
+			{
+				Log($"KillKnight: TIMEOUT waiting for GG_Workshop "
+					+ $"(still in {UnityEngine.SceneManagement.SceneManager.GetActiveScene().name})");
+			}
+			yield return new WaitForFinishedEnteringScene();
+			_syntheticKill = false;
+		}
+
+		// Wait for HK's natural end-of-episode transition (boss-complete
+		// DoDreamReturn on a win, hero-death dream return on a loss) to leave
+		// the current arena. Destination-agnostic: boss-complete can land us in
+		// a non-Workshop scene (pantheon completion rooms etc.), and we don't
+		// need to know which — LoadBossScene will bounce through Workshop from
+		// wherever HK puts us. We just need to be out of `fromScene` so our
+		// scene load doesn't race the queued natural transition.
+		private IEnumerator WaitForSceneChange(string fromScene)
+		{
+			int timeoutFrames = 5000;
+			while (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == fromScene
+				&& --timeoutFrames > 0)
+			{
+				yield return null;
+			}
+			if (timeoutFrames <= 0)
+			{
+				Log($"WaitForSceneChange: TIMEOUT (still in {fromScene})");
 			}
 		}
 

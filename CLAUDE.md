@@ -45,9 +45,10 @@ The Python side is the **server**. Each game instance connects as a client. `Vec
 
 ### Observation Space
 
-- **Hitboxes** (variable-length sets): Each hitbox is `[rel_x, rel_y, width, height, is_trigger]` relative to the knight. Split into combat (enemy + attack colliders) and terrain. Padded and masked for batching.
-- **Global state** (22 floats): `[vel_x, vel_y, hp, soul, knight_w, knight_h, has_dash, has_wall_jump, has_double_jump, has_super_dash, has_dream_nail, has_acid_armour, has_nail_art, can_jump, can_double_jump, can_wall_jump, can_dash, can_attack, can_cast, can_nail_charge, can_dream_nail, can_super_dash]`. Boss HP is no longer global; it lives per-hitbox in the `hp_raw` column of combat features.
-- **Combat hitbox features** (9 floats): `[rel_x, rel_y, w, h, is_trigger, gives_damage, takes_damage, is_target, hp_raw]` plus parallel kind/parent vocab IDs. `gives_damage`=hurts knight on contact, `takes_damage`=has reachable HealthManager (can be attacked), `is_target`=its HealthManager is in `BossSceneController.bosses` (the canonical objective). `hp_raw` is the HealthManager's current HP, raw — intentionally excluded from the running normalizer so the agent reads absolute "1-2 nail hits from death" vs "beefy" semantics.
+- **Hitboxes** (variable-length sets): Split into combat (enemy + attack colliders) and terrain, each padded and masked for batching. Combat and terrain have different feature layouts (see below).
+- **Global state** (22 floats): `[vel_x, vel_y, hp, soul, knight_w, knight_h, has_dash, has_wall_jump, has_double_jump, has_super_dash, has_dream_nail, has_acid_armour, has_nail_art, can_jump, can_double_jump, can_wall_jump, can_dash, can_attack, can_cast, can_nail_charge, can_dream_nail, can_super_dash]`. Boss HP is not global; it lives per-hitbox in the `hp_raw` / `hp_max_raw` columns of combat features.
+- **Combat hitbox features** (10 floats): `[rel_x, rel_y, w, h, is_trigger, gives_damage, takes_damage, is_target, hp_raw, hp_max_raw]` plus parallel kind/parent vocab IDs. `gives_damage`=hurts knight on contact, `takes_damage`=has reachable HealthManager (can be attacked), `is_target`=its HealthManager is in `BossSceneController.bosses` (the canonical objective). `hp_raw` / `hp_max_raw` bypass the running normalizer and get log1p-compressed instead — preserves high resolution near death while keeping the input range bounded (~[0, 8]).
+- **Terrain hitbox features** (8 floats): `[mx, my, hdx, hdy, npx, npy, dist, is_trigger]` — midpoint, half-extent, nearest-point, and distance from knight. Composite-absorbed colliders are skipped to avoid double-counting.
 
 ### Action Space (Factored)
 
@@ -72,7 +73,7 @@ The GRU provides temporal memory across timesteps. Hidden state flows during rol
 
 ### Key C# Components
 
-- `TrainingEnv`: Main environment loop. Handles reset/step/pause/resume. Computes reward: step penalty + damage dealt fraction − damage taken fraction + win/loss bonuses. Auto-resets on episode end.
+- `TrainingEnv`: Main environment loop. Handles reset/step/pause/resume. Reports per-step reward signals to Python — `damage_landed` (% of boss max HP dealt), `hits_taken` (integer hit count), `hp_healed` (raw HP restored). Reward is computed Python-side as `δ_attack/D − hits_taken + heal_coef·hp_healed` (`ppo.py:131`); no terminal win/loss bonus. Auto-resets on episode end (knight death or boss death).
 - `ProxyController.cs` (`InputDeviceShim` + `ActionDecoder`): Virtual InControl device that injects actions. Checks `Can*` methods before applying actions.
 - `HitboxObserver`: Tracks all active Collider2Ds via `HitboxReader` MonoBehaviour, classifies into Knight/Enemy/Attack/Terrain.
 - `TimeScale`: IL-hooks `GameManager.FreezeMoment*` coroutines and shims `SetTimeScale` to maintain configurable game speed.
@@ -85,7 +86,9 @@ Windows-only. Creates junction-linked copies of the HK game directory to run N i
 
 ### Environment
 
-Instead of training discretely on beating a boss, we train on an infinite boss game where the boss and player never die. Since the terminal state of a boss dying is just the sum of per step rewards, actually killing the boss isn't informative; its the progressive damage given vs taken thats the real, immediate reward signal.
+Episodes are real: both knight and boss have real HP and can actually die. Episode end (`done=True`) fires on either death, the env auto-resets, and Python's GAE bootstraps value to 0 at the boundary.
+
+The reward shape, however, is intentionally non-terminal: there is no +1/-1 win/loss bonus. The signal is purely the per-step `δ_attack/D − hits_taken + heal_coef·hp_healed`. Rationale: the original episodic design with terminal rewards was reward-exploited (under discounting, idling beat dying, so the agent hid in a corner). The dense per-step damage signal encodes the actual objective without that pathology. `D` is a per-epoch adaptive scale measured from rollouts, not a hyperparameter to tune. `heal_coef = 0.65` makes a hit-then-heal sequence net to −0.35 instead of −1, creating a dodge > heal > tank ordering.
 
 ## Config
 

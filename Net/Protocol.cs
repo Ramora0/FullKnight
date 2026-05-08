@@ -57,5 +57,11 @@ namespace FullKnight.Net
 
 		// Action (Python -> C#)
 		public int[] action_vec;
+
+		// True iff action[2] was overridden by the hard-commit state machine
+		// this step. Python masks the action-head's policy gradient on these
+		// steps (the agent didn't make a free choice; movement/direction/jump
+		// stay free and get normal gradient).
+		public bool? action_committed;
 	}
 }

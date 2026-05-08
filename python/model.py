@@ -229,7 +229,12 @@ class FullKnightActorCritic(nn.Module):
 
         actions: dict with keys 'movement', 'direction', 'action', 'jump',
                  each (B,) LongTensor.
-        Returns: actions_dict, log_prob (B,), entropy (B,), value_atk (B,), value_def (B,), hx_new (B, hidden_dim)
+        Returns: actions_dict, log_prob (B,), entropy (B,), value_atk (B,),
+                 value_def (B,), hx_new (B, hidden_dim),
+                 log_prob_action (B,), entropy_action (B,).
+        log_prob_action / entropy_action are the action-head's contributions
+        alone — the caller subtracts them from the total on hard-commit steps
+        (where action[2] was overridden by the env).
         """
         h, hx_new = self._encode(obs, hx)
 
@@ -257,19 +262,14 @@ class FullKnightActorCritic(nn.Module):
             a_a = actions["action"]
             a_j = actions["jump"]
 
-        log_prob = (
-            dist_m.log_prob(a_m)
-            + dist_d.log_prob(a_d)
-            + dist_a.log_prob(a_a)
-            + dist_j.log_prob(a_j)
-        )
+        lp_m = dist_m.log_prob(a_m)
+        lp_d = dist_d.log_prob(a_d)
+        lp_a = dist_a.log_prob(a_a)
+        lp_j = dist_j.log_prob(a_j)
+        log_prob = lp_m + lp_d + lp_a + lp_j
 
-        entropy = (
-            dist_m.entropy()
-            + dist_d.entropy()
-            + dist_a.entropy()
-            + dist_j.entropy()
-        )
+        ent_a = dist_a.entropy()
+        entropy = dist_m.entropy() + dist_d.entropy() + ent_a + dist_j.entropy()
 
         value_atk = self.critic_attack(h).squeeze(-1)
         value_def = self.critic_defense(h).squeeze(-1)
@@ -280,7 +280,7 @@ class FullKnightActorCritic(nn.Module):
             "action": a_a,
             "jump": a_j,
         }
-        return actions_dict, log_prob, entropy, value_atk, value_def, hx_new
+        return actions_dict, log_prob, entropy, value_atk, value_def, hx_new, lp_a, ent_a
 
     def forward_sequence(self, obs: Observation, hx, actions):
         """Truncated BPTT over a chunk of L timesteps.
@@ -345,15 +345,17 @@ class FullKnightActorCritic(nn.Module):
         flat_a_a = actions["action"].reshape(-1)
         flat_a_j = actions["jump"].reshape(-1)
 
+        lp_a_flat = dist_a.log_prob(flat_a_a)
         log_prob_flat = (
             dist_m.log_prob(flat_a_m)
             + dist_d.log_prob(flat_a_d)
-            + dist_a.log_prob(flat_a_a)
+            + lp_a_flat
             + dist_j.log_prob(flat_a_j)
         )
+        ent_a_flat = dist_a.entropy()
         entropy_flat = (
             dist_m.entropy() + dist_d.entropy()
-            + dist_a.entropy() + dist_j.entropy()
+            + ent_a_flat + dist_j.entropy()
         )
         v_atk_flat = self.critic_attack(flat_features).squeeze(-1)
         v_def_flat = self.critic_defense(flat_features).squeeze(-1)
@@ -362,7 +364,10 @@ class FullKnightActorCritic(nn.Module):
         entropies = entropy_flat.view(B, L)
         values_atk = v_atk_flat.view(B, L)
         values_def = v_def_flat.view(B, L)
+        log_probs_action = lp_a_flat.view(B, L)
+        entropies_action = ent_a_flat.view(B, L)
 
         gru_info = {'gru_norm': gru_seq.detach().norm(dim=-1).mean().item()}
 
-        return log_probs, entropies, values_atk, values_def, gru_info
+        return (log_probs, entropies, values_atk, values_def, gru_info,
+                log_probs_action, entropies_action)

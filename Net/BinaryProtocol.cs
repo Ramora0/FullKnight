@@ -67,6 +67,7 @@ namespace FullKnight.Net
 					w.Write(d.step_real_time ?? 0f);
 					w.Write(d.hp_healed ?? 0f);
 					w.Write(d.done == true ? (byte)1 : (byte)0);
+					w.Write(d.action_committed == true ? (byte)1 : (byte)0);
 				}
 
 				// Combat kind strings: one per combat hitbox, in the same order.

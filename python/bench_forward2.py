@@ -54,7 +54,7 @@ with torch.no_grad():
 
 print("\n=== Test 2: Pre-allocated, fixed shape, WITH .cpu().numpy() sync each call ===")
 def test2():
-    actions, lp, _, va, vd, _ = model.get_action_and_value(obs)
+    actions, lp, _, va, vd, _, _, _ = model.get_action_and_value(obs)
     {k: v.cpu().numpy() for k, v in actions.items()}
     lp.cpu().numpy()
     va.cpu().numpy()
@@ -90,7 +90,7 @@ def numpy_to_gpu_obs(o):
 
 def test3():
     gpu_obs = numpy_to_gpu_obs(np_obs)
-    actions, lp, _, va, vd, _ = model.get_action_and_value(gpu_obs)
+    actions, lp, _, va, vd, _, _, _ = model.get_action_and_value(gpu_obs)
     {k: v.cpu().numpy() for k, v in actions.items()}
     lp.cpu().numpy()
     va.cpu().numpy()
@@ -124,7 +124,7 @@ def test4():
     o = make_numpy_obs(call_idx[0])
     call_idx[0] += 1
     gpu_obs = numpy_to_gpu_obs(o)
-    actions, lp, _, va, vd, _ = model.get_action_and_value(gpu_obs)
+    actions, lp, _, va, vd, _, _, _ = model.get_action_and_value(gpu_obs)
     {k: v.cpu().numpy() for k, v in actions.items()}
     lp.cpu().numpy()
     va.cpu().numpy()
@@ -141,7 +141,7 @@ def test5_iter():
     o = make_numpy_obs(call_idx[0])
     call_idx[0] += 1
     gpu_obs = numpy_to_gpu_obs(o)
-    actions, lp, _, va, vd, _ = model.get_action_and_value(gpu_obs)
+    actions, lp, _, va, vd, _, _, _ = model.get_action_and_value(gpu_obs)
     {k: v.cpu().numpy() for k, v in actions.items()}
     lp.cpu().numpy()
     va.cpu().numpy()
@@ -161,7 +161,7 @@ with torch.no_grad():
         o = make_numpy_obs(i)
         gpu_obs = numpy_to_gpu_obs(o)
         s.record()
-        actions, lp, _, va, vd, _ = model.get_action_and_value(gpu_obs)
+        actions, lp, _, va, vd, _, _, _ = model.get_action_and_value(gpu_obs)
         e.record()
         {k: v.cpu().numpy() for k, v in actions.items()}
         lp.cpu().numpy()

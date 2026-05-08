@@ -207,12 +207,14 @@ async def train(config: Config):
             buf_obs = []  # list of per-step Observations
             buf_actions = {k: [] for k in ["movement", "direction", "action", "jump"]}
             buf_log_probs = []
+            buf_log_probs_action = []  # action-head log_prob alone, for hard-commit masking
             buf_values_atk = []
             buf_values_def = []
             buf_damage_landed = []
             buf_hits_taken = []
             buf_hp_healed = []
             buf_dones = []
+            buf_committed = []  # bool, action[2] overridden by C# hard-commit state machine
             buf_hx = []
             buf_step_game_times = []
             buf_step_real_times = []
@@ -231,7 +233,8 @@ async def train(config: Config):
 
             for t in range(config.rollout_len):
                 buf_hx.append(agent.get_hx_snapshot(env_indices=active_envs))
-                actions_np, log_probs, values_atk, values_def = agent.collect_action(
+                (actions_np, log_probs, log_probs_action,
+                 values_atk, values_def) = agent.collect_action(
                     obs, env_indices=active_envs
                 )
 
@@ -247,6 +250,7 @@ async def train(config: Config):
 
                 t_step = time.perf_counter()
                 (next_obs, damage_landed, hits_taken, hp_healed, done_flags,
+                 committed_flags,
                  step_game_times, step_real_times,
                  step_wall_per_env, diag) = await vec_env.step_all(
                     action_vecs, active_indices=active_envs
@@ -257,12 +261,14 @@ async def train(config: Config):
                 for k in buf_actions:
                     buf_actions[k].append(actions_np[k])
                 buf_log_probs.append(log_probs)
+                buf_log_probs_action.append(log_probs_action)
                 buf_values_atk.append(values_atk)
                 buf_values_def.append(values_def)
                 buf_damage_landed.append(damage_landed)
                 buf_hits_taken.append(hits_taken)
                 buf_hp_healed.append(hp_healed)
                 buf_dones.append(done_flags)
+                buf_committed.append(committed_flags)
                 buf_step_game_times.append(step_game_times)
                 buf_step_real_times.append(step_real_times)
                 buf_step_wall_times.append(step_wall_per_env)
@@ -278,7 +284,7 @@ async def train(config: Config):
                     vis.update(obs)
 
             # Bootstrap final values
-            _, _, final_vatk, final_vdef = agent.collect_action(
+            _, _, _, final_vatk, final_vdef = agent.collect_action(
                 obs, env_indices=active_envs
             )
             buf_values_atk.append(final_vatk)
@@ -293,7 +299,9 @@ async def train(config: Config):
             hits_taken_arr = np.stack(buf_hits_taken)
             hp_healed_arr = np.stack(buf_hp_healed)
             dones_arr = np.stack(buf_dones)
+            committed_arr = np.stack(buf_committed)  # (T, N) bool
             log_probs_arr = np.stack(buf_log_probs)
+            log_probs_action_arr = np.stack(buf_log_probs_action)
             values_atk_arr = np.stack(buf_values_atk)
             values_def_arr = np.stack(buf_values_def)
             actions_arr = {k: np.stack(v) for k, v in buf_actions.items()}
@@ -480,6 +488,8 @@ async def train(config: Config):
             # currently-active envs this epoch contribute; bosses with no
             # active envs (e.g. only assigned to a currently-resetting env)
             # are left untouched.
+            d_ideal_epoch = {}
+            d_ideal_window = {}
             for boss in set(active_boss):
                 env_mask = np.array([b == boss for b in active_boss])
                 landed_b = float(damage_landed_arr[:, env_mask].sum())
@@ -489,6 +499,11 @@ async def train(config: Config):
                 bs["taken_window"].append(taken_b)
                 window_landed = sum(bs["landed_window"])
                 window_taken = sum(bs["taken_window"])
+                # D_ideal = the value D would take if it tracked perfectly
+                # this epoch (or this window). Logged as a target for the
+                # adaptive update; the gap D_ideal - D is the curriculum lag.
+                d_ideal_epoch[boss] = (landed_b / taken_b) if taken_b > 0 else float("nan")
+                d_ideal_window[boss] = (window_landed / window_taken) if window_taken > 0 else float("nan")
 
                 if window_landed > 0 and window_taken > 0:
                     # Normal case: EMA toward the raw ratio, clamped.
@@ -530,12 +545,22 @@ async def train(config: Config):
             torch.cuda.synchronize()
             inf_timing = agent.report_timing()
 
+            # Mask post-death filler from training. Once an env reports done
+            # mid-rollout, every subsequent step is a frozen all-zeros obs
+            # (TrainingEnv.cs:209-224) until the end-of-epoch reset. The death
+            # step itself is valid — it carries the real terminal transition.
+            prev_dones = np.concatenate(
+                [np.zeros((1, dones_arr.shape[1]), dtype=bool), dones_arr[:-1]],
+                axis=0,
+            )
+            valid_arr = ~prev_dones  # (T, N_active)
+
             t0 = time.perf_counter()
             metrics = agent.train_on_rollout(
-                buf_obs, actions_arr, log_probs_arr,
+                buf_obs, actions_arr, log_probs_arr, log_probs_action_arr,
                 damage_landed_arr, hits_taken_arr, hp_healed_arr,
                 values_atk_arr, values_def_arr, D_per_env, buf_hx_arr,
-                dones_arr,
+                dones_arr, valid_arr, committed_arr,
             )
             torch.cuda.synchronize()
             t_train = time.perf_counter() - t0
@@ -612,7 +637,7 @@ async def train(config: Config):
             balanced_taken = float(np.mean(per_boss_taken_mean))
             balanced_healed = float(np.mean(per_boss_healed_mean))
             # Episode stats
-            n_deaths = int(dones_arr.sum())
+            n_deaths = int(dones_arr.any(axis=0).sum())
             log = {
                 "loss/surrogate": metrics["surrogate"],
                 "loss/value_atk": metrics["value_atk"],
@@ -620,6 +645,9 @@ async def train(config: Config):
                 "metrics/ev_atk": metrics["ev_atk"],
                 "metrics/ev_def": metrics["ev_def"],
                 "metrics/pass_frac": metrics["pass_frac"],
+                "metrics/adv_std_raw": metrics["adv_std_raw"],
+                "metrics/atk_return_var": metrics["atk_return_var"],
+                "metrics/def_return_var": metrics["def_return_var"],
                 "loss/entropy": metrics["entropy"],
                 "metrics/kl": metrics["kl"],
                 "metrics/lr": agent.optimizer.param_groups[0]["lr"],
@@ -630,6 +658,7 @@ async def train(config: Config):
                 "rollout/hits_taken": balanced_taken,
                 "rollout/hp_healed": balanced_healed,
                 "rollout/deaths": n_deaths,
+                "diag/committed_frac": float(committed_arr.mean()),
                 "diag/active_step_pct": 100 * active_steps / total_steps_epoch,
                 "diag/first_event_avg": np.mean(first_event_steps),
                 "diag/step0_ms": step0_ms,
@@ -668,6 +697,10 @@ async def train(config: Config):
                 log[f"perf/per_boss_step_ms/{boss}"] = ms
             for boss in bosses:
                 log[f"curriculum/D/{boss}"] = boss_state[boss]["D"]
+                if boss in d_ideal_epoch and not np.isnan(d_ideal_epoch[boss]):
+                    log[f"curriculum/D_ideal_epoch/{boss}"] = d_ideal_epoch[boss]
+                if boss in d_ideal_window and not np.isnan(d_ideal_window[boss]):
+                    log[f"curriculum/D_ideal_window/{boss}"] = d_ideal_window[boss]
                 log[f"diag/slow_cum/{boss}"] = slow_count_by_boss.get(boss, 0)
             for env_i in range(config.n_envs):
                 log[f"diag/slow_cum_env/{env_i}"] = slow_count_by_env[env_i]

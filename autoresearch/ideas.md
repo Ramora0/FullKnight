@@ -67,7 +67,7 @@ Effective batch = chunks_per_batch × seq_len = 8 × 16 = 128 samples.
 - seq_len 8 or 32: BPTT window; affects credit assignment through the GRU
 
 ### value_coeff 0.5 → 0.25 / 1.0
-Critic-vs-actor loss weighting. `max_value_loss` similarly.
+Critic-vs-actor loss weighting.
 
 ### max_grad_norm 0.5 → 1.0 / 0.25
 Gradient clipping for numerical stability.

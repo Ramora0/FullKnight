@@ -1,0 +1,27 @@
+Spawning 8 HK instance(s)...
+Cleaning up instances...
+Traceback (most recent call last):
+  File "C:\Users\Lee\coding\CSharp\HK\FullKnight\python\train.py", line 755, in <module>
+    main()
+  File "C:\Users\Lee\coding\CSharp\HK\FullKnight\python\train.py", line 751, in main
+    asyncio.run(train(config))
+  File "C:\Users\Lee\AppData\Roaming\uv\python\cpython-3.12.2-windows-x86_64-none\Lib\asyncio\runners.py", line 194, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Lee\AppData\Roaming\uv\python\cpython-3.12.2-windows-x86_64-none\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Lee\AppData\Roaming\uv\python\cpython-3.12.2-windows-x86_64-none\Lib\asyncio\base_events.py", line 685, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\Lee\coding\CSharp\HK\FullKnight\python\train.py", line 95, in train
+    await vec_env.start_server()
+  File "C:\Users\Lee\coding\CSharp\HK\FullKnight\python\vec_env.py", line 32, in start_server
+    self._server = await websockets.serve(
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Lee\coding\CSharp\HK\FullKnight\.venv\Lib\site-packages\websockets\asyncio\server.py", line 847, in __await_impl__
+    server = await self.create_server
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Lee\AppData\Roaming\uv\python\cpython-3.12.2-windows-x86_64-none\Lib\asyncio\base_events.py", line 1570, in create_server
+    raise OSError(err.errno, msg) from None
+OSError: [Errno 10048] error while attempting to bind on address ('::1', 8765, 0, 0): only one usage of each socket address (protocol/network address/port) is normally permitted
