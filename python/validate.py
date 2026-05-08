@@ -131,6 +131,30 @@ def _stats(r):
     rt = np.asarray(r.get("rtime_samples", []), dtype=np.float64)
     rt_mean = rt.mean() * 1000 if rt.size else float("nan")
     rt_p95 = np.percentile(rt, 95) * 1000 if rt.size else float("nan")
+    # Game time per agent step — what the AGENT sees per decision. With
+    # captureDeltaTime mode this is fixed; without, it's frames_per_wait
+    # × Time.deltaTime per frame and varies with FPS.
+    gt = np.asarray(r.get("gtime_samples", []), dtype=np.float64)
+    gt_mean = gt.mean() if gt.size else float("nan")
+
+    # Two sim_pct denominators, both useful and not the same:
+    #   sim_pct_inner = mean(rt) / mean(wt) × 100
+    #     wt = step_wall_times: Python's perf_counter for `await env.step()`
+    #     This matches train.py's perf/sim_pct (line 404) and tells you "of
+    #     the time inside step_all, how much was HK frame loop". Doesn't
+    #     count Python forward / reset / loop-overhead between calls.
+    #   sim_pct_total = mean(rt) / (total_wallclock / steps_done) × 100
+    #     Includes everything (resets, agent forward, loop overhead). Bigger
+    #     denominator → smaller fraction. The metric for "how dominant is
+    #     sim in the WHOLE run".
+    wt = np.asarray(r.get("wtime_samples", []), dtype=np.float64)
+    wt_mean = wt.mean() * 1000 if wt.size else float("nan")  # ms
+
+    steps_done = r.get("steps_done", 0)
+    wall = r.get("wall", 0.0)
+    per_step_wallclock_ms = (wall / steps_done * 1000) if steps_done else float("nan")
+    sim_pct_inner = (rt_mean / wt_mean * 100) if (rt_mean and wt_mean) else float("nan")
+    sim_pct_total = (rt_mean / per_step_wallclock_ms * 100) if (rt_mean and per_step_wallclock_ms) else float("nan")
 
     cpu_samples = r.get("cpu_samples", [])[1:]  # drop primer
     proc_sum = 0.0
@@ -167,12 +191,63 @@ def _stats(r):
     else:
         gc_mean = gc_growth = 0.0
 
+    # Phase-attribution timers from extended_eval. Each is total wall over
+    # the run divided by steps_done — gives per-iter ms for that phase.
+    # Residual = per_step_wallclock - (action+step+postproc+done+pbar). Should
+    # be small if instrumentation is exhaustive (asyncio sleep(0), gc, etc.).
+    pt = r.get("phase_timers", {})
+    if steps_done > 0 and pt:
+        t_action_ms = pt.get("t_action_s", 0.0) / steps_done * 1000
+        t_step_ms = pt.get("t_step_s", 0.0) / steps_done * 1000
+        t_postproc_ms = pt.get("t_postproc_s", 0.0) / steps_done * 1000
+        t_done_ms = pt.get("t_done_s", 0.0) / steps_done * 1000
+        t_pbar_ms = pt.get("t_pbar_s", 0.0) / steps_done * 1000
+        t_residual_ms = max(0.0,
+            per_step_wallclock_ms
+            - (t_action_ms + t_step_ms + t_postproc_ms + t_done_ms + t_pbar_ms))
+        n_resets_total = int(pt.get("n_resets", 0))
+        # Per-reset wallclock: total time spent in done-handling / n_resets.
+        # Resets are wallclock-expensive (1-3s in HK); this surfaces it.
+        reset_mean_ms = (pt.get("t_done_s", 0.0) / n_resets_total * 1000) \
+                        if n_resets_total else 0.0
+    else:
+        t_action_ms = t_step_ms = t_postproc_ms = 0.0
+        t_done_ms = t_pbar_ms = t_residual_ms = 0.0
+        n_resets_total = 0
+        reset_mean_ms = 0.0
+
+    # PPO collect_action breakdown — CUDA event sums (seconds) + CPU prep wall.
+    # Convert to per-call (per loop iter, not per env-step) ms. count is the
+    # number of collect_action calls = steps_done.
+    pp = r.get("ppo_timing", {})
+    if pp and pp.get("count", 0):
+        c = pp["count"]
+        ppo_norm_ms = pp.get("normalize_s", 0.0) / c * 1000
+        ppo_prep_ms = pp.get("tensor_prep_s", 0.0) / c * 1000
+        ppo_h2d_ms = pp.get("h2d_s", 0.0) / c * 1000
+        ppo_fwd_ms = pp.get("forward_s", 0.0) / c * 1000
+        ppo_d2h_ms = pp.get("d2h_s", 0.0) / c * 1000
+    else:
+        ppo_norm_ms = ppo_prep_ms = ppo_h2d_ms = ppo_fwd_ms = ppo_d2h_ms = 0.0
+
     return dict(rt_mean=rt_mean, rt_p95=rt_p95,
+                gt_mean=gt_mean,
+                wt_mean=wt_mean,
+                per_step_wallclock_ms=per_step_wallclock_ms,
+                sim_pct_inner=sim_pct_inner,
+                sim_pct_total=sim_pct_total,
                 proc_sum=proc_sum, sat=sat,
                 sys_mean=sys_mean, sys_peak=sys_peak,
                 ram_init=ram_init, ram_final=ram_final, ram_mean=ram_mean,
                 ram_growth=ram_final - ram_init,
-                gc_mean=gc_mean, gc_growth=gc_growth)
+                gc_mean=gc_mean, gc_growth=gc_growth,
+                t_action_ms=t_action_ms, t_step_ms=t_step_ms,
+                t_postproc_ms=t_postproc_ms, t_done_ms=t_done_ms,
+                t_pbar_ms=t_pbar_ms, t_residual_ms=t_residual_ms,
+                n_resets=n_resets_total, reset_mean_ms=reset_mean_ms,
+                ppo_norm_ms=ppo_norm_ms, ppo_prep_ms=ppo_prep_ms,
+                ppo_h2d_ms=ppo_h2d_ms, ppo_fwd_ms=ppo_fwd_ms,
+                ppo_d2h_ms=ppo_d2h_ms)
 
 
 def _print_throughput(r, n_envs):
@@ -233,6 +308,11 @@ def _print_summary_block(quality, throughput, throughput_n):
     print(f"throughput_wall_s:  {wall:.1f}")
     print(f"rtime_mean_ms:      {s['rt_mean']:.4f}")
     print(f"rtime_p95_ms:       {s['rt_p95']:.4f}")
+    print(f"gtime_mean_s:       {s['gt_mean']:.6f}")
+    print(f"wtime_mean_ms:      {s['wt_mean']:.4f}")
+    print(f"per_step_wall_ms:   {s['per_step_wallclock_ms']:.4f}")
+    print(f"sim_pct_inner:      {s['sim_pct_inner']:.2f}")
+    print(f"sim_pct_total:      {s['sim_pct_total']:.2f}")
     print(f"cpu_hk_sum_pct:     {s['proc_sum']:.2f}")
     print(f"cpu_machine_sat:    {s['sat']:.2f}")
     print(f"cpu_system_mean:    {s['sys_mean']:.2f}")
@@ -242,6 +322,27 @@ def _print_summary_block(quality, throughput, throughput_n):
     print(f"ram_growth_mb:      {s['ram_growth']:.0f}")
     print(f"gc_heap_mean_mb:    {s['gc_mean']:.2f}")
     print(f"gc_heap_growth_mb:  {s['gc_growth']:.2f}")
+    # Phase-attribution diagnostic — partitions the per-step wallclock into
+    # the components of the rollout loop. Sum should ≈ per_step_wall_ms;
+    # t_residual_ms is whatever's left after the named phases (asyncio
+    # scheduling, gc.collect, sleep(0), import-time stuff). Tells us where
+    # the gap between wtime_mean (inside `await env.step`) and per_step_wall
+    # (full loop) actually goes.
+    print(f"t_action_ms:        {s['t_action_ms']:.4f}")
+    print(f"t_step_ms:          {s['t_step_ms']:.4f}")
+    print(f"t_postproc_ms:      {s['t_postproc_ms']:.4f}")
+    print(f"t_done_ms:          {s['t_done_ms']:.4f}")
+    print(f"t_pbar_ms:          {s['t_pbar_ms']:.4f}")
+    print(f"t_residual_ms:      {s['t_residual_ms']:.4f}")
+    print(f"n_resets:           {s['n_resets']}")
+    print(f"reset_mean_ms:      {s['reset_mean_ms']:.1f}")
+    # PPO collect_action breakdown — per-call ms within t_action.
+    # normalize/tensor_prep are CPU wall; h2d/forward/d2h are CUDA event sums.
+    print(f"ppo_normalize_ms:   {s['ppo_norm_ms']:.4f}")
+    print(f"ppo_tensor_prep_ms: {s['ppo_prep_ms']:.4f}")
+    print(f"ppo_h2d_ms:         {s['ppo_h2d_ms']:.4f}")
+    print(f"ppo_forward_ms:     {s['ppo_fwd_ms']:.4f}")
+    print(f"ppo_d2h_ms:         {s['ppo_d2h_ms']:.4f}")
 
 
 def main():

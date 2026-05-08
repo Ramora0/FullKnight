@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time as _time
 import numpy as np
+import psutil
 import torch
 import websockets
 from tqdm import tqdm
@@ -293,7 +294,7 @@ def _print_run_summary(label, results):
 
 
 def _print_comparison(label_a, results_a, label_b, results_b):
-    """Bootstrap diff CI: positive diff = B - A. If 0 not in CI → significant."""
+    """Bootstrap diff CI: positive diff = B - A. If 0 not in CI -> significant."""
     def _per_ep_rates(r):
         return ([d / s for d, s in zip(r["ep_dmg"], r["ep_steps"]) if s > 0],
                 [h / s for h, s in zip(r["ep_hits"], r["ep_steps"]) if s > 0])
@@ -307,8 +308,8 @@ def _print_comparison(label_a, results_a, label_b, results_b):
 
     print()
     print(f"{'=' * 70}")
-    print(f"  COMPARISON: ({label_b}) − ({label_a})")
-    print(f"  Positive = B is larger. 95% CI excluding 0 → significant.")
+    print(f"  COMPARISON: ({label_b}) - ({label_a})")
+    print(f"  Positive = B is larger. 95% CI excluding 0 -> significant.")
     print(f"{'-' * 70}")
     if len(dmg_a) < 2 or len(dmg_b) < 2:
         print(f"  Insufficient episodes (A={len(dmg_a)}, B={len(dmg_b)}). Rerun with more steps.")
@@ -322,8 +323,8 @@ def _print_comparison(label_a, results_a, label_b, results_b):
         ("per-episode hits/step  ", hps_a, hps_b),
     ]:
         diff, lo, hi = _bootstrap_diff_ci(a, b)
-        sig = "★ SIGNIFICANT" if (lo > 0 or hi < 0) else "  ns"
-        print(f"  {name}  Δ={diff:+.5f}  95% CI [{lo:+.5f}, {hi:+.5f}]   {sig}")
+        sig = "* SIGNIFICANT" if (lo > 0 or hi < 0) else "  ns"
+        print(f"  {name}  d={diff:+.5f}  95% CI [{lo:+.5f}, {hi:+.5f}]   {sig}")
     print(f"{'=' * 70}")
 
 
@@ -397,6 +398,57 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
     # effective decision rate for the same model.
     gtime_samples = []
     rtime_samples = []
+    # Per-env Python-side wallclock for `await env.step(action)`. Mirrors
+    # train.py's avg_wall_ms denominator so sim_pct lines up across modes.
+    wtime_samples = []
+    # Phase-attribution timers — every step of the main loop is partitioned
+    # into these phases so we can see where the gap between wtime_mean and
+    # per_step_wall_ms goes. All in seconds, summed across the whole run.
+    # NOTE: t_step is the wallclock for `await vec_env.step_all(...)` itself
+    # (one number per loop iter, ~max(wtime) under asyncio.gather), distinct
+    # from wtime which is per-env step duration inside step_all.
+    t_action_total = 0.0       # agent.collect_action + action_vec build
+    t_step_total = 0.0         # await vec_env.step_all(...)
+    t_postproc_total = 0.0     # totals/buffers/perf-sample bookkeeping
+    t_done_total = 0.0         # done-handling: reset gather + merge + hx reset
+    t_pbar_total = 0.0         # tqdm.update + set_postfix (not free at 32 step/s × 8)
+    n_resets = 0               # number of (env, done) events processed
+    # HK process RSS + CPU% sampled every PERF_SAMPLE_PERIOD steps. RAM is a
+    # single Win32 syscall (~10us); cpu_percent(interval=None) returns the
+    # delta since the last call, so we prime once before stepping and then
+    # sample at regular intervals — each sample reports CPU% averaged over
+    # the elapsed window. Off the hot path.
+    ram_samples = []
+    cpu_samples = []  # (step, [pct_per_proc, ...], system_pct)
+    gc_heap_samples = []  # (step, total_mono_gc_heap_mb_summed_across_envs)
+    PERF_SAMPLE_PERIOD = 32
+    cpu_total = psutil.cpu_count(logical=True) * 100  # 100% per logical core
+    hk_procs = []  # psutil.Process handles, primed for cpu_percent
+    if mgr is not None:
+        for p in mgr._procs:
+            try:
+                pp = psutil.Process(p.pid)
+                pp.cpu_percent(interval=None)  # prime
+                hk_procs.append((p, pp))
+            except Exception:
+                pass
+    psutil.cpu_percent(interval=None)  # prime system
+
+    def _sample_perf(step_idx):
+        total_rss = 0
+        per_proc_cpu = []
+        for popen, pp in hk_procs:
+            try:
+                if popen.poll() is None:
+                    total_rss += pp.memory_info().rss
+                    per_proc_cpu.append(pp.cpu_percent(interval=None))
+            except Exception:
+                pass
+        sys_cpu = psutil.cpu_percent(interval=None)
+        ram_samples.append((step_idx, total_rss / (1024 ** 2)))
+        cpu_samples.append((step_idx, per_proc_cpu, sys_cpu))
+
+    _sample_perf(-1)  # baseline (cpu values from this sample are 0 — primer)
 
     print(f"[{label}] Running {n_steps} steps per env ({n_steps * n_envs} total)...", flush=True)
     # Snapshot existing tasks so we can identify (and cancel) only the ones
@@ -410,6 +462,7 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
 
     try:
         for step in range(n_steps):
+            ta0 = _time.perf_counter()
             if no_agent:
                 action_vecs = [[2, 2, 7, 1] for _ in range(n_envs)]
             else:
@@ -421,9 +474,13 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
                      int(actions_np["jump"][i])]
                     for i in range(n_envs)
                 ]
+            ta1 = _time.perf_counter()
+            t_action_total += ta1 - ta0
 
             (next_obs, damage, hits, hp_healed, done_flags,
              committed, gtimes, rtimes, wtimes, diag) = await vec_env.step_all(action_vecs)
+            ts1 = _time.perf_counter()
+            t_step_total += ts1 - ta1
 
             total_damage += damage
             total_hits += hits.astype(np.int64)
@@ -432,9 +489,17 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
             running_steps += 1
             gtime_samples.extend(gtimes.tolist())
             rtime_samples.extend(rtimes.tolist())
+            wtime_samples.extend(wtimes.tolist())
+            if step % PERF_SAMPLE_PERIOD == 0 or step == n_steps - 1:
+                _sample_perf(step)
+                gc_heap_samples.append(
+                    (step, float(diag["gc_heap_mb"].sum())))
+            tp1 = _time.perf_counter()
+            t_postproc_total += tp1 - ts1
 
             if done_flags.any():
                 done_indices = np.where(done_flags)[0].tolist()
+                n_resets += len(done_indices)
                 for ei in done_indices:
                     ep_dmg.append(float(running_dmg[ei]))
                     ep_hits.append(int(running_hits[ei]))
@@ -450,6 +515,8 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
                 next_obs = merge_obs_padded(next_obs, reset_batch, done_indices)
                 if not no_agent:
                     agent.reset_hidden_for(done_indices)
+            td1 = _time.perf_counter()
+            t_done_total += td1 - tp1
 
             obs = next_obs
 
@@ -459,6 +526,7 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
                 "hits": int(total_hits.sum()),
                 "eps": len(ep_dmg),
             })
+            t_pbar_total += _time.perf_counter() - td1
 
     except KeyboardInterrupt:
         print(f"\n[{label}] Interrupted.")
@@ -514,6 +582,19 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
         # Yield once so cancellations propagate before we return.
         await asyncio.sleep(0)
 
+    # Pull PPO collect_action breakdown (CUDA event timers + CPU prep wall).
+    # report_timing() returns sums in seconds; clears the internal log so a
+    # second call would only see new data. We call it once here at end-of-run.
+    if not no_agent and agent is not None:
+        # Sync to make sure CUDA events are realized before we read elapsed_time.
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        ppo_timing = agent.report_timing() or {}
+    else:
+        ppo_timing = {}
+
     return {
         "label": label,
         "n_envs": n_envs,
@@ -527,6 +608,20 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
         "ep_steps": ep_steps,
         "gtime_samples": gtime_samples,
         "rtime_samples": rtime_samples,
+        "wtime_samples": wtime_samples,
+        "ram_samples": ram_samples,
+        "cpu_samples": cpu_samples,
+        "cpu_total": cpu_total,
+        "gc_heap_samples": gc_heap_samples,
+        "phase_timers": {
+            "t_action_s": t_action_total,
+            "t_step_s": t_step_total,
+            "t_postproc_s": t_postproc_total,
+            "t_done_s": t_done_total,
+            "t_pbar_s": t_pbar_total,
+            "n_resets": n_resets,
+        },
+        "ppo_timing": ppo_timing,
     }
 
 
