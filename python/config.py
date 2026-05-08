@@ -116,6 +116,13 @@ class Config:
     train_iters: int = 2
     anneal_lr: bool = True
     save_every_steps: int = 51_200
+    # How often to hard-kill and relaunch every HK instance during training.
+    # Patches the long-running env-state exploitation observed across multi-hour
+    # runs (the policy starts to depend on accumulated FSM/cache/heap state
+    # that doesn't exist on fresh launches; D inflates and doesn't transfer).
+    # All instances restart synchronously at the same epoch boundary; cost is
+    # ~30s of training pause every cadence. 0 disables.
+    hard_restart_every_epochs: int = 1200
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
 
