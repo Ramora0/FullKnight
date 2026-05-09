@@ -15,6 +15,24 @@ namespace FullKnight.Game
 	{
 		private float timeScale;
 
+		/// <summary>
+		/// In-place multiplier swap — avoids the cost of disposing and recreating
+		/// the IL hooks (each ctor reflection-walks GameManager.FreezeMoment*
+		/// methods and installs a MonoMod ILHook per coroutine, ~50–100ms).
+		/// Used by the reset path to crank to 20× and back to baseline without
+		/// the per-reset hook-install overhead.
+		/// </summary>
+		public void SetMultiplier(float newScale)
+		{
+			this.timeScale = newScale;
+			// Push the new product through TimeController so HK's actual
+			// Time.timeScale reflects it immediately. GenericTimeScale=1 ×
+			// our 4-factor product effectively makes our shim's multiplier
+			// the authoritative scale (HK's other 3 factors are pinned to 1).
+			TimeController.GenericTimeScale = 1f;
+			Time.timeScale = newScale;
+		}
+
 		public TimeScale(float TimeScale = 1f)
 		{
 			this.timeScale = TimeScale;

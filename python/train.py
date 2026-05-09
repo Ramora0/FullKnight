@@ -70,6 +70,84 @@ def seed_everything(seed: int):
         torch.backends.cudnn.benchmark = False
 
 
+def _print_diag_summary(diag):
+    """Print the aggregated wallclock breakdown collected over diag_epochs.
+
+    Layout: per-epoch averages first (so values are comparable to the
+    `timing |` log line you've been reading), then a percentage column
+    for "where did time go". Reset cost is reported separately because
+    it overlaps with rollout/train and isn't part of the epoch budget.
+    """
+    n = max(1, diag["epochs"])
+    epoch_s = diag["epoch_s"] / n
+    pct = lambda x: 100.0 * x / diag["epoch_s"] if diag["epoch_s"] > 0 else 0.0
+    ms = lambda x: 1000.0 * x / n
+    print()
+    print("=" * 78)
+    print(f"  TRAIN DIAGNOSTIC ({diag['epochs']} epochs, "
+          f"{diag['epoch_s']:.1f}s wallclock, {epoch_s:.2f}s/epoch avg)")
+    print("=" * 78)
+    print(f"  utilization: {diag['active_steps']}/{diag['total_steps']} env-steps "
+          f"({100*diag['active_steps']/max(diag['total_steps'],1):.1f}% — rest dropped to resets)")
+    print()
+    print(f"  rollout       {ms(diag['rollout_s']):8.1f} ms/epoch  ({pct(diag['rollout_s']):5.1f}%)")
+    print(f"    hk (sim)    {ms(diag['hk_s']):8.1f} ms/epoch  ({pct(diag['hk_s']):5.1f}%)")
+    print(f"    collect     {ms(diag['collect_s']):8.1f} ms/epoch  ({pct(diag['collect_s']):5.1f}%)")
+    print(f"      norm      {ms(diag['norm_s']):8.1f} ms/epoch  ({pct(diag['norm_s']):5.1f}%)")
+    print(f"      prep      {ms(diag['prep_s']):8.1f} ms/epoch  ({pct(diag['prep_s']):5.1f}%)")
+    print(f"      h2d       {ms(diag['h2d_s']):8.1f} ms/epoch  ({pct(diag['h2d_s']):5.1f}%)")
+    print(f"      fwd       {ms(diag['fwd_s']):8.1f} ms/epoch  ({pct(diag['fwd_s']):5.1f}%)")
+    print(f"      d2h       {ms(diag['d2h_s']):8.1f} ms/epoch  ({pct(diag['d2h_s']):5.1f}%)")
+    print(f"  train         {ms(diag['train_s']):8.1f} ms/epoch  ({pct(diag['train_s']):5.1f}%)")
+    print(f"    gae         {ms(diag['tr_gae_s']):8.1f} ms/epoch  ({pct(diag['tr_gae_s']):5.1f}%)")
+    print(f"    normalize   {ms(diag['tr_normalize_s']):8.1f} ms/epoch  ({pct(diag['tr_normalize_s']):5.1f}%)")
+    print(f"    h2d         {ms(diag['tr_h2d_s']):8.1f} ms/epoch  ({pct(diag['tr_h2d_s']):5.1f}%)")
+    print(f"    train_loop  {ms(diag['tr_train_loop_s']):8.1f} ms/epoch  ({pct(diag['tr_train_loop_s']):5.1f}%)")
+    print(f"      forward   {ms(diag['tr_forward_seq_s']):8.1f} ms/epoch  "
+          f"({pct(diag['tr_forward_seq_s']):5.1f}%)  [cuda time, GPU-only]")
+    print(f"      bwd+optim {ms(diag['tr_backward_optim_s']):8.1f} ms/epoch  "
+          f"({pct(diag['tr_backward_optim_s']):5.1f}%)  [cuda time, GPU-only]")
+    print()
+    print(f"  resets (background, overlapped with rollout/train):")
+    if diag["reset_count"] > 0:
+        rc = diag["reset_count"]
+        avg_reset_ms = 1000.0 * diag["reset_wallclock_sum_s"] / rc
+        per_epoch_reset_ms = 1000.0 * diag["reset_wallclock_sum_s"] / n
+        print(f"    count       {rc} ({rc/n:.2f}/epoch)")
+        print(f"    avg dur     {avg_reset_ms:.1f} ms/reset")
+        print(f"    sum/epoch   {per_epoch_reset_ms:.1f} ms/epoch ({pct(diag['reset_wallclock_sum_s']):.1f}% of total)")
+        # Branch distribution — tells us whether suicide-vs-natural-end is
+        # responsible for the bulk of resets, since they have very different
+        # transition_out costs.
+        bc = diag["reset_branch_counts"]
+        print(f"    branches    workshop={bc.get('workshop',0)} "
+              f"natural_end={bc.get('natural_end',0)} suicide={bc.get('suicide',0)}"
+              + (f" unknown={bc['unknown']}" if bc.get('unknown', 0) else ""))
+        # Per-phase breakdown of the average reset. Sum of phase rows should
+        # be close to avg dur (small residual = wire round-trip + scheduler
+        # latency outside the C# coroutine).
+        print(f"    phase breakdown (avg ms / reset, % of avg dur, frames, ms/f):")
+        phases = diag["reset_phase_sums_ms"]
+        frames = diag.get("reset_phase_sums_frames", {})
+        phase_total = 0.0
+        for phase in ("pre_unload", "transition_out", "settle",
+                      "load_boss_scene", "recreate_reader",
+                      "init_boss_refs", "obs_final"):
+            ms_val = phases.get(phase, 0.0) / rc
+            f_val = frames.get(phase, 0.0) / rc
+            ms_per_frame = ms_val / f_val if f_val > 0 else 0.0
+            phase_pct = 100.0 * ms_val / avg_reset_ms if avg_reset_ms > 0 else 0.0
+            phase_total += ms_val
+            print(f"      {phase:<18s} {ms_val:8.1f} ms  ({phase_pct:5.1f}%)  "
+                  f"{f_val:6.1f}f  {ms_per_frame:5.1f}ms/f")
+        residual_ms = avg_reset_ms - phase_total
+        residual_pct = 100.0 * residual_ms / avg_reset_ms if avg_reset_ms > 0 else 0.0
+        print(f"      {'(wire+scheduler)':<18s} {residual_ms:8.1f} ms  ({residual_pct:5.1f}%)")
+    else:
+        print(f"    none completed during diagnostic window")
+    print("=" * 78)
+
+
 async def hard_restart_all(vec_env, mgr, env_boss, agent, graphical=False):
     """Synchronously kill and relaunch every HK instance, then reset to bosses.
 
@@ -199,6 +277,42 @@ async def train(config: Config):
         time_budget = config.time_budget
         t_start = time.perf_counter()
         recent = deque(maxlen=20)
+
+        # Diagnostic mode aggregator: when config.diag_epochs > 0, accumulate
+        # per-epoch wallclock breakdowns and exit with a summary after that
+        # many epochs. Tracks rollout/train/reset phases so we can pinpoint
+        # the next bottleneck.
+        train_diag = {
+            "rollout_s": 0.0, "train_s": 0.0, "epoch_s": 0.0,
+            "collect_s": 0.0, "hk_s": 0.0,
+            "norm_s": 0.0, "prep_s": 0.0, "h2d_s": 0.0,
+            "fwd_s": 0.0, "d2h_s": 0.0,
+            "tr_gae_s": 0.0, "tr_normalize_s": 0.0, "tr_h2d_s": 0.0,
+            "tr_train_loop_s": 0.0,
+            "tr_forward_seq_s": 0.0, "tr_backward_optim_s": 0.0,
+            "reset_count": 0, "reset_wallclock_sum_s": 0.0,
+            # Per-phase ms sums across all reaped resets. Keys mirror
+            # binary_protocol.RESET_PHASE_NAMES; "branch_<name>" keys count
+            # how many resets took each branch (workshop/natural_end/suicide).
+            "reset_phase_sums_ms": {
+                "pre_unload": 0.0, "transition_out": 0.0, "settle": 0.0,
+                "load_boss_scene": 0.0, "recreate_reader": 0.0,
+                "init_boss_refs": 0.0, "obs_final": 0.0,
+            },
+            # Parallel frame counts per phase. Combined with ms it tells us
+            # whether 4s in transition_out is many normal frames (~5 ms/f
+            # × 800 frames) or a few stalled frames (~1000 ms/f × 4 frames).
+            "reset_phase_sums_frames": {
+                "pre_unload": 0.0, "transition_out": 0.0, "settle": 0.0,
+                "load_boss_scene": 0.0, "recreate_reader": 0.0,
+                "init_boss_refs": 0.0, "obs_final": 0.0,
+            },
+            "reset_branch_counts": {
+                "workshop": 0, "natural_end": 0, "suicide": 0, "unknown": 0,
+            },
+            "active_steps": 0, "total_steps": 0,
+            "epochs": 0,
+        } if config.diag_epochs > 0 else None
 
         # Slow-step bookkeeping: any per-env step whose wall time exceeds
         # `slow_step_threshold_s` is counted against the (env, boss) pair it
@@ -481,11 +595,18 @@ async def train(config: Config):
             # stays bounded even when rollout << reset.
             steps_since_last_reset += total_steps_epoch
             reset_indices = []
-            while steps_since_last_reset >= config.steps_per_reset:
-                steps_since_last_reset -= config.steps_per_reset
-                for _ in range(envs_per_reset):
-                    reset_indices.append(next_reset_env)
-                    next_reset_env = (next_reset_env + 1) % config.n_envs
+            # Staggered anti-drift resets are gated on steps_per_reset > 0.
+            # In the current high-D regime (knight dies often), natural
+            # episode endings are frequent enough that every env naturally
+            # resets within a couple epochs anyway, so the staggered cadence
+            # was redundant — and each forced suicide costs ~7s wallclock.
+            # Long-run state drift is still patched by hard_restart_every_epochs.
+            if config.steps_per_reset > 0:
+                while steps_since_last_reset >= config.steps_per_reset:
+                    steps_since_last_reset -= config.steps_per_reset
+                    for _ in range(envs_per_reset):
+                        reset_indices.append(next_reset_env)
+                        next_reset_env = (next_reset_env + 1) % config.n_envs
 
             # Death-triggered resets: any env that emitted done=true during
             # this rollout needs to be reset now, not when the step-budget
@@ -638,6 +759,44 @@ async def train(config: Config):
                 f"h2d {t_h2d*1000:.0f}ms | fwd {t_fwd*1000:.0f}ms | d2h {t_d2h*1000:.0f}ms"
             )
 
+            # --- Diagnostic accumulation (only when --diag_epochs > 0) ---
+            if train_diag is not None:
+                tphase = metrics.get("train_phase_t", {}) or {}
+                reset_dts = vec_env.pop_reset_dts()
+                train_diag["epochs"] += 1
+                train_diag["epoch_s"] += t_total
+                train_diag["rollout_s"] += t_rollout
+                train_diag["train_s"] += t_train
+                train_diag["collect_s"] += t_collect
+                train_diag["hk_s"] += t_hk
+                train_diag["norm_s"] += t_norm
+                train_diag["prep_s"] += t_prep
+                train_diag["h2d_s"] += t_h2d
+                train_diag["fwd_s"] += t_fwd
+                train_diag["d2h_s"] += t_d2h
+                train_diag["tr_gae_s"] += tphase.get("gae", 0.0)
+                train_diag["tr_normalize_s"] += tphase.get("normalize", 0.0)
+                train_diag["tr_h2d_s"] += tphase.get("h2d", 0.0)
+                train_diag["tr_train_loop_s"] += tphase.get("train_loop", 0.0)
+                train_diag["tr_forward_seq_s"] += tphase.get("forward_seq", 0.0)
+                train_diag["tr_backward_optim_s"] += tphase.get("backward_optim", 0.0)
+                train_diag["reset_count"] += len(reset_dts)
+                # reset_dts entries are dicts (wall_dt + per-phase ms + branch).
+                # Aggregate wallclock + per-phase + per-branch counts.
+                for entry in reset_dts:
+                    train_diag["reset_wallclock_sum_s"] += float(entry.get("wall_dt", 0.0))
+                    for phase in train_diag["reset_phase_sums_ms"]:
+                        train_diag["reset_phase_sums_ms"][phase] += float(entry.get(phase, 0.0))
+                    entry_frames = entry.get("frames", {})
+                    for phase in train_diag["reset_phase_sums_frames"]:
+                        train_diag["reset_phase_sums_frames"][phase] += float(entry_frames.get(phase, 0))
+                    branch = entry.get("branch", "unknown")
+                    if branch not in train_diag["reset_branch_counts"]:
+                        branch = "unknown"
+                    train_diag["reset_branch_counts"][branch] += 1
+                train_diag["active_steps"] += int(total_steps_epoch)
+                train_diag["total_steps"] += int(config.rollout_len * config.n_envs)
+
             # Step-based linear LR annealing. Progress is measured in
             # env-steps collected (not epochs), so variable rollout sizes
             # and dropped-env epochs decay LR at the same rate per unit work.
@@ -787,6 +946,10 @@ async def train(config: Config):
 
             if time_budget and (time.perf_counter() - t_start) >= time_budget:
                 print(f"Time budget ({time_budget}s) reached after {epoch + 1} epochs")
+                break
+
+            if train_diag is not None and train_diag["epochs"] >= config.diag_epochs:
+                _print_diag_summary(train_diag)
                 break
 
             if env_steps_collected - last_save_step >= config.save_every_steps:

@@ -253,9 +253,15 @@ namespace FullKnight.Game
 		private static int LockedStepsFor(int actionIdx, int framesPerWait, int timeScale)
 		{
 			if (!HoldGameSeconds.TryGetValue(actionIdx, out float gs)) return 0;
-			float stepGameSeconds = framesPerWait * timeScale / 60f;
-			if (stepGameSeconds <= 0f) return 0;
-			int n = (int)System.Math.Ceiling(gs / stepGameSeconds);
+			// Pinned to baseline (framesPerWait=5, timeScale=3) so the locked-step
+			// count is invariant to the current fpw. Otherwise trained agents
+			// would see a different lock duration when we lower fpw to cut sim
+			// cost — at fpw=2 the lock would balloon from 6 -> 15 steps and
+			// the agent would freeze through boss attacks. Behavioral parity
+			// with training matters more here than the (always-wrong) game-
+			// seconds derivation; agents learned the lock count, not the wallclock.
+			const float kBaselineStepGameSeconds = 5f * 3f / 60f;  // 0.25
+			int n = (int)System.Math.Ceiling(gs / kBaselineStepGameSeconds);
 			return n > 0 ? n : 1;
 		}
 

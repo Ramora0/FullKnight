@@ -331,7 +331,8 @@ def _print_comparison(label_a, results_a, label_b, results_b):
 async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
                         level="GG_Mega_Moss_Charger", hk_path=None, no_agent=False,
                         graphical=None, label="extended",
-                        view_w=None, view_h=None):
+                        view_w=None, view_h=None, use_cuda_graphs=False,
+                        frames_per_wait=None):
     """Run K parallel envs through the training collection path (`collect_action`,
     sampled actions, batched policy forward) for `n_steps` steps per env, with
     synchronous reset on done. Tracks per-episode damage/hits/length.
@@ -349,6 +350,9 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
         config.view_w = view_w
     if view_h is not None:
         config.view_h = view_h
+    config.use_cuda_graphs = use_cuda_graphs
+    if frames_per_wait is not None:
+        config.frames_per_wait = frames_per_wait
 
     agent = None
     vocab = KindVocab(max_size=config.kind_vocab_size)

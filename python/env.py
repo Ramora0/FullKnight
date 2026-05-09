@@ -2,7 +2,8 @@ import time
 import numpy as np
 from binary_protocol import (
     pack_init, pack_reset, pack_action, pack_pause, pack_resume,
-    unpack_reset, unpack_step, pop_last_terrain_debug, pop_last_diag, MSG_CLOSE,
+    unpack_reset, unpack_step, pop_last_terrain_debug, pop_last_diag,
+    pop_last_reset_phases, MSG_CLOSE,
 )
 import struct
 
@@ -32,6 +33,10 @@ class HKEnv:
             "enemy_count": 0, "attack_count": 0, "terrain_count": 0,
             "kind_cache_size": 0, "gc_heap_mb": 0.0,
         }
+        # Per-phase ms breakdown of the most recent reset, populated by
+        # reset(). vec_env reads this in reap_completed_resets() so the
+        # train-time diagnostic can attribute the 8s reset average.
+        self.last_reset_phases: dict = {}
 
     async def init(self):
         """Send init handshake and wait for ack."""
@@ -56,6 +61,7 @@ class HKEnv:
                   flush=True)
         result = unpack_reset(data)
         self.last_terrain_debug = pop_last_terrain_debug()
+        self.last_reset_phases = pop_last_reset_phases()
         return result
 
     async def step(self, action_vec):

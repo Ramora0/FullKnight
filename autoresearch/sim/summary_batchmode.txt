@@ -1,0 +1,23 @@
+---
+dmg_per_ep_mean:    94.5536
+dmg_per_ep_lo:      86.9635
+dmg_per_ep_hi:      101.0744
+hits_per_ep_mean:   7.4286
+hits_per_ep_lo:     6.2857
+hits_per_ep_hi:     8.4286
+quality_episodes:   7
+quality_wall_s:     246.2
+throughput_eps:     175.2365
+throughput_n:       8
+throughput_wall_s:  46.7
+rtime_mean_ms:      14.3858
+rtime_p95_ms:       15.6525
+cpu_hk_sum_pct:     439.75
+cpu_machine_sat:    27.48
+cpu_system_mean:    45.43
+cpu_system_peak:    58.80
+ram_initial_mb:     4970
+ram_final_mb:       5100
+ram_growth_mb:      130
+gc_heap_mean_mb:    1075.32
+gc_heap_growth_mb:  109.45

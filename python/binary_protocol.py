@@ -129,6 +129,20 @@ def pop_last_terrain_debug():
 _DIAG_FMT = '<HHHif'  # enemy_cnt, attack_cnt, terrain_cnt, kind_cache_size, gc_heap_mb
 _DIAG_SIZE = struct.calcsize(_DIAG_FMT)  # 14 bytes
 
+# Reset phase trailer — 7 u16 phase deltas (ms) + 7 u16 phase frame counts
+# + 1 u8 branch flag. Order matches C# TrainingEnv.Reset() LogPhase call
+# sequence. Older C# DLLs only emit the 15-byte (ms+branch) variant; we
+# detect by length and parse the frames block when present.
+_RESET_PHASES_FMT_FULL = '<HHHHHHHHHHHHHHB'  # 7 ms + 7 frames + 1 branch = 29 bytes
+_RESET_PHASES_FMT_LEGACY = '<HHHHHHHB'        # 7 ms + 1 branch = 15 bytes
+_RESET_PHASES_SIZE_FULL = struct.calcsize(_RESET_PHASES_FMT_FULL)
+_RESET_PHASES_SIZE_LEGACY = struct.calcsize(_RESET_PHASES_FMT_LEGACY)
+RESET_PHASE_NAMES = (
+    "pre_unload", "transition_out", "settle", "load_boss_scene",
+    "recreate_reader", "init_boss_refs", "obs_final",
+)
+RESET_BRANCH_NAMES = {0: "workshop", 1: "natural_end", 2: "suicide"}
+
 # Side channel: last diag tuple pulled off the wire. Populated by unpack_step,
 # read by vec_env so we don't balloon the main return tuple on every caller.
 _last_diag = {
@@ -142,6 +156,18 @@ _last_diag = {
 def pop_last_diag():
     """Return the most-recently-received diag block (dict)."""
     return dict(_last_diag)
+
+
+# Side channel: per-reset phase breakdown pulled off the wire by unpack_reset.
+# Read by HKEnv.reset() and ferried up to vec_env's reap_completed_resets.
+_last_reset_phases: dict = {}
+
+def pop_last_reset_phases():
+    """Return (and clear) the most-recently-parsed reset phase dict."""
+    global _last_reset_phases
+    out = _last_reset_phases
+    _last_reset_phases = {}
+    return out
 
 
 def unpack_step(data):
@@ -186,11 +212,32 @@ def unpack_step(data):
 
 def unpack_reset(data):
     """Unpack a reset response.
-    Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents)."""
-    global _last_terrain_debug
+    Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents).
+    Phase trailer (if present) is stashed in _last_reset_phases — read it
+    via pop_last_reset_phases()."""
+    global _last_terrain_debug, _last_reset_phases
     combat_hb, terrain_hb, gs, n_combat, offset = unpack_obs(data)
     n_terrain = terrain_hb.shape[0]
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
     combat_parents, offset = unpack_kinds(data, offset, n_combat)
-    _last_terrain_debug, _ = unpack_terrain_debug(data, offset, n_terrain)
+    _last_terrain_debug, offset = unpack_terrain_debug(data, offset, n_terrain)
+    # Reset phase trailer — defensive parse for older C# DLLs that don't
+    # append it. Layout matches BinaryProtocol.Pack reset trailer. Prefer
+    # the full (ms+frames+branch) layout; fall back to legacy (ms+branch).
+    remaining = len(data) - offset
+    if remaining >= _RESET_PHASES_SIZE_FULL:
+        vals = struct.unpack_from(_RESET_PHASES_FMT_FULL, data, offset)
+        phases = {n: float(v) for n, v in zip(RESET_PHASE_NAMES, vals[:7])}
+        frames = {n: int(v) for n, v in zip(RESET_PHASE_NAMES, vals[7:14])}
+        phases["frames"] = frames
+        phases["branch"] = RESET_BRANCH_NAMES.get(int(vals[14]), "unknown")
+        _last_reset_phases = phases
+    elif remaining >= _RESET_PHASES_SIZE_LEGACY:
+        vals = struct.unpack_from(_RESET_PHASES_FMT_LEGACY, data, offset)
+        phases = {n: float(v) for n, v in zip(RESET_PHASE_NAMES, vals[:7])}
+        phases["frames"] = {n: 0 for n in RESET_PHASE_NAMES}
+        phases["branch"] = RESET_BRANCH_NAMES.get(int(vals[7]), "unknown")
+        _last_reset_phases = phases
+    else:
+        _last_reset_phases = {}
     return combat_hb, terrain_hb, gs, combat_kinds, combat_parents

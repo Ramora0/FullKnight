@@ -56,6 +56,19 @@ namespace FullKnight.Environment
 		// LogPhase call so each line shows both delta and total.
 		private float _phaseStart;
 		private float _phaseLast;
+		private int _phaseLastFrame;
+		// Per-reset phase deltas, populated by LogPhase. Cleared at PhaseBegin.
+		// Shipped to Python via a fixed-shape trailer on the reset response so
+		// the train-time diagnostic can break down the 8s reset average.
+		private readonly List<float> _resetPhaseDeltasMs = new();
+		// Parallel frame-count deltas: how many Unity frames each phase took.
+		// Combined with the ms deltas this disambiguates "many normal frames"
+		// from "few stalled frames" — e.g. 4000 ms / 4 frames is a render
+		// stall; 4000 ms / 800 frames is just a slow loop at 200fps.
+		private readonly List<int> _resetPhaseFrames = new();
+		// Which exit-from-arena branch ran in the current Reset(). Mirrors the
+		// reset_branch wire field; set in the if/elif/else inside Reset().
+		private byte _resetBranch;
 
 		private HitboxObserver _hitboxObserver = new();
 		private InputDeviceShim _inputShim = new();
@@ -136,8 +149,29 @@ namespace FullKnight.Environment
 			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 },
 				_frameSkipCount, _timeScaleValue);
 
-			// Unpause so scene transition and WaitForSeconds can proceed
-			Time.timeScale = _timeScaleValue;
+			// Crank timeScale during the entire reset path. Both transition_out
+			// (HK death/win cinematic + DreamReturn) and load_boss_scene
+			// (BounceThroughWorkshop + BeginSceneTransition + FixSoul) are
+			// dominated by game-time-bound coroutines — death anim, fade,
+			// scene transition visualizations — that compress linearly with
+			// timeScale. The two settle waits inside SceneHooks were converted
+			// to WaitForSecondsRealtime so they hold their wallclock magnitude
+			// (0.333s + 0.667s) regardless of timeScale; without that the boss
+			// FSM doesn't finish waking and intro-skip times out (commit
+			// ed8731f). Recreate _timeManager at multiplier 20 (rather than
+			// directly assigning Time.timeScale) because HK's TimeController
+			// recomputes Time.timeScale from the product of 4 factors whenever
+			// GameManager.SetTimeScale is called during transitions — direct
+			// Time.timeScale writes get clobbered. The Game.TimeScale shim
+			// intercepts SetTimeScale and multiplies by this.timeScale, so
+			// setting it to 20 makes ALL transition-driven timescale changes
+			// 20× faster. Drop back to _timeScaleValue at the very end before
+			// re-freezing for the obs handoff to Python.
+			const float kResetTimeScale = 20f;
+			if (_timeManager == null)
+				_timeManager = new Game.TimeScale(kResetTimeScale);
+			else
+				_timeManager.SetMultiplier(kResetTimeScale);
 
 			// Three paths out of the boss arena:
 			//  (a) Already out — death/win cleanup landed before reset arrived.
@@ -160,11 +194,13 @@ namespace FullKnight.Environment
 			if (preScene == "GG_Workshop")
 			{
 				// Cleanup already landed; nothing to wait for.
+				_resetBranch = 0;
 				LogBossDiag($"reset#{_resetCount} ALREADY-IN-WORKSHOP");
 				LogPhase("Reset", "ALREADY-IN-WORKSHOP");
 			}
 			else if (naturalEnd)
 			{
+				_resetBranch = 1;
 				LogBossDiag($"reset#{_resetCount} NATURAL-END WAIT (in {preScene})");
 				yield return WaitForSceneChange(preScene);
 				var afterScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
@@ -173,6 +209,7 @@ namespace FullKnight.Environment
 			}
 			else
 			{
+				_resetBranch = 2;
 				LogBossDiag($"reset#{_resetCount} PRE-SUICIDE (alive in {preScene})");
 				yield return KillKnight();
 				LogBossDiag($"reset#{_resetCount} POST-SUICIDE");
@@ -209,8 +246,14 @@ namespace FullKnight.Environment
 			UnhookDamage();
 			HookDamage();
 
-			if (_timeManager != null) _timeManager.Dispose();
-			_timeManager = new Game.TimeScale(_timeScaleValue);
+			// Swap multiplier in place (cheap) — IL hooks installed once at
+			// first reset stay live across the run. Dropping the multiplier
+			// from kResetTimeScale=20 back to _timeScaleValue here is the
+			// counterpart to the early SetMultiplier(20) at the top of Reset.
+			if (_timeManager == null)
+				_timeManager = new Game.TimeScale(_timeScaleValue);
+			else
+				_timeManager.SetMultiplier(_timeScaleValue);
 
 			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs, emitTerrainDebug: _evalMode);
 			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
@@ -226,6 +269,9 @@ namespace FullKnight.Environment
 			LogPhase("Reset", "obs+freeze (final)");
 			float resetTotalMs = (Time.realtimeSinceStartup - _phaseStart) * 1000f;
 			Log($"[Reset-Timing] reset#{_resetCount} TOTAL {resetTotalMs:F0}ms level={_level}");
+			data.reset_phase_deltas_ms = _resetPhaseDeltasMs.ToArray();
+			data.reset_phase_frames = _resetPhaseFrames.ToArray();
+			data.reset_branch = _resetBranch;
 			SendMessage(new Message { type = "reset", data = data });
 			yield break;
 		}
@@ -277,7 +323,15 @@ namespace FullKnight.Environment
 			// Restore captureDeltaTime=0 between steps because Unity ignores
 			// Time.timeScale=0 under capture (would break the inter-step pause
 			// and the intro-skip timeScale=20 fast-forward).
-			const float kStepDeltaTime = 0.00283f;
+			//
+			// Computed (not const) so that lowering _frameSkipCount automatically
+			// raises captureDeltaTime to preserve gtime. Baseline regime is
+			// gtime=0.0424s/step; we keep that invariant and trade Unity frames
+			// for per-frame game-time. Going from frames=5 to frames=2 means
+			// 60% fewer Unity frames per agent step → ~60% less Unity sim cost,
+			// while the agent's gtime/step stays exactly 0.0424.
+			const float kBaselineGtime = 0.0424f;
+			float kStepDeltaTime = kBaselineGtime / (_frameSkipCount * _timeScaleValue);
 			Time.captureDeltaTime = kStepDeltaTime;
 
 			float frameSkipT0 = Time.realtimeSinceStartup;
@@ -446,15 +500,24 @@ namespace FullKnight.Environment
 		{
 			_phaseStart = Time.realtimeSinceStartup;
 			_phaseLast = _phaseStart;
+			_phaseLastFrame = Time.frameCount;
+			_resetPhaseDeltasMs.Clear();
+			_resetPhaseFrames.Clear();
 		}
 
 		private void LogPhase(string scope, string label)
 		{
 			float now = Time.realtimeSinceStartup;
+			int frameNow = Time.frameCount;
 			float deltaMs = (now - _phaseLast) * 1000f;
 			float totalMs = (now - _phaseStart) * 1000f;
+			int deltaFrames = frameNow - _phaseLastFrame;
 			_phaseLast = now;
-			Log($"[Phase-Timing] {scope}#{_resetCount} {label}: +{deltaMs:F0}ms (total {totalMs:F0}ms)");
+			_phaseLastFrame = frameNow;
+			_resetPhaseDeltasMs.Add(deltaMs);
+			_resetPhaseFrames.Add(deltaFrames);
+			float msPerFrame = deltaFrames > 0 ? deltaMs / deltaFrames : 0f;
+			Log($"[Phase-Timing] {scope}#{_resetCount} {label}: +{deltaMs:F0}ms / {deltaFrames}f ({msPerFrame:F1}ms/f) (total {totalMs:F0}ms)");
 		}
 
 		/// <summary>
@@ -753,10 +816,10 @@ namespace FullKnight.Environment
 			_bossMaxHPs.Clear();
 			try
 			{
-				if (BossSceneController.Instance?.bosses != null
-					&& BossSceneController.Instance.bosses.Length > 0)
+				var bsc = BossSceneController.Instance;
+				if (bsc?.bosses != null && bsc.bosses.Length > 0)
 				{
-					foreach (var b in BossSceneController.Instance.bosses)
+					foreach (var b in bsc.bosses)
 					{
 						if (b == null) continue;
 						var hm = b.gameObject.GetComponent<HealthManager>();
@@ -765,6 +828,17 @@ namespace FullKnight.Environment
 						_bossMaxHPs[hm] = hm.hp;
 					}
 				}
+				// Strip the 5-second `bossesDeadWaitTime` HK adds after a boss
+				// dies. EndSceneDelayed yields `WaitForSeconds(bossesDeadWaitTime)`
+				// before any transition logic runs (BossSceneController.cs:234 in
+				// the decomp); zeroing it is the single largest win-side wallclock
+				// reduction available without breaking the GG transition FSM
+				// chain. We DO leave doTransitionOut=true (default): turning it
+				// off skips the `GG TRANSITION OUT` event broadcast that HK's
+				// transition FSM listens for, and the fallback path is strictly
+				// slower (+1s wallclock measured).
+				if (bsc != null)
+					bsc.bossesDeadWaitTime = 0f;
 			}
 			catch { }
 		}

@@ -68,13 +68,24 @@ namespace FullKnight.Game
 				EntryGateName = "door_dreamEnter",
 				EntryDelay = 0,
 				Visualization = GameManager.SceneLoadVisualizations.GodsAndGlory,
-				PreventCameraFadeOut = true
+				PreventCameraFadeOut = true,
+				// Skip the fixed 0.5s camera-fade wait inside
+				// GameManager.BeginSceneTransitionRoutine (decomp line 596).
+				// The timer decrements unscaled so timeScale=20 doesn't help.
+				WaitForSceneTransitionCameraFade = false,
 			});
 			LogStage("BeginSceneTransition (boss)");
 			yield return FixSoul();
 			LogStage("FixSoul");
-			yield return new WaitForSeconds(2f);
-			LogStage("WaitForSeconds(2)");
+			// Realtime: this settle wait gives HK wallclock time for the boss
+			// FSM to finish waking. WaitForSeconds scales with Time.timeScale,
+			// so cranking timeScale during reset would collapse it to ~100ms
+			// at timeScale=20 and intro-skip would TIMEOUT (5001 frames =
+			// 13.7s wasted on step 1) — empirical from commit ed8731f.
+			// 0.667s = 2f / baseline timeScale=3, the magnitude that's been
+			// proven sufficient.
+			yield return new WaitForSecondsRealtime(0.667f);
+			LogStage("WaitForSecondsRealtime(0.667)");
 		}
 
 		private static IEnumerator BounceThroughWorkshop()
@@ -87,7 +98,9 @@ namespace FullKnight.Game
 				EntryGateName = "door_dreamReturn",
 				EntryDelay = 0,
 				Visualization = GameManager.SceneLoadVisualizations.GodsAndGlory,
-				PreventCameraFadeOut = true
+				PreventCameraFadeOut = true,
+				// See LoadBossScene's note — same 0.5s camera fade wait.
+				WaitForSceneTransitionCameraFade = false,
 			});
 			float t1 = Time.realtimeSinceStartup;
 			yield return new WaitForSceneLoad("GG_Workshop");
@@ -107,13 +120,16 @@ namespace FullKnight.Game
 			yield return new WaitForFinishedEnteringScene();
 			float t1 = Time.realtimeSinceStartup;
 			yield return null;
-			yield return new WaitForSeconds(1f);
+			// Realtime — see LoadBossScene's note. 0.333s wallclock matches
+			// the prior baseline (1f / timeScale=3) and is empirically enough
+			// for HeroController to be ready for the soul-charge refresh.
+			yield return new WaitForSecondsRealtime(0.333f);
 			float t2 = Time.realtimeSinceStartup;
 			HeroController.instance.AddMPCharge(1);
 			HeroController.instance.AddMPCharge(-1);
 			FullKnight.Instance.Log(
 				$"[Phase-Timing] FixSoul: WaitForFinishedEnteringScene={(t1 - t0) * 1000f:F0}ms"
-				+ $" WaitForSeconds(1)+frame={(t2 - t1) * 1000f:F0}ms"
+				+ $" WaitForSecondsRealtime(0.333)+frame={(t2 - t1) * 1000f:F0}ms"
 				+ $" total={(t2 - t0) * 1000f:F0}ms");
 		}
 

@@ -118,6 +118,37 @@ namespace FullKnight.Net
 					w.Write(d.diag_kind_cache_size ?? 0);
 					w.Write(d.diag_gc_heap_mb ?? 0f);
 				}
+
+				// Reset phase trailer — 7 u16 phase deltas (ms) + 7 u16 phase
+				// frame counts + 1 u8 branch. Layout HHHHHHH HHHHHHH B = 29 bytes.
+				// Order matches Reset()'s LogPhase calls: pre_unload,
+				// transition_out, settle, load_boss_scene, recreate_reader,
+				// init_boss_refs, obs_final. Branch flag: 0=already-in-workshop,
+				// 1=natural-end, 2=suicide. Must match python/binary_protocol.py
+				// :unpack_reset trailer parsing.
+				if (message.type == "reset")
+				{
+					var deltas = d.reset_phase_deltas_ms;
+					int nDeltas = deltas != null ? deltas.Length : 0;
+					for (int i = 0; i < 7; i++)
+					{
+						float deltaMs = i < nDeltas ? deltas[i] : 0f;
+						int clamped = (int)System.Math.Round(deltaMs);
+						if (clamped < 0) clamped = 0;
+						if (clamped > 65535) clamped = 65535;
+						w.Write((ushort)clamped);
+					}
+					var frames = d.reset_phase_frames;
+					int nFrames = frames != null ? frames.Length : 0;
+					for (int i = 0; i < 7; i++)
+					{
+						int f = i < nFrames ? frames[i] : 0;
+						if (f < 0) f = 0;
+						if (f > 65535) f = 65535;
+						w.Write((ushort)f);
+					}
+					w.Write(d.reset_branch ?? (byte)0);
+				}
 			}
 
 			return ms.ToArray();

@@ -56,7 +56,8 @@ def _abort_if_port_busy(host, port):
 
 
 async def validate(checkpoint, quality_steps, throughput_steps,
-                   throughput_n, hk_path, level, graphical, merged=False):
+                   throughput_n, hk_path, level, graphical, merged=False,
+                   use_cuda_graphs=False, frames_per_wait=None):
     """Run quality @ N=1 then throughput @ N=throughput_n. Print sections
     and a `---` summary block at the end.
 
@@ -79,7 +80,9 @@ async def validate(checkpoint, quality_steps, throughput_steps,
                                      n_steps=quality_steps, level=level,
                                      hk_path=hk_path,
                                      graphical=graphical,
-                                     label=f"merged-N{throughput_n}")
+                                     label=f"merged-N{throughput_n}",
+                                     use_cuda_graphs=use_cuda_graphs,
+                                     frames_per_wait=frames_per_wait)
         _print_quality(result)
         _print_throughput(result, throughput_n)
         _print_summary_block(result, result, throughput_n)
@@ -90,7 +93,8 @@ async def validate(checkpoint, quality_steps, throughput_steps,
     print("#" * 78)
     quality = await extended_eval(checkpoint, n_envs=1, n_steps=quality_steps,
                                   level=level, hk_path=hk_path,
-                                  graphical=graphical, label="quality")
+                                  graphical=graphical, label="quality",
+                                  use_cuda_graphs=use_cuda_graphs)
     _print_quality(quality)
 
     print("\n" + "#" * 78)
@@ -100,7 +104,9 @@ async def validate(checkpoint, quality_steps, throughput_steps,
                                      n_steps=throughput_steps, level=level,
                                      hk_path=hk_path,
                                      graphical=graphical,
-                                     label=f"throughput-N{throughput_n}")
+                                     label=f"throughput-N{throughput_n}",
+                                     use_cuda_graphs=use_cuda_graphs,
+                                     frames_per_wait=frames_per_wait)
     _print_throughput(throughput, throughput_n)
 
     _print_summary_block(quality, throughput, throughput_n)
@@ -380,10 +386,20 @@ def main():
     p.add_argument("--merged", action="store_true",
                    help="Single phase at N=throughput_n for quality_steps; "
                         "extracts quality CIs and throughput from one run.")
+    p.add_argument("--use-cuda-graphs", action="store_true",
+                   help="Enable BucketedGraphRunner in PPO.collect_action.")
+    p.add_argument("--frames-per-wait", type=int, default=None,
+                   help="Override config.frames_per_wait. Lower = fewer Unity "
+                        "frames per agent step. C# auto-scales captureDeltaTime "
+                        "to preserve gtime (0.0424s/step).")
 
     args = p.parse_args()
 
     cfg = Config()
+    if args.use_cuda_graphs:
+        cfg.use_cuda_graphs = True
+    if args.frames_per_wait is not None:
+        cfg.frames_per_wait = args.frames_per_wait
     _abort_if_port_busy(cfg.server_host, cfg.server_port)
 
     asyncio.run(validate(
@@ -395,6 +411,8 @@ def main():
         level=args.level if args.level is not None else cfg.level,
         graphical=args.graphical,
         merged=args.merged,
+        use_cuda_graphs=args.use_cuda_graphs,
+        frames_per_wait=args.frames_per_wait,
     ))
 
 

@@ -63,5 +63,20 @@ namespace FullKnight.Net
 		// steps (the agent didn't make a free choice; movement/direction/jump
 		// stay free and get normal gradient).
 		public bool? action_committed;
+
+		// Reset-only: per-phase wallclock deltas (ms) collected by LogPhase.
+		// Order is fixed and matches Python's unpack_reset trailer:
+		//   [pre_unload, transition_out, settle, load_boss_scene,
+		//    recreate_reader, init_boss_refs, obs_final].
+		// Empty/null on non-reset messages.
+		public float[] reset_phase_deltas_ms;
+		// Parallel to reset_phase_deltas_ms: how many Unity frames each phase
+		// occupied. ms / frames disambiguates "many normal frames" from
+		// "few stalled frames". Empty/null on non-reset messages.
+		public int[] reset_phase_frames;
+		// 0 = already-in-workshop (no transition needed),
+		// 1 = natural-end (waited for HK's death/win transition),
+		// 2 = suicide (synthetic kill, mid-fight reset).
+		public byte? reset_branch;
 	}
 }

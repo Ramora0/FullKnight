@@ -26,6 +26,12 @@ class VecEnv:
         # In-flight background reset tasks: env_i -> asyncio.Task wrapping the
         # _timed_op reset coroutine. Caller polls with reap_completed_resets().
         self._reset_tasks: dict = {}
+        # Per-reset breakdown dicts for resets reaped since the last
+        # pop_reset_dts() drain. Each dict has:
+        #   wall_dt (s, Python wire time) + the C# phase ms keys
+        #   (pre_unload, transition_out, settle, load_boss_scene,
+        #    recreate_reader, init_boss_refs, obs_final) + branch name.
+        self._completed_reset_dts: list = []
 
     async def start_server(self):
         """Start WebSocket server and wait for all N connections."""
@@ -211,10 +217,22 @@ class VecEnv:
             task = self._reset_tasks[env_i]
             if not task.done():
                 continue
-            _env_i, _dt, result = task.result()  # raises if the task errored
+            _env_i, dt, result = task.result()  # raises if the task errored
             completed.append((env_i, result))
+            phases = dict(self.envs[env_i].last_reset_phases)
+            phases["wall_dt"] = float(dt)
+            self._completed_reset_dts.append(phases)
             del self._reset_tasks[env_i]
         return completed
+
+    def pop_reset_dts(self):
+        """Drain and return per-reset breakdown dicts for resets reaped since
+        the last call. Each entry: {"wall_dt": s, "branch": str,
+        "<phase>": ms, ...}. Used by the train-time diagnostic to break down
+        the average reset wallclock into its constituent C# phases."""
+        out = self._completed_reset_dts
+        self._completed_reset_dts = []
+        return out
 
     async def await_all_resets(self):
         """Block until every in-flight reset task is done. Returns the same

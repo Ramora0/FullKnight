@@ -25,7 +25,12 @@ class Config:
     # run as background asyncio tasks overlapping the next rollout; scheduled
     # envs sit out of the active set until their reset completes.
     envs_per_reset_div: int = 8
-    steps_per_reset: int = 4096
+    # 0 disables staggered anti-drift resets entirely. Natural episode
+    # endings (knight dies / boss dies) reset envs frequently enough in
+    # the current regime that the staggered cadence is redundant; each
+    # forced mid-fight suicide costs ~7s wallclock. Long-run state drift
+    # is still patched by hard_restart_every_epochs.
+    steps_per_reset: int = 0
 
     # Hollow Knight paths (Windows)
     hk_path: str = r"C:\Program Files (x86)\Steam\steamapps\common\Hollow Knight"
@@ -134,6 +139,24 @@ class Config:
 
     # Time budget (seconds, 0 = unlimited). Disables wandb when set.
     time_budget: int = 0
+
+    # CUDA Graphs for collect_action — captures the per-step forward (h2d +
+    # forward + d2h) into a replay-only graph, slashing CPU launch overhead
+    # which dominates per-step wallclock for our small model on a fast GPU.
+    # Requires that batch dim B equals n_envs (we pad inactive envs with
+    # zero-masked rows), and that combat/terrain dims fit the bucket caps
+    # below. Caps are ceiling-pad targets; pick them above your typical
+    # max observed values, but not so high that wasted compute exceeds the
+    # launch-overhead savings.
+    use_cuda_graphs: bool = True
+    graph_combat_buckets: str = "8,16,32,64"   # comma-separated
+    graph_terrain_buckets: str = "96"          # one bucket is plenty if terrain is camera-clipped
+
+    # Diagnostic mode: when > 0, train.py exits after this many epochs and
+    # prints an aggregated wallclock breakdown (rollout vs train, sub-phases
+    # of each, reset overhead). Used to identify where time is going so we
+    # can target the right bottleneck.
+    diag_epochs: int = 0
 
     # Debug
     visualize: bool = False
