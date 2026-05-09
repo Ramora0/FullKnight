@@ -136,14 +136,8 @@ namespace FullKnight.Environment
 			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 },
 				_frameSkipCount, _timeScaleValue);
 
-			// Unpause so scene transition and WaitForSeconds can proceed.
-			// Use a high timeScale (matches intro-skip @ line ~288) to compress
-			// the ~3s wallclock per reset: NATURAL-END wait, LoadBossScene's
-			// WaitForSeconds(2), and FixSoul's WaitForSeconds(1) all scale by
-			// 1/timeScale. The agent never observes a frame during reset (only
-			// the freeze-time snapshot at the end), so dt regime is preserved.
-			const float kResetTimeScale = 20f;
-			Time.timeScale = kResetTimeScale;
+			// Unpause so scene transition and WaitForSeconds can proceed
+			Time.timeScale = _timeScaleValue;
 
 			// Three paths out of the boss arena:
 			//  (a) Already out — death/win cleanup landed before reset arrived.
