@@ -441,12 +441,6 @@ namespace FullKnight.Environment
 		/// </summary>
 		private void LogBossDiag(string tag)
 		{
-			// Debug-only path — iterates GetComponentsInChildren<PlayMakerFSM> and
-			// string-builds a multi-hundred-character diagnostic; called ~5-10x
-			// per reset plus once every 10 intro-skip frames. Gating behind
-			// _evalMode skips the work entirely on training/validation runs,
-			// where _evalMode=false by default (TrainingEnv.cs:110).
-			if (!_evalMode) return;
 			var sb = new StringBuilder();
 			sb.Append("[DIAG ").Append(tag).Append("]\n");
 			try
