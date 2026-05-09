@@ -1,10 +1,7 @@
 using System.Collections;
 using System.Collections.Generic;
-using System.Text;
 using FullKnight.Net;
 using FullKnight.Game;
-using HutongGames.PlayMaker;
-using HutongGames.PlayMaker.Actions;
 using InControl;
 using Modding;
 using UnityEngine;
@@ -27,10 +24,6 @@ namespace FullKnight.Environment
 		private bool _bossDied;
 		private bool _episodeDone;
 		private string _episodeResult;
-		// Set during synthetic suicide (Reset path) so OnKnightDamaged skips
-		// the hit-taken counter — otherwise the forced kill would inject a
-		// phantom -1 hit penalty into the next step's reward.
-		private bool _syntheticKill;
 		// Set of HealthManagers considered the "true target(s)" for is_target and
 		// reward. Populated from BossSceneController.bosses on each reset; used by
 		// HitboxObserver.GetSplitFeatures to flag which combat hitboxes the agent
@@ -41,9 +34,6 @@ namespace FullKnight.Environment
 		// boss fights (Oro/Mato, God Tamer) have asymmetric HP pools and damage
 		// must be normalized against each boss's own maxHP.
 		private readonly Dictionary<HealthManager, int> _bossMaxHPs = new();
-
-		// Boss intro skip: keep simulating internally until combat starts
-		private bool _combatStarted;
 
 		// Diagnostics: count resets so logs are correlatable across episodes
 		private int _resetCount;
@@ -67,7 +57,8 @@ namespace FullKnight.Environment
 		// stall; 4000 ms / 800 frames is just a slow loop at 200fps.
 		private readonly List<int> _resetPhaseFrames = new();
 		// Which exit-from-arena branch ran in the current Reset(). Mirrors the
-		// reset_branch wire field; set in the if/elif/else inside Reset().
+		// reset_branch wire field. 0 = already in GG_Workshop, 1 = waited for
+		// natural end transition.
 		private byte _resetBranch;
 
 		private HitboxObserver _hitboxObserver = new();
@@ -125,20 +116,11 @@ namespace FullKnight.Environment
 			_damageLandedInStep = 0;
 			_hpHealedInStep = 0;
 			_stepCount = 0;
-			// Capture episode-end flags before clearing — the suicide-vs-wait
-			// branch below depends on whether this reset follows a natural end
-			// (boss death = win, knight death = loss) or a mid-fight cut. Note:
-			// reading PlayerData.instance.health here is unreliable, since HK's
-			// death sequence may have already restored HP between the death step
-			// and the time Reset() arrives.
-			bool naturalEnd = _bossDied || _episodeResult == "loss";
 			_bossDied = false;
 			_episodeDone = false;
 			_episodeResult = null;
-			_combatStarted = false;
 			_resetCount++;
 
-			LogBossDiag($"reset#{_resetCount} PRE-UNLOAD (still in old scene)");
 			LogPhase("Reset", "PRE-UNLOAD");
 
 			// Release any inputs held over from the previous episode before the
@@ -149,83 +131,52 @@ namespace FullKnight.Environment
 			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 },
 				_frameSkipCount, _timeScaleValue);
 
-			// Crank timeScale during the entire reset path. Both transition_out
-			// (HK death/win cinematic + DreamReturn) and load_boss_scene
-			// (BounceThroughWorkshop + BeginSceneTransition + FixSoul) are
-			// dominated by game-time-bound coroutines — death anim, fade,
-			// scene transition visualizations — that compress linearly with
-			// timeScale. The two settle waits inside SceneHooks were converted
-			// to WaitForSecondsRealtime so they hold their wallclock magnitude
-			// (0.333s + 0.667s) regardless of timeScale; without that the boss
-			// FSM doesn't finish waking and intro-skip times out (commit
-			// ed8731f). Recreate _timeManager at multiplier 20 (rather than
-			// directly assigning Time.timeScale) because HK's TimeController
-			// recomputes Time.timeScale from the product of 4 factors whenever
-			// GameManager.SetTimeScale is called during transitions — direct
-			// Time.timeScale writes get clobbered. The Game.TimeScale shim
-			// intercepts SetTimeScale and multiplies by this.timeScale, so
-			// setting it to 20 makes ALL transition-driven timescale changes
-			// 20× faster. Drop back to _timeScaleValue at the very end before
-			// re-freezing for the obs handoff to Python.
-			const float kResetTimeScale = 20f;
+			// FIRST-PRINCIPLES SIMPLIFICATION: removed the timeScale=20 crank
+			// during reset (was lines 142-164 + 230-237 — dual SetMultiplier
+			// to fast-forward HK transition coroutines and back). Testing
+			// whether the crank is actually load-bearing or whether resets
+			// work fine at the normal _timeScaleValue. Also removed the
+			// suicide branch (forced mid-fight resets are disabled upstream)
+			// and consolidated the two-branch arena-exit logic into a single
+			// "wait for scene change away from boss" check.
+			//
+			// Always SetMultiplier — Step() ends with Time.timeScale = 0 to
+			// freeze for the Python obs handoff, and we need to unfreeze
+			// here so HK's queued DoDreamReturn / hero-death transition
+			// can actually tick during WaitForSceneChange.
 			if (_timeManager == null)
-				_timeManager = new Game.TimeScale(kResetTimeScale);
+				_timeManager = new Game.TimeScale(_timeScaleValue);
 			else
-				_timeManager.SetMultiplier(kResetTimeScale);
+				_timeManager.SetMultiplier(_timeScaleValue);
 
-			// Three paths out of the boss arena:
-			//  (a) Already out — death/win cleanup landed before reset arrived.
-			//      Nothing to wait for.
-			//  (b) Natural end (win or loss) — HK's own DoDreamReturn / death
-			//      transition is queued and time just resumed, so it's about to
-			//      run. We don't care WHERE it sends the knight (boss-complete
-			//      can land in a non-Workshop scene like a pantheon completion
-			//      room); we just need them out of the arena before LoadBossScene
-			//      fires. Wait for the scene to change away from preScene; the
-			//      LoadBossScene bounce handles getting back to GG_Workshop from
-			//      wherever HK dropped us. Suiciding here would race the queued
-			//      natural transition and corrupt state — that was the original
-			//      "boss killed but never re-entered arena" bug.
-			//  (c) Mid-fight (step-budget reset on a live knight + live boss) —
-			//      yanking that state into a new scene leaves FSMs / HUD
-			//      inconsistent. Force a synthetic suicide so HK's natural death
-			//      cleanup brings us home cleanly.
 			var preScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
-			if (preScene == "GG_Workshop")
+			if (preScene != "GG_Workshop")
 			{
-				// Cleanup already landed; nothing to wait for.
-				_resetBranch = 0;
-				LogBossDiag($"reset#{_resetCount} ALREADY-IN-WORKSHOP");
-				LogPhase("Reset", "ALREADY-IN-WORKSHOP");
-			}
-			else if (naturalEnd)
-			{
+				// HK's natural DoDreamReturn (win) / hero-death (loss) transition
+				// is queued from the previous step and just needs time to leave
+				// the boss arena. Loading on top of it would race and corrupt
+				// state — wait for the scene to actually change first.
 				_resetBranch = 1;
-				LogBossDiag($"reset#{_resetCount} NATURAL-END WAIT (in {preScene})");
 				yield return WaitForSceneChange(preScene);
 				var afterScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
-				LogBossDiag($"reset#{_resetCount} NATURAL-END DONE (now in {afterScene})");
 				LogPhase("Reset", $"NATURAL-END (pre={preScene} post={afterScene})");
 			}
 			else
 			{
-				_resetBranch = 2;
-				LogBossDiag($"reset#{_resetCount} PRE-SUICIDE (alive in {preScene})");
-				yield return KillKnight();
-				LogBossDiag($"reset#{_resetCount} POST-SUICIDE");
-				LogPhase("Reset", $"SUICIDE (pre={preScene})");
+				_resetBranch = 0;
+				LogPhase("Reset", "ALREADY-IN-WORKSHOP");
 			}
 
-			// Let any in-flight transition (the one that just left the arena, or
-			// any post-load scene wiring) settle before LoadBossScene kicks off
-			// our own. LoadBossScene then bounces through GG_Workshop if needed.
-			yield return new WaitForFinishedEnteringScene();
-			LogPhase("Reset", "WaitForFinishedEnteringScene (settle)");
+			// FIRST-PRINCIPLES: removed the WaitForFinishedEnteringScene "settle"
+			// that used to live here — LoadBossScene's BounceThroughWorkshop
+			// already does its own enter-scene wait, so this was redundant.
+			// Empty LogPhase preserves the 7-slot wire alignment that Python
+			// expects (binary_protocol.py:RESET_PHASE_NAMES); without it the
+			// debug breakdown labels every phase one slot to the left.
+			LogPhase("Reset", "settle (skipped)");
 
 			yield return SceneHooks.LoadBossScene(_level);
 			LogPhase("Reset", "LoadBossScene");
-
-			LogBossDiag($"reset#{_resetCount} POST-SCENELOAD (before reader recreate)");
 
 			// Force-recreate the hitbox reader for the boss scene. The activeSceneChanged
 			// event is unreliable under multi-instance load (some instances miss it), so
@@ -235,7 +186,6 @@ namespace FullKnight.Environment
 			LogPhase("Reset", "RecreateReader+frame");
 
 			InitBossRefs();
-			LogBossDiag($"reset#{_resetCount} POST-INITBOSSREFS");
 			LogPhase("Reset", "InitBossRefs");
 			// One-line pass/fail signal for the same-scene-reload bug. Grep for
 			// "[BounceCheck]" to audit every reset at a glance.
@@ -245,15 +195,6 @@ namespace FullKnight.Environment
 
 			UnhookDamage();
 			HookDamage();
-
-			// Swap multiplier in place (cheap) — IL hooks installed once at
-			// first reset stay live across the run. Dropping the multiplier
-			// from kResetTimeScale=20 back to _timeScaleValue here is the
-			// counterpart to the early SetMultiplier(20) at the top of Reset.
-			if (_timeManager == null)
-				_timeManager = new Game.TimeScale(_timeScaleValue);
-			else
-				_timeManager.SetMultiplier(_timeScaleValue);
 
 			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs, emitTerrainDebug: _evalMode);
 			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
@@ -351,56 +292,6 @@ namespace FullKnight.Environment
 			Time.captureDeltaTime = 0;  // restore real-time so timeScale gymnastics work
 			float frameSkipMs = (Time.realtimeSinceStartup - frameSkipT0) * 1000f;
 
-			// If boss intro is still playing, fast-forward until combat starts
-			float introT0 = Time.realtimeSinceStartup;
-			int introFrames = 0;
-			bool introSkipRan = !_combatStarted;
-			bool introSkipTimedOut = false;
-			float introSettleMs = 0f;
-			if (!_combatStarted)
-			{
-				LogBossDiag($"reset#{_resetCount} INTRO-SKIP START");
-				Time.timeScale = 20f;
-				while (!HasActiveCombatHitboxes())
-				{
-					introFrames++;
-					// Dense early logging (every 10 frames for first 200, then every 100)
-					// lets us pinpoint the exact frame the boss glitches to the ceiling.
-					bool shouldDiag = introFrames <= 200
-						? (introFrames % 10 == 0)
-						: (introFrames % 100 == 0);
-					if (shouldDiag)
-						LogBossDiag($"reset#{_resetCount} INTRO-SKIP f{introFrames}");
-					if (introFrames > 5000)
-					{
-						var hb = _hitboxObserver.GetHitboxes();
-						Log($"IntroSkip: TIMEOUT after {introFrames} frames — "
-							+ $"enemy={hb[HitboxType.Enemy].Count} terrain={hb[HitboxType.Terrain].Count} "
-							+ $"scene={UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}");
-						LogBossDiag($"reset#{_resetCount} INTRO-SKIP TIMEOUT");
-						introSkipTimedOut = true;
-						break;
-					}
-					yield return null;
-				}
-				LogBossDiag($"reset#{_resetCount} INTRO-SKIP DONE (after {introFrames} frames)");
-				_combatStarted = true;
-				// Clear any accidental reward signals from intro
-				_hitsTakenInStep = 0;
-				_damageLandedInStep = 0;
-				// Run one normal frame skip at real speed so first obs is clean.
-				// captureDeltaTime here too so the settle window matches a
-				// normal agent step's per-frame game-time exactly.
-				float settleT0 = Time.realtimeSinceStartup;
-				Time.timeScale = _timeScaleValue;
-				Time.captureDeltaTime = kStepDeltaTime;
-				for (int i = 0; i < _frameSkipCount; i++)
-					yield return null;
-				Time.captureDeltaTime = 0;
-				introSettleMs = (Time.realtimeSinceStartup - settleT0) * 1000f;
-			}
-			float introTotalMs = (Time.realtimeSinceStartup - introT0) * 1000f;
-
 			Time.timeScale = 0;
 			data.step_game_time = gameTimeElapsed;
 			data.step_real_time = realTimeElapsed;
@@ -443,21 +334,15 @@ namespace FullKnight.Environment
 			data.diag_kind_cache_size = sizes.KindCacheCount;
 			data.diag_gc_heap_mb = System.GC.GetTotalMemory(false) / (1024f * 1024f);
 
-			// Slow-step diagnostic. Wall time is dominated by the frame-skip and
-			// intro-skip loops; obs build / hooks / GC probes are <1ms. Always
-			// log the first step after a reset (intro-skip lives there) and any
-			// step over 1s wall. Emitted before the done-branch so dying-during-
-			// intro-skip steps get attributed too.
+			// Slow-step diagnostic. Wall time is dominated by the frame-skip
+			// loop; obs build / hooks / GC probes are <1ms.
 			float stepWallMs = (Time.realtimeSinceStartup - _phaseStart) * 1000f;
-			if (stepWallMs > 1000f || introSkipRan)
+			if (stepWallMs > 1000f)
 			{
 				Log($"[Step-Timing] reset#{_resetCount} step#{_stepCount} "
 					+ $"total={stepWallMs:F0}ms frameSkip={frameSkipMs:F0}ms"
 					+ $"({frameSkipFrames}f) "
-					+ $"introSkip={(introSkipRan ? introTotalMs : 0):F0}ms"
-					+ $"({introFrames}f, settle={introSettleMs:F0}ms"
-					+ (introSkipTimedOut ? ", TIMEOUT" : "")
-					+ $") gameTime={gameTimeElapsed * 1000:F0}ms "
+					+ $"gameTime={gameTimeElapsed * 1000:F0}ms "
 					+ $"realTime={realTimeElapsed * 1000:F0}ms "
 					+ $"timeScale={_timeScaleValue} done={_episodeDone}");
 			}
@@ -518,131 +403,6 @@ namespace FullKnight.Environment
 			_resetPhaseFrames.Add(deltaFrames);
 			float msPerFrame = deltaFrames > 0 ? deltaMs / deltaFrames : 0f;
 			Log($"[Phase-Timing] {scope}#{_resetCount} {label}: +{deltaMs:F0}ms / {deltaFrames}f ({msPerFrame:F1}ms/f) (total {totalMs:F0}ms)");
-		}
-
-		/// <summary>
-		/// Dump every piece of state useful for diagnosing boss-reset bugs:
-		/// active scene, knight position, boss GameObject/HealthManager status,
-		/// FSM active state name, enemy hitbox inventory, BossSceneController
-		/// state, key PlayerData flags. Called at multiple points during Reset
-		/// and the intro-skip loop so log timelines tell the whole story.
-		/// </summary>
-		private void LogBossDiag(string tag)
-		{
-			var sb = new StringBuilder();
-			sb.Append("[DIAG ").Append(tag).Append("]\n");
-			try
-			{
-				var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
-				sb.Append("  scene=").Append(scene.name)
-				  .Append(" loaded=").Append(scene.isLoaded)
-				  .Append(" time=").Append(Time.timeScale.ToString("0.00"))
-				  .Append(" combatStarted=").Append(_combatStarted)
-				  .Append('\n');
-
-				var hc = HeroController.instance;
-				if (hc != null)
-				{
-					var p = hc.transform.position;
-					sb.Append("  knight pos=(").Append(p.x.ToString("0.00")).Append(',')
-					  .Append(p.y.ToString("0.00")).Append(")\n");
-				}
-				else sb.Append("  knight=NULL\n");
-
-				var bsc = BossSceneController.Instance;
-				if (bsc != null)
-				{
-					sb.Append("  BossSceneController: bosses.len=")
-					  .Append(bsc.bosses != null ? bsc.bosses.Length : -1)
-					  .Append(" BossLevel=").Append(bsc.BossLevel)
-					  .Append('\n');
-					if (bsc.bosses != null)
-					{
-						for (int i = 0; i < bsc.bosses.Length; i++)
-						{
-							var b = bsc.bosses[i];
-							if (b == null) { sb.Append("    [").Append(i).Append("] NULL\n"); continue; }
-							var go = b.gameObject;
-							sb.Append("    [").Append(i).Append("] name=").Append(go.name)
-							  .Append(" active=").Append(go.activeInHierarchy)
-							  .Append(" pos=(").Append(go.transform.position.x.ToString("0.00"))
-							  .Append(',').Append(go.transform.position.y.ToString("0.00")).Append(")");
-							var hm = go.GetComponent<HealthManager>();
-							if (hm != null)
-								sb.Append(" hp=").Append(hm.hp).Append(" dead=").Append(hm.isDead)
-								  .Append(" invincible=").Append(hm.IsInvincible);
-							var rb = go.GetComponent<Rigidbody2D>();
-							if (rb != null)
-								sb.Append(" vel=(").Append(rb.velocity.x.ToString("0.00"))
-								  .Append(',').Append(rb.velocity.y.ToString("0.00")).Append(")");
-							sb.Append('\n');
-							// Dump every PlayMakerFSM on boss + its children so we can
-							// see which state the sleep/wake machine is sitting in.
-							var fsms = go.GetComponentsInChildren<PlayMakerFSM>(true);
-							foreach (var fsm in fsms)
-							{
-								sb.Append("      fsm='").Append(fsm.FsmName)
-								  .Append("' state='")
-								  .Append(fsm.ActiveStateName ?? "<none>")
-								  .Append("' on ").Append(fsm.gameObject.name).Append('\n');
-							}
-						}
-					}
-				}
-				else sb.Append("  BossSceneController.Instance=NULL\n");
-
-				// Hitbox inventory: what does the observer currently see?
-				var hitboxes = _hitboxObserver.GetHitboxes();
-				int enemyCount = 0, attackCount = 0, terrainCount = 0;
-				if (hitboxes != null)
-				{
-					if (hitboxes.ContainsKey(HitboxType.Enemy)) enemyCount = hitboxes[HitboxType.Enemy].Count;
-					if (hitboxes.ContainsKey(HitboxType.Attack)) attackCount = hitboxes[HitboxType.Attack].Count;
-					if (hitboxes.ContainsKey(HitboxType.Terrain)) terrainCount = hitboxes[HitboxType.Terrain].Count;
-				}
-				sb.Append("  hitboxes: enemy=").Append(enemyCount)
-				  .Append(" attack=").Append(attackCount)
-				  .Append(" terrain=").Append(terrainCount).Append('\n');
-				// Enumerate live enemy hitboxes with positions — this is the clearest
-				// signal of "where did the boss actually go" independent of FSM guesses.
-				if (hitboxes != null && hitboxes.ContainsKey(HitboxType.Enemy))
-				{
-					int i = 0;
-					foreach (var col in hitboxes[HitboxType.Enemy])
-					{
-						if (col == null) continue;
-						var c = col.bounds.center;
-						sb.Append("    enemy[").Append(i++).Append("] ")
-						  .Append(col.gameObject.name)
-						  .Append(" active=").Append(col.isActiveAndEnabled)
-						  .Append(" pos=(").Append(c.x.ToString("0.00"))
-						  .Append(',').Append(c.y.ToString("0.00"))
-						  .Append(") size=(").Append(col.bounds.size.x.ToString("0.00"))
-						  .Append(',').Append(col.bounds.size.y.ToString("0.00"))
-						  .Append(")\n");
-						if (i >= 12) { sb.Append("    ...\n"); break; }
-					}
-				}
-
-				// PlayerData flags that can influence whether a boss intro plays
-				// (if HK reads them for sleep/wake FSMs in the HoG variant).
-				var pd = PlayerData.instance;
-				if (pd != null)
-				{
-					sb.Append("  pd:");
-					foreach (var key in new[] { "killedBigFly", "killedGruzMother", "newGruzMother" })
-					{
-						try { sb.Append(' ').Append(key).Append('=').Append(pd.GetBool(key)); }
-						catch { sb.Append(' ').Append(key).Append("=?"); }
-					}
-					sb.Append('\n');
-				}
-			}
-			catch (System.Exception e)
-			{
-				sb.Append("  EXCEPTION: ").Append(e.GetType().Name).Append(": ").Append(e.Message).Append('\n');
-			}
-			FullKnight.Instance.Log(sb.ToString());
 		}
 
 		protected override IEnumerator Setup()
@@ -711,7 +471,7 @@ namespace FullKnight.Environment
 		// the applied damage; pass `damage` through unchanged.
 		private int OnKnightDamaged(int damageType, int damage)
 		{
-			if (!_syntheticKill) _hitsTakenInStep++;
+			_hitsTakenInStep++;
 			return damage;
 		}
 
@@ -748,54 +508,57 @@ namespace FullKnight.Environment
 			}
 		}
 
-		// Force-kill the knight via HK's natural damage path. Step-budget resets
-		// fire mid-fight on a live knight + live boss; yanking that into a new
-		// scene leaves FSM coroutines / HUD bindings in inconsistent states
-		// (missing healthbar, stuck-on-ceiling boss). Riding the death sequence
-		// gives HK its blessed cleanup: death anim → DreamReturn → GG_Workshop.
-		// The _syntheticKill guard suppresses hit-counter inflation in
-		// OnKnightDamaged for both this fatal hit and any incidental damage
-		// during the death animation.
-		private IEnumerator KillKnight()
-		{
-			_syntheticKill = true;
-			HeroController.instance.TakeDamage(
-				HeroController.instance.gameObject,
-				GlobalEnums.CollisionSide.other,
-				9999, 0);
-			int timeoutFrames = 2000;
-			while (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name != "GG_Workshop"
-				&& --timeoutFrames > 0)
-			{
-				yield return null;
-			}
-			if (timeoutFrames <= 0)
-			{
-				Log($"KillKnight: TIMEOUT waiting for GG_Workshop "
-					+ $"(still in {UnityEngine.SceneManagement.SceneManager.GetActiveScene().name})");
-			}
-			yield return new WaitForFinishedEnteringScene();
-			_syntheticKill = false;
-		}
-
 		// Wait for HK's natural end-of-episode transition (boss-complete
 		// DoDreamReturn on a win, hero-death dream return on a loss) to leave
-		// the current arena. Destination-agnostic: boss-complete can land us in
-		// a non-Workshop scene (pantheon completion rooms etc.), and we don't
-		// need to know which — LoadBossScene will bounce through Workshop from
-		// wherever HK puts us. We just need to be out of `fromScene` so our
-		// scene load doesn't race the queued natural transition.
+		// the current arena AND fully finish its Finish callback chain.
+		//
+		// Both gates matter. Scene-name flip alone fires during sceneLoad's
+		// ActivationComplete, but `gm.sceneLoad` only nulls in the later Finish
+		// callback. Issuing BeginSceneTransition in that window is rejected
+		// with "Cannot scene transition while a scene transition is in
+		// progress" (logged by GameManager) and HK ends up stuck in
+		// ENTERING_LEVEL forever — the boss scene never loads. Polling
+		// IsInSceneTransition (cleared inside Finish, after sceneLoad = null)
+		// closes that race.
 		private IEnumerator WaitForSceneChange(string fromScene)
 		{
 			int timeoutFrames = 5000;
-			while (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == fromScene
-				&& --timeoutFrames > 0)
+			int waited = 0;
+			float t0 = Time.realtimeSinceStartup;
+			var gm = GameManager.instance;
+			while (--timeoutFrames > 0)
 			{
+				bool sceneFlipped = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name != fromScene;
+				bool transitionDone = gm == null || !gm.IsInSceneTransition;
+				if (sceneFlipped && transitionDone)
+					break;
+				waited++;
+				// Periodic heartbeat with HK-side state. Lets us tell, when
+				// a reset is hanging, whether HK's death/win transition is
+				// actually progressing or whether we're frozen on something.
+				// Sampled every 60 frames so the log isn't drowned but the
+				// signal arrives quickly enough to catch a stuck timescale.
+				if (waited % 60 == 0)
+				{
+					var pd = PlayerData.instance;
+					string gs = gm != null ? gm.GetSceneNameString() : "?";
+					string state = "?";
+					try { state = gm != null ? gm.gameState.ToString() : "?"; }
+					catch { }
+					int hp = pd != null ? pd.health : -1;
+					Log($"[WaitForSceneChange] reset#{_resetCount} f{waited} "
+						+ $"still={fromScene} gm.scene={gs} state={state} "
+						+ $"inTransition={(gm != null && gm.IsInSceneTransition)} "
+						+ $"timeScale={Time.timeScale:F2} hp={hp} "
+						+ $"elapsed={(Time.realtimeSinceStartup - t0) * 1000f:F0}ms");
+				}
 				yield return null;
 			}
 			if (timeoutFrames <= 0)
 			{
-				Log($"WaitForSceneChange: TIMEOUT (still in {fromScene})");
+				Log($"WaitForSceneChange: TIMEOUT after {waited} frames "
+					+ $"(still in {fromScene}, "
+					+ $"elapsed={(Time.realtimeSinceStartup - t0) * 1000f:F0}ms)");
 			}
 		}
 

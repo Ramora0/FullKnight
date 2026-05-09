@@ -2,6 +2,28 @@ import argparse
 from dataclasses import dataclass, fields
 
 
+# Fields exposed as `--<name>` flags by Config.from_cli. Everything else lives
+# as an internal default — model/encoder dims, observation layout, D-curriculum
+# tuning constants, vocab caps — and is set in code, not at the command line.
+# Add a name here when a knob earns its place on the CLI; if you find yourself
+# adding most fields, the whitelist isn't doing its job.
+_CLI_FIELDS = frozenset({
+    # Run control
+    "n_envs", "level", "boss_levels",
+    "frames_per_wait", "time_scale", "fps_cap",
+    "hk_path",
+    "seed", "resume", "time_budget", "diag_epochs", "visualize",
+    "debug_transitions",
+    "wandb_project", "save_path", "save_every_steps",
+    "total_env_steps", "total_steps_per_epoch",
+    # PPO / training knobs that get ablated
+    "lr", "gamma", "gae_lambda", "clip_eps", "value_coeff",
+    "entropy_coeff", "max_grad_norm", "target_kl",
+    "batch_size", "train_iters",
+    "hard_restart_every_epochs",
+})
+
+
 @dataclass
 class Config:
     @property
@@ -28,17 +50,11 @@ class Config:
     # bound where HK FSM/animator timing stays sane (per ideas.md).
     frames_per_wait: int = 1
     time_scale: int = 3
-    # Staggered reset cadence: every `steps_per_reset` accumulated env-steps,
-    # schedule a reset for max(1, n_envs // envs_per_reset_div) envs. Resets
-    # run as background asyncio tasks overlapping the next rollout; scheduled
-    # envs sit out of the active set until their reset completes.
-    envs_per_reset_div: int = 8
-    # 0 disables staggered anti-drift resets entirely. Natural episode
-    # endings (knight dies / boss dies) reset envs frequently enough in
-    # the current regime that the staggered cadence is redundant; each
-    # forced mid-fight suicide costs ~7s wallclock. Long-run state drift
-    # is still patched by hard_restart_every_epochs.
-    steps_per_reset: int = 0
+    # Cap Unity's frame rate (Application.targetFrameRate). 0 = uncapped (-1),
+    # the default used in training. Set to e.g. 60 when watching graphical
+    # runs locally, so HK doesn't burn CPU at hundreds of fps. Plumbed to C#
+    # via FK_FPS_CAP env var on instance launch (see train.py / instance_manager).
+    fps_cap: int = 0
 
     # Hollow Knight paths (Windows)
     hk_path: str = r"C:\Program Files (x86)\Steam\steamapps\common\Hollow Knight"
@@ -127,7 +143,6 @@ class Config:
     total_steps_per_epoch: int = 1024
     batch_size: int = 128
     train_iters: int = 2
-    anneal_lr: bool = True
     save_every_steps: int = 51_200
     # How often to hard-kill and relaunch every HK instance during training.
     # Patches the long-running env-state exploitation observed across multi-hour
@@ -168,13 +183,26 @@ class Config:
 
     # Debug
     visualize: bool = False
+    # Strip all training-loop prints (timing/perf/leak/policy/slow/epoch
+    # summary) and emit only scene-transition events: reset start/done
+    # with per-phase breakdown + branch, episode-end (win/loss + level),
+    # connection events, hard restarts. C# mod logs ([Phase-Timing],
+    # [BounceCheck], [Reset-Timing], [SceneHooks]) still go to HK's mod
+    # log file — tail that alongside this output to debug freezes.
+    debug_transitions: bool = False
 
     @classmethod
     def from_cli(cls) -> "Config":
-        """Build Config from dataclass defaults, overridden by any CLI args."""
+        """Build Config from dataclass defaults, overridden by CLI args.
+
+        Only fields listed in `_CLI_FIELDS` get a `--<name>` flag. Other
+        fields are intentionally set in code only — see the whitelist's
+        docstring for the rationale.
+        """
         parser = argparse.ArgumentParser()
-        defaults = cls()
         for f in fields(cls):
+            if f.name not in _CLI_FIELDS:
+                continue
             if f.type is bool:
                 parser.add_argument(f"--{f.name}", action="store_true", default=None)
                 parser.add_argument(f"--no-{f.name}", dest=f.name, action="store_false")

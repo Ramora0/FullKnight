@@ -141,7 +141,7 @@ RESET_PHASE_NAMES = (
     "pre_unload", "transition_out", "settle", "load_boss_scene",
     "recreate_reader", "init_boss_refs", "obs_final",
 )
-RESET_BRANCH_NAMES = {0: "workshop", 1: "natural_end", 2: "suicide"}
+RESET_BRANCH_NAMES = {0: "workshop", 1: "natural_end"}
 
 # Side channel: last diag tuple pulled off the wire. Populated by unpack_step,
 # read by vec_env so we don't balloon the main return tuple on every caller.

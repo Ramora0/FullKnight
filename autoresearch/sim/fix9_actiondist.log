@@ -1,0 +1,48 @@
+Seeded all RNGs with 42
+Spawning 8 HK instance(s)...
+WebSocket server started on ws://localhost:8765
+Waiting for 8 game instances to connect...
+Instance 0 connected.
+Instance 1 connected.
+Instance 2 connected.
+Instance 3 connected.
+Instance 4 connected.
+Instance 5 connected.
+Instance 6 connected.
+Instance 7 connected.
+All 8 instances connected.
+D curriculum: step_scale=0.1250 window=80 ema=0.9936 max_delta=0.0000 (from config 10/0.95/0.0)
+Boss pool: ['GG_Mega_Moss_Charger']
+Initial env_boss: ['GG_Mega_Moss_Charger', 'GG_Mega_Moss_Charger', 'GG_Mega_Moss_Charger', 'GG_Mega_Moss_Charger', 'GG_Mega_Moss_Charger', 'GG_Mega_Moss_Charger', 'GG_Mega_Moss_Charger', 'GG_Mega_Moss_Charger']
+Using device: cuda
+Model parameters: 360,402
+reset_all: 8 envs in 1.1s
+[vocab] new kind #2: 'Burrow Hit'
+[vocab] new kind #3: 'Mega Moss Charger'
+[vocab] new kind #4: 'Crouch Hit'
+[vocab] new kind #5: 'Charge Hit'
+  [cuda_graphs] capturing B=8 combat=[8, 16, 32, 64] terrain=[96]...
+[vocab] new kind #6: 'Leap Hit'
+[vocab] new kind #7: 'UpSlash'
+[vocab] new kind #8: 'Slash'
+[vocab] new kind #9: 'DownSlash'
+[vocab] new kind #10: 'AltSlash'
+Cleaning up instances...
+Traceback (most recent call last):
+  File "C:\Users\Lee\coding\CSharp\HK\FullKnight\python\train.py", line 1071, in <module>
+    main()
+  File "C:\Users\Lee\coding\CSharp\HK\FullKnight\python\train.py", line 1067, in main
+    asyncio.run(train(config))
+  File "C:\Users\Lee\AppData\Roaming\uv\python\cpython-3.12.2-windows-x86_64-none\Lib\asyncio\runners.py", line 194, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\Lee\AppData\Roaming\uv\python\cpython-3.12.2-windows-x86_64-none\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Lee\AppData\Roaming\uv\python\cpython-3.12.2-windows-x86_64-none\Lib\asyncio\base_events.py", line 685, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\Lee\coding\CSharp\HK\FullKnight\python\train.py", line 520, in train
+    minlength=config.action_n) / total_steps_epoch
+                                 ^^^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'total_steps_epoch' where it is not associated with a value

@@ -52,7 +52,7 @@ class VecEnv:
             return
 
         self._ws_connections[idx] = websocket
-        self.envs[idx] = HKEnv(websocket, self.config)
+        self.envs[idx] = HKEnv(websocket, self.config, idx=idx)
         print(f"Instance {idx} connected.")
 
         await self.envs[idx].init()
@@ -223,6 +223,12 @@ class VecEnv:
             phases["wall_dt"] = float(dt)
             self._completed_reset_dts.append(phases)
             del self._reset_tasks[env_i]
+            if getattr(self.config, "debug_transitions", False):
+                print(
+                    f"  [state] reaped env {env_i} reset (wall={dt:.1f}s) — "
+                    f"rejoining active set",
+                    flush=True,
+                )
         return completed
 
     def pop_reset_dts(self):
