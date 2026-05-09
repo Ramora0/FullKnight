@@ -73,14 +73,8 @@ namespace FullKnight.Game
 			LogStage("BeginSceneTransition (boss)");
 			yield return FixSoul();
 			LogStage("FixSoul");
-			// Realtime: this settle wait gives HK wallclock time to finish
-			// scene/FSM initialization. Switching from WaitForSeconds(2) to
-			// realtime decouples it from Time.timeScale — the prior 0.667s
-			// wallclock at timeScale=3 was empirically enough; at timeScale=20
-			// the same WaitForSeconds collapses to 100ms wallclock and the boss
-			// FSM doesn't finish waking, causing intro-skip TIMEOUT in step 1.
-			yield return new WaitForSecondsRealtime(0.667f);
-			LogStage("WaitForSecondsRealtime(0.667)");
+			yield return new WaitForSeconds(2f);
+			LogStage("WaitForSeconds(2)");
 		}
 
 		private static IEnumerator BounceThroughWorkshop()
@@ -113,16 +107,13 @@ namespace FullKnight.Game
 			yield return new WaitForFinishedEnteringScene();
 			float t1 = Time.realtimeSinceStartup;
 			yield return null;
-			// Realtime — see LoadBossScene's note. 0.333s wallclock matches the
-			// prior baseline (1f / timeScale=3) and is empirically enough for
-			// HeroController to be ready for the soul-charge refresh below.
-			yield return new WaitForSecondsRealtime(0.333f);
+			yield return new WaitForSeconds(1f);
 			float t2 = Time.realtimeSinceStartup;
 			HeroController.instance.AddMPCharge(1);
 			HeroController.instance.AddMPCharge(-1);
 			FullKnight.Instance.Log(
 				$"[Phase-Timing] FixSoul: WaitForFinishedEnteringScene={(t1 - t0) * 1000f:F0}ms"
-				+ $" WaitForSecondsRealtime(0.333)+frame={(t2 - t1) * 1000f:F0}ms"
+				+ $" WaitForSeconds(1)+frame={(t2 - t1) * 1000f:F0}ms"
 				+ $" total={(t2 - t0) * 1000f:F0}ms");
 		}
 
