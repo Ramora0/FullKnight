@@ -153,9 +153,20 @@ class FullKnightActorCritic(nn.Module):
         nn.init.orthogonal_(self.gru_proj_out.weight, gain=0.1)
         nn.init.constant_(self.gru_proj_out.bias, 0.0)
 
-        # Bias action head toward attack_tap (idx 0) at init
+        # Bias action head toward attack_tap (idx 0) and away from "none"
+        # (idx 7) at init. "none" is the only action[2] choice without a
+        # CAN_X validity mask; whenever attack/dash/cast/etc. get masked,
+        # "none" picks up renormalized probability mass and PG drifts the
+        # bias further toward idle. A strong negative initial logit on
+        # "none" is harder to erode than a small one — it acts as a
+        # persistent prior keeping the agent engaged even when its
+        # gradient signal is sparse and noisy. Combined with the
+        # idle_action_penalty in PPO, this fights both the sampling-side
+        # (renormalization) and gradient-side (PG drift) sources of the
+        # idle collapse.
         with torch.no_grad():
-            self.head_action.bias[0] = 1.0
+            self.head_action.bias[0] = 1.0   # +1 toward attack_tap
+            self.head_action.bias[7] = -2.0  # -2 against none
 
     def _encode(self, obs: Observation, hx=None):
         global_emb = self.global_encoder(obs.global_state)
