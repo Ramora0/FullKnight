@@ -10,28 +10,6 @@ from config import Config
 from vec_env import VecEnv
 from ppo import PPO
 from instance_manager import InstanceManager
-from observation import CB
-
-
-def _compute_proximity(combat_hb, combat_mask, scale):
-    """Per-env proximity-to-target shaping reward, exp(-min_target_dist/scale).
-
-    combat_hb: (B, max_combat, 10) raw (pre-normalization) world-unit hitboxes.
-    combat_mask: (B, max_combat) 0/1 valid-row mask.
-    scale: world-unit decay constant. Returns (B,) float32 in [0, 1].
-
-    Returns 0 for envs with no visible target (boss intro / dead boss / minion
-    fights with target=False). Uses the boss's HitboxObserver-flagged is_target
-    column so multi-collider bosses contribute their nearest collider.
-    """
-    target_mask = (combat_hb[..., CB.IS_TARGET] > 0.5) & (combat_mask > 0.5)
-    rel_x = combat_hb[..., CB.REL_X]
-    rel_y = combat_hb[..., CB.REL_Y]
-    dist = np.sqrt(rel_x * rel_x + rel_y * rel_y)
-    masked_dist = np.where(target_mask, dist, np.inf)
-    min_dist = masked_dist.min(axis=-1)
-    has_target = np.isfinite(min_dist)
-    return np.where(has_target, np.exp(-min_dist / scale), 0.0).astype(np.float32)
 
 
 def merge_padded(old, new, indices, fill=0.0):
@@ -404,7 +382,6 @@ async def train(config: Config):
             buf_hp_healed = []
             buf_dones = []
             buf_committed = []  # bool, action[2] overridden by C# hard-commit state machine
-            buf_proximity = []  # (T, N_active) per-step proximity-to-target shaping reward
             buf_hx = []
             buf_step_game_times = []
             buf_step_real_times = []
@@ -459,16 +436,6 @@ async def train(config: Config):
                 buf_hp_healed.append(hp_healed)
                 buf_dones.append(done_flags)
                 buf_committed.append(committed_flags)
-                # Per-step proximity reward: exp(-min_dist_to_target/scale).
-                # Computed from the OBSERVED obs (the one the policy acted on
-                # this step), not next_obs, so the reward is causally aligned
-                # with the action just taken. CB.IS_TARGET=7, REL_X=0, REL_Y=1.
-                # For envs with no target visible (boss intro / dead boss),
-                # proximity = 0.
-                buf_proximity.append(_compute_proximity(
-                    obs.combat_hb, obs.combat_mask,
-                    config.proximity_scale,
-                ))
                 buf_step_game_times.append(step_game_times)
                 buf_step_real_times.append(step_real_times)
                 buf_step_wall_times.append(step_wall_per_env)
@@ -500,7 +467,6 @@ async def train(config: Config):
             hp_healed_arr = np.stack(buf_hp_healed)
             dones_arr = np.stack(buf_dones)
             committed_arr = np.stack(buf_committed)  # (T, N) bool
-            proximity_arr = np.stack(buf_proximity)  # (T, N) float32
             log_probs_arr = np.stack(buf_log_probs)
             log_probs_action_arr = np.stack(buf_log_probs_action)
             values_atk_arr = np.stack(buf_values_atk)
@@ -788,7 +754,6 @@ async def train(config: Config):
                 damage_landed_arr, hits_taken_arr, hp_healed_arr,
                 values_atk_arr, values_def_arr, D_per_env, buf_hx_arr,
                 dones_arr, valid_arr, committed_arr,
-                proximity_arr=proximity_arr,
             )
             torch.cuda.synchronize()
             t_train = time.perf_counter() - t0
@@ -902,7 +867,6 @@ async def train(config: Config):
             balanced_landed = float(np.mean(per_boss_landed_mean))
             balanced_taken = float(np.mean(per_boss_taken_mean))
             balanced_healed = float(np.mean(per_boss_healed_mean))
-            balanced_proximity = float(proximity_arr.mean())
             # Episode stats
             n_deaths = int(dones_arr.any(axis=0).sum())
             log = {
@@ -983,7 +947,6 @@ async def train(config: Config):
                 f"curr_rew {curriculum_reward:7.4f} | "
                 f"dmg {balanced_landed:6.3f} | "
                 f"taken {balanced_taken:6.3f} | "
-                f"prox {balanced_proximity:5.3f} | "
                 f"surr {metrics['surrogate']:7.4f} | "
                 f"kl {metrics['kl']:6.4f}"
             )
