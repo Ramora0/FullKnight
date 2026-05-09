@@ -511,6 +511,7 @@ async def train(config: Config):
             # Diagnostic: first combat event per env, step timing
             any_event = (damage_landed_arr > 0) | (hits_taken_arr > 0)  # (T, N_active)
             active_steps = int(any_event.sum())
+            total_steps_epoch = damage_landed_arr.shape[0] * damage_landed_arr.shape[1]
             # Action distribution diagnostic — tells us at a glance whether
             # the policy collapsed onto idle/none or stayed engaged. Each
             # value is the fraction of (T*N_active) steps choosing that
@@ -520,7 +521,6 @@ async def train(config: Config):
                                       minlength=config.action_n) / total_steps_epoch
             act_m_dist = np.bincount(actions_arr["movement"].reshape(-1),
                                       minlength=config.movement_n) / total_steps_epoch
-            total_steps_epoch = damage_landed_arr.shape[0] * damage_landed_arr.shape[1]
             first_event_steps = []
             for local_i in range(damage_landed_arr.shape[1]):
                 col = any_event[:, local_i]

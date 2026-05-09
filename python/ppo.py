@@ -93,7 +93,7 @@ class PPO:
         # Lazy-initialized on first collect_action() call once we know n_envs.
         self._graph_runner = None
 
-    def get_advantages(self, damage_landed, hits_taken, hp_healed, values_atk, values_def, D, heal_coef, dones=None, proximity=None, proximity_coef=0.0):
+    def get_advantages(self, damage_landed, hits_taken, hp_healed, values_atk, values_def, D, heal_coef, dones=None, proximity=None, proximity_coef=0.0, idle_mask=None, idle_penalty=0.0, attack_mask=None, attack_bonus=0.0):
         """GAE with decomposed value heads and curriculum scaling.
 
         Values are trained on stationary rewards, D scales at advantage time.
@@ -143,6 +143,14 @@ class PPO:
 
             # Curriculum-scaled advantage with heal reward
             delta = delta_atk / D - delta_def + heal_coef * hp_healed[t]
+            if idle_mask is not None and idle_penalty:
+                # Penalize free "none" picks. Scaled by idle_mask which is
+                # 1 only for FREELY-chosen action[2]=7 steps (committed-FSM
+                # release transitions are excluded).
+                delta = delta - idle_penalty * float(idle_mask[t])
+            if attack_mask is not None and attack_bonus:
+                # Reward free attack-tap picks (action[2]==0, not committed).
+                delta = delta + attack_bonus * float(attack_mask[t])
             if proximity is not None and proximity_coef:
                 # Potential-based shaping: F_t = γΦ_{t+1} − Φ_t. At episode
                 # boundaries (done at t) we bootstrap Φ_{t+1}=0 — the agent
@@ -489,15 +497,40 @@ class PPO:
         all_def_returns = np.empty((T, N), dtype=np.float32)
         heal_coef = cfg.heal_coef
         proximity_coef = getattr(cfg, "proximity_coef", 0.0)
+        idle_penalty = getattr(cfg, "idle_action_penalty", 0.0)
+        # idle_mask: 1 where action[2]==7 (none) AND not committed (free pick).
+        # Committed action[2]=7 is the post-charge release transition that
+        # the C# hard-commit FSM forces — penalizing it would discourage
+        # the agent from ever picking a hold action.
+        attack_bonus = getattr(cfg, "attack_action_bonus", 0.0)
+        not_committed = (~committed_arr.astype(bool)) if committed_arr is not None else None
+        if idle_penalty:
+            free_idle = (actions_arr["action"] == 7)
+            if not_committed is not None:
+                free_idle = free_idle & not_committed
+            idle_mask_full = free_idle.astype(np.float32)
+        else:
+            idle_mask_full = None
+        if attack_bonus:
+            free_attack = (actions_arr["action"] == 0)
+            if not_committed is not None:
+                free_attack = free_attack & not_committed
+            attack_mask_full = free_attack.astype(np.float32)
+        else:
+            attack_mask_full = None
         for env_i in range(N):
             env_dones = dones_arr[:, env_i] if dones_arr is not None else None
             env_prox = proximity_arr[:, env_i] if proximity_arr is not None else None
+            env_idle = idle_mask_full[:, env_i] if idle_mask_full is not None else None
+            env_atk = attack_mask_full[:, env_i] if attack_mask_full is not None else None
             adv, atk_ret, def_ret = self.get_advantages(
                 damage_landed_arr[:, env_i], hits_taken_arr[:, env_i],
                 hp_healed_arr[:, env_i],
                 values_atk_arr[:, env_i], values_def_arr[:, env_i],
                 float(D_per_env[env_i]), heal_coef, env_dones,
                 proximity=env_prox, proximity_coef=proximity_coef,
+                idle_mask=env_idle, idle_penalty=idle_penalty,
+                attack_mask=env_atk, attack_bonus=attack_bonus,
             )
             all_advantages[:, env_i] = adv
             all_atk_returns[:, env_i] = atk_ret

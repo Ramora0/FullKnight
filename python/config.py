@@ -107,10 +107,35 @@ class Config:
     # the agent never finds an aggressive engagement policy. Scale-units are
     # world-units (Knight is ~1u tall), so a knight at melee range
     # (dist≈3) gets exp(-3/3)≈0.37 per step, distance 9 gives ≈0.05.
-    # Coef 0.05 makes the per-step bonus comparable in magnitude to a
-    # single hit_taken=1 over ~7 melee-range steps. Set to 0 to disable.
-    proximity_coef: float = 0.05
-    proximity_scale: float = 3.0
+    # Used in the **potential-based** form F_t = γΦ_{t+1}-Φ_t (the naive
+    # `coef*Φ_t` form was wiped out by per-rollout advantage centering).
+    # Set to 0 to disable.
+    proximity_coef: float = 1.0
+    proximity_scale: float = 5.0
+
+    # Per-step bonus applied to FREELY-CHOSEN action[2]=0 (attack tap) steps.
+    # Direct counterweight to the symmetric idle penalty: idle_action_penalty
+    # alone made the agent prefer hold actions (nail_charge, focus) because
+    # the C# hard-commit FSM made those steps non-penalized "free passes."
+    # The attack bonus targets the actual desired behavior (attack-tap is the
+    # primary engagement action) rather than just punishing non-engagement.
+    # Committed steps are excluded — the bonus applies only when the agent
+    # freely chose attack. Set to 0 to disable.
+    attack_action_bonus: float = 0.05
+
+    # Per-step penalty applied to FREELY-CHOSEN action[2]=7 (none) steps.
+    # The action-head was collapsing to "none" — observed action-dist trace
+    # shows none rising from 0.47 (epoch 0) to 0.69 (epoch 90). Mechanism:
+    # "none" is the only action without a CAN_X validity mask, so when other
+    # actions get masked (attack cooldown, no soul, etc.) "none" picks up
+    # extra probability mass; PG attributes the value of those steps to
+    # "none" and pushes its bias up; the policy spirals into idle.
+    # The penalty discourages free "none" picks; committed steps (action[2]
+    # locked by the C# hard-commit FSM, including the post-charge release
+    # transition action[2]=7) are NOT penalized — they're not the agent's
+    # free choice. Value 0.05 ≈ 1/20 of a hit_taken cost — small enough not
+    # to dominate combat rewards, large enough to break the idle attractor.
+    idle_action_penalty: float = 0.05
 
 
     # PPO
