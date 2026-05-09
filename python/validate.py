@@ -256,7 +256,7 @@ def _print_throughput(r, n_envs):
     print("=" * 78)
     print(f"  THROUGHPUT  —  N={n_envs}, env-steps/sec + CPU/RAM/GC bottleneck signals")
     print("-" * 78)
-    env_steps = r["n_envs"] * r["steps_done"]
+    env_steps = r.get("total_env_steps") or (r["n_envs"] * r["steps_done"])
     wall = max(r["wall"], 1e-9)
     eps = env_steps / wall
     s = _stats(r)
@@ -288,7 +288,10 @@ def _print_summary_block(quality, throughput, throughput_n):
     else:
         dmg_m = dmg_lo = dmg_hi = hit_m = hit_lo = hit_hi = float("nan")
 
-    env_steps = throughput["n_envs"] * throughput["steps_done"]
+    # Use total_env_steps when present (async-reset path may step <n_envs envs
+    # per loop iter, so n_envs × steps_done over-counts). Fall back to the
+    # legacy product for older results dicts.
+    env_steps = throughput.get("total_env_steps") or (throughput["n_envs"] * throughput["steps_done"])
     wall = max(throughput["wall"], 1e-9)
     eps = env_steps / wall
     s = _stats(throughput)

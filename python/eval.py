@@ -20,7 +20,7 @@ from env import HKEnv
 from vec_env import VecEnv
 from vocab import KindVocab
 from observation import Observation, filter_terrain_in_view
-from train import merge_obs_padded
+from train import merge_obs_padded, slice_obs
 
 
 async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
@@ -410,9 +410,18 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
     t_action_total = 0.0       # agent.collect_action + action_vec build
     t_step_total = 0.0         # await vec_env.step_all(...)
     t_postproc_total = 0.0     # totals/buffers/perf-sample bookkeeping
-    t_done_total = 0.0         # done-handling: reset gather + merge + hx reset
+    t_done_total = 0.0         # done-handling: kick off async resets + bookkeeping
     t_pbar_total = 0.0         # tqdm.update + set_postfix (not free at 32 step/s × 8)
     n_resets = 0               # number of (env, done) events processed
+    # Async-reset state. Resets fire as background tasks and resetting envs
+    # drop out of `active_envs` until the task completes. obs_full is the
+    # canonical (n_envs,...) Observation; we slice to active for stepping
+    # and merge step results / reaped reset obs back in. total_env_steps
+    # is the actual count of env-steps (sum of |active| per loop iter) —
+    # may be less than n_steps × n_envs when envs are sitting out for resets.
+    active_envs = list(range(n_envs))
+    obs_full = obs
+    total_env_steps = 0
     # HK process RSS + CPU% sampled every PERF_SAMPLE_PERIOD steps. RAM is a
     # single Win32 syscall (~10us); cpu_percent(interval=None) returns the
     # delta since the last call, so we prime once before stepping and then
@@ -463,30 +472,70 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
     try:
         for step in range(n_steps):
             ta0 = _time.perf_counter()
+
+            # Reap any background resets that finished since the prior iter.
+            # Splice their fresh obs into obs_full, zero hidden state, and add
+            # them back to active_envs.
+            reaped = vec_env.reap_completed_resets()
+            if reaped:
+                reaped_indices = [env_i for env_i, _ in reaped]
+                reaped_obs_batch = vec_env._batch_observations(
+                    [raw for _, raw in reaped]
+                )
+                obs_full = merge_obs_padded(obs_full, reaped_obs_batch, reaped_indices)
+                if not no_agent:
+                    agent.reset_hidden_for(reaped_indices)
+                active_envs = sorted(set(active_envs) | set(reaped_indices))
+
+            # If literally nothing is active (rare — all 8 dying simultaneously),
+            # block until at least one reset finishes so we don't crash on empty
+            # batch.
+            if not active_envs:
+                if vec_env._reset_tasks:
+                    reaped = await vec_env.await_all_resets()
+                    reaped_indices = [env_i for env_i, _ in reaped]
+                    reaped_obs_batch = vec_env._batch_observations(
+                        [raw for _, raw in reaped]
+                    )
+                    obs_full = merge_obs_padded(obs_full, reaped_obs_batch, reaped_indices)
+                    if not no_agent:
+                        agent.reset_hidden_for(reaped_indices)
+                    active_envs = reaped_indices
+                else:
+                    break  # shouldn't happen
+
+            N_active = len(active_envs)
+            obs = slice_obs(obs_full, active_envs)
+
             if no_agent:
-                action_vecs = [[2, 2, 7, 1] for _ in range(n_envs)]
+                action_vecs = [[2, 2, 7, 1] for _ in range(N_active)]
             else:
-                actions_np, _, _, _, _ = agent.collect_action(obs)
+                actions_np, _, _, _, _ = agent.collect_action(obs, env_indices=active_envs)
                 action_vecs = [
                     [int(actions_np["movement"][i]),
                      int(actions_np["direction"][i]),
                      int(actions_np["action"][i]),
                      int(actions_np["jump"][i])]
-                    for i in range(n_envs)
+                    for i in range(N_active)
                 ]
             ta1 = _time.perf_counter()
             t_action_total += ta1 - ta0
 
             (next_obs, damage, hits, hp_healed, done_flags,
-             committed, gtimes, rtimes, wtimes, diag) = await vec_env.step_all(action_vecs)
+             committed, gtimes, rtimes, wtimes, diag) = await vec_env.step_all(
+                action_vecs, active_indices=active_envs)
             ts1 = _time.perf_counter()
             t_step_total += ts1 - ta1
 
-            total_damage += damage
-            total_hits += hits.astype(np.int64)
-            running_dmg += damage
-            running_hits += hits.astype(np.int64)
-            running_steps += 1
+            total_env_steps += N_active
+
+            # Update per-env stats. damage[local_i] applies to active_envs[local_i].
+            for local_i, env_i in enumerate(active_envs):
+                total_damage[env_i] += damage[local_i]
+                total_hits[env_i] += int(hits[local_i])
+                running_dmg[env_i] += damage[local_i]
+                running_hits[env_i] += int(hits[local_i])
+                running_steps[env_i] += 1
             gtime_samples.extend(gtimes.tolist())
             rtime_samples.extend(rtimes.tolist())
             wtime_samples.extend(wtimes.tolist())
@@ -497,34 +546,40 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
             tp1 = _time.perf_counter()
             t_postproc_total += tp1 - ts1
 
+            # Splice the just-stepped obs back into obs_full so the canonical
+            # state is up-to-date. Done envs get terminal obs spliced too;
+            # those slots are about to be overwritten on reset reap, so it's
+            # harmless.
+            obs_full = merge_obs_padded(obs_full, next_obs, active_envs)
+
+            # Process done events: push episode stats, kick off background
+            # resets, drop done envs from active_envs.
             if done_flags.any():
-                done_indices = np.where(done_flags)[0].tolist()
-                n_resets += len(done_indices)
-                for ei in done_indices:
-                    ep_dmg.append(float(running_dmg[ei]))
-                    ep_hits.append(int(running_hits[ei]))
-                    ep_steps.append(int(running_steps[ei]))
-                    running_dmg[ei] = 0.0
-                    running_hits[ei] = 0
-                    running_steps[ei] = 0
-                # Synchronous reset for any env that finished.
-                reset_results = await asyncio.gather(*[
-                    vec_env.envs[ei].reset(level=level) for ei in done_indices
-                ])
-                reset_batch = vec_env._batch_observations(reset_results)
-                next_obs = merge_obs_padded(next_obs, reset_batch, done_indices)
-                if not no_agent:
-                    agent.reset_hidden_for(done_indices)
+                local_done = np.where(done_flags)[0].tolist()
+                done_envs = [active_envs[li] for li in local_done]
+                n_resets += len(done_envs)
+                for env_i in done_envs:
+                    ep_dmg.append(float(running_dmg[env_i]))
+                    ep_hits.append(int(running_hits[env_i]))
+                    ep_steps.append(int(running_steps[env_i]))
+                    running_dmg[env_i] = 0.0
+                    running_hits[env_i] = 0
+                    running_steps[env_i] = 0
+                resume_indices = [i for i in active_envs if i not in set(done_envs)]
+                await vec_env.start_resets(
+                    done_envs, levels=[level] * len(done_envs),
+                    resume_indices=resume_indices,
+                )
+                active_envs = resume_indices
             td1 = _time.perf_counter()
             t_done_total += td1 - tp1
-
-            obs = next_obs
 
             pbar.update(1)
             pbar.set_postfix({
                 "dmg": f"{total_damage.sum():.1f}",
                 "hits": int(total_hits.sum()),
                 "eps": len(ep_dmg),
+                "act": N_active,
             })
             t_pbar_total += _time.perf_counter() - td1
 
@@ -534,6 +589,13 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
         pbar.close()
         wall = _time.perf_counter() - t_start
         steps_done = max(step + 1, 0)
+
+        # 0) Cancel any in-flight background reset tasks before closing the
+        #    websockets they depend on — awaiting them after socket teardown
+        #    would deadlock.
+        for task in list(vec_env._reset_tasks.values()):
+            task.cancel()
+        vec_env._reset_tasks.clear()
 
         # 1) Tell each game we're closing (best-effort, short timeout).
         for env in vec_env.envs:
@@ -600,6 +662,11 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
         "n_envs": n_envs,
         "n_steps": n_steps,
         "steps_done": steps_done,
+        # total_env_steps is the actual count of (env × step) tuples executed.
+        # Under the async-reset path it can be < n_envs × steps_done because
+        # resetting envs sit out. Throughput should divide by this, not
+        # n_envs × steps_done.
+        "total_env_steps": total_env_steps,
         "wall": wall,
         "total_damage": total_damage,
         "total_hits": total_hits,
