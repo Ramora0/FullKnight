@@ -260,6 +260,24 @@ namespace FullKnight.Environment
 			// Track HP at step start for heal detection
 			_knightHpAtStepStart = PlayerData.instance.health;
 
+			// Pin Time.deltaTime to a constant during the agent's frame-skip so
+			// per-step game-time is decoupled from Unity's wallclock framerate.
+			// Without this, faster wallclock fps = smaller deltaTime = the agent
+			// sees a different gtime regime than it was trained on, even when
+			// nothing about the simulation changed.
+			//
+			// Calibrated to baseline gtime_mean = 0.0424s/step at frames_per_wait=5
+			// → 0.00848 game-sec/frame. Time.timeScale is ignored under capture
+			// mode (Unity overrides deltaTime directly), so we restore
+			// captureDeltaTime=0 between steps to let timeScale=0 pause the engine
+			// and to let intro-skip's timeScale=20 fast-forward operate.
+			//
+			// Prior attempt (commit a2f7136, reverted) used 0.0075 — 12% under-
+			// calibrated relative to the current measured baseline; quality
+			// cratered. Recalibrating to the actual baseline now.
+			const float kStepDeltaTime = 0.00848f;
+			Time.captureDeltaTime = kStepDeltaTime;
+
 			float frameSkipT0 = Time.realtimeSinceStartup;
 			float gameTimeElapsed = 0f;
 			float realTimeElapsed = 0f;
@@ -274,6 +292,7 @@ namespace FullKnight.Environment
 				if (_bossDied || PlayerData.instance.health <= 0)
 					break;
 			}
+			Time.captureDeltaTime = 0;  // restore real-time so timeScale gymnastics work
 			float frameSkipMs = (Time.realtimeSinceStartup - frameSkipT0) * 1000f;
 
 			// If boss intro is still playing, fast-forward until combat starts
@@ -313,11 +332,15 @@ namespace FullKnight.Environment
 				// Clear any accidental reward signals from intro
 				_hitsTakenInStep = 0;
 				_damageLandedInStep = 0;
-				// Run one normal frame skip at real speed so first obs is clean
+				// Run one normal frame skip at real speed so first obs is clean.
+				// captureDeltaTime here too so the settle window matches a
+				// normal agent step's per-frame game-time exactly.
 				float settleT0 = Time.realtimeSinceStartup;
 				Time.timeScale = _timeScaleValue;
+				Time.captureDeltaTime = kStepDeltaTime;
 				for (int i = 0; i < _frameSkipCount; i++)
 					yield return null;
+				Time.captureDeltaTime = 0;
 				introSettleMs = (Time.realtimeSinceStartup - settleT0) * 1000f;
 			}
 			float introTotalMs = (Time.realtimeSinceStartup - introT0) * 1000f;
