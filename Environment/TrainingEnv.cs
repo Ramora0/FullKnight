@@ -266,16 +266,18 @@ namespace FullKnight.Environment
 			// sees a different gtime regime than it was trained on, even when
 			// nothing about the simulation changed.
 			//
-			// Calibrated to baseline gtime_mean = 0.0424s/step at frames_per_wait=5
-			// → 0.00848 game-sec/frame. Time.timeScale is ignored under capture
-			// mode (Unity overrides deltaTime directly), so we restore
-			// captureDeltaTime=0 between steps to let timeScale=0 pause the engine
-			// and to let intro-skip's timeScale=20 fast-forward operate.
+			// EMPIRICAL: under capture, Time.deltaTime = captureDeltaTime ×
+			// Time.timeScale (NOT just captureDeltaTime as Unity docs imply).
+			// First attempt at 0.00848 produced gtime=0.126/step (3× baseline)
+			// because timeScale=3 multiplied through; quality cratered.
+			// Calibration: gtime_baseline / (frames × timeScale) = 0.0424 /
+			// (5 × 3) ≈ 0.00283, giving Time.deltaTime ≈ 0.00848/frame and
+			// gtime ≈ 0.0424/step — matches the trained regime.
 			//
-			// Prior attempt (commit a2f7136, reverted) used 0.0075 — 12% under-
-			// calibrated relative to the current measured baseline; quality
-			// cratered. Recalibrating to the actual baseline now.
-			const float kStepDeltaTime = 0.00848f;
+			// Restore captureDeltaTime=0 between steps because Unity ignores
+			// Time.timeScale=0 under capture (would break the inter-step pause
+			// and the intro-skip timeScale=20 fast-forward).
+			const float kStepDeltaTime = 0.00283f;
 			Time.captureDeltaTime = kStepDeltaTime;
 
 			float frameSkipT0 = Time.realtimeSinceStartup;
@@ -591,6 +593,19 @@ namespace FullKnight.Environment
 				yield return Setup();
 				yield break;
 			}
+
+			// Uncap Unity's frame loop. With -nographics there's no display to
+			// vsync against; the only thing throttling Update() is targetFrameRate
+			// (default cap on Windows). Pairing this with captureDeltaTime in
+			// Step() decouples wallclock framerate from per-step game-time, so
+			// faster frames don't shrink dt out from under the agent. Uncap-alone
+			// (commit e094f23, reverted) gave +63% throughput but cratered
+			// quality via the regime shift; capture-alone (a2f7136) preserves
+			// regime but Unity stays at ~360fps cap and there's no speedup.
+			// Combined, the uncap delivers the wallclock win and capture holds
+			// the regime steady.
+			QualitySettings.vSyncCount = 0;
+			Application.targetFrameRate = -1;
 
 			On.GameManager.SaveGame += SaveFileProxy.DisableSaveGame;
 			SaveFileProxy.LoadCompletedSave();
