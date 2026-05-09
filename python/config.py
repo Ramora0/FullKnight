@@ -100,6 +100,18 @@ class Config:
     # the penalty for having taken that damage. Creates dodge > heal > tank ordering.
     heal_coef: float = 0.65
 
+    # Proximity shaping reward: dense per-step bonus for being near a target
+    # combat hitbox (the boss). Computed from observation as exp(-dist/scale).
+    # Without this, sparse damage events (~1-2% of steps have any combat
+    # interaction) are insufficient to drive learning from random init —
+    # the agent never finds an aggressive engagement policy. Scale-units are
+    # world-units (Knight is ~1u tall), so a knight at melee range
+    # (dist≈3) gets exp(-3/3)≈0.37 per step, distance 9 gives ≈0.05.
+    # Coef 0.05 makes the per-step bonus comparable in magnitude to a
+    # single hit_taken=1 over ~7 melee-range steps. Set to 0 to disable.
+    proximity_coef: float = 0.05
+    proximity_scale: float = 3.0
+
 
     # PPO
     lr: float = 3e-4

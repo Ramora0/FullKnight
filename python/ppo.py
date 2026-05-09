@@ -93,7 +93,7 @@ class PPO:
         # Lazy-initialized on first collect_action() call once we know n_envs.
         self._graph_runner = None
 
-    def get_advantages(self, damage_landed, hits_taken, hp_healed, values_atk, values_def, D, heal_coef, dones=None):
+    def get_advantages(self, damage_landed, hits_taken, hp_healed, values_atk, values_def, D, heal_coef, dones=None, proximity=None, proximity_coef=0.0):
         """GAE with decomposed value heads and curriculum scaling.
 
         Values are trained on stationary rewards, D scales at advantage time.
@@ -102,7 +102,13 @@ class PPO:
         hp_healed is raw HP restored this step.
         heal_coef scales hp_healed (unscaled by D, like defense).
         dones[t] = True means episode ended at step t; bootstrap to 0.
+        proximity is an optional (T,) per-step exp(-dist/scale) shaping signal.
         δ_t = δ_attack_t / D - δ_defense_t + heal_coef * hp_healed_t
+              + proximity_coef * proximity_t
+        Proximity is added directly to delta (not bootstrapped through a
+        value head): it's a per-step potential-style signal that doesn't
+        need credit assignment through V. Excluding it from atk/def returns
+        keeps the value heads tracking the raw combat signals.
         """
         T = len(damage_landed)
         gamma = self.config.gamma
@@ -133,6 +139,8 @@ class PPO:
 
             # Curriculum-scaled advantage with heal reward
             delta = delta_atk / D - delta_def + heal_coef * hp_healed[t]
+            if proximity is not None and proximity_coef:
+                delta = delta + proximity_coef * proximity[t]
             lastgaelam = delta + gamma * lam * lastgaelam
             advantages[t] = lastgaelam
 
@@ -412,7 +420,8 @@ class PPO:
                          log_probs_action_arr,
                          damage_landed_arr, hits_taken_arr, hp_healed_arr,
                          values_atk_arr, values_def_arr, D_per_env, buf_hx,
-                         dones_arr=None, valid_arr=None, committed_arr=None):
+                         dones_arr=None, valid_arr=None, committed_arr=None,
+                         proximity_arr=None):
         """Train on a collected rollout with chunked truncated BPTT.
 
         obs_buf: list of length T, each element a per-step Observation with
@@ -466,13 +475,16 @@ class PPO:
         all_atk_returns = np.empty((T, N), dtype=np.float32)
         all_def_returns = np.empty((T, N), dtype=np.float32)
         heal_coef = cfg.heal_coef
+        proximity_coef = getattr(cfg, "proximity_coef", 0.0)
         for env_i in range(N):
             env_dones = dones_arr[:, env_i] if dones_arr is not None else None
+            env_prox = proximity_arr[:, env_i] if proximity_arr is not None else None
             adv, atk_ret, def_ret = self.get_advantages(
                 damage_landed_arr[:, env_i], hits_taken_arr[:, env_i],
                 hp_healed_arr[:, env_i],
                 values_atk_arr[:, env_i], values_def_arr[:, env_i],
                 float(D_per_env[env_i]), heal_coef, env_dones,
+                proximity=env_prox, proximity_coef=proximity_coef,
             )
             all_advantages[:, env_i] = adv
             all_atk_returns[:, env_i] = atk_ret
