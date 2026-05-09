@@ -136,8 +136,16 @@ namespace FullKnight.Environment
 			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 },
 				_frameSkipCount, _timeScaleValue);
 
-			// Unpause so scene transition and WaitForSeconds can proceed
-			Time.timeScale = _timeScaleValue;
+			// Unpause so scene transition and WaitForSeconds can proceed.
+			// Use a high timeScale (matches intro-skip @ line ~290) ONLY for the
+			// game-time-bound death-anim / natural-transition waits below. We
+			// drop back to _timeScaleValue before SceneHooks.LoadBossScene starts
+			// because its WaitForSeconds(1)/(2) settle waits are tuned for that
+			// timeScale (giving HK ~1s wallclock to finish scene init); a higher
+			// timeScale there collapses them to ~50ms and the boss FSM doesn't
+			// finish waking, producing intro-skip TIMEOUT in step 1.
+			const float kResetWaitTimeScale = 20f;
+			Time.timeScale = kResetWaitTimeScale;
 
 			// Three paths out of the boss arena:
 			//  (a) Already out — death/win cleanup landed before reset arrived.
@@ -185,6 +193,10 @@ namespace FullKnight.Environment
 			yield return new WaitForFinishedEnteringScene();
 			LogPhase("Reset", "WaitForFinishedEnteringScene (settle)");
 
+			// Drop back to the agent's timeScale before SceneHooks runs — its
+			// WaitForSeconds settles need their baseline wallclock (see comment
+			// at the kResetWaitTimeScale assignment above).
+			Time.timeScale = _timeScaleValue;
 			yield return SceneHooks.LoadBossScene(_level);
 			LogPhase("Reset", "LoadBossScene");
 
