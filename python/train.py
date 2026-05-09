@@ -511,6 +511,15 @@ async def train(config: Config):
             # Diagnostic: first combat event per env, step timing
             any_event = (damage_landed_arr > 0) | (hits_taken_arr > 0)  # (T, N_active)
             active_steps = int(any_event.sum())
+            # Action distribution diagnostic — tells us at a glance whether
+            # the policy collapsed onto idle/none or stayed engaged. Each
+            # value is the fraction of (T*N_active) steps choosing that
+            # head's option. m0=left, m1=right, m2=none. d0=up, d1=down,
+            # d2=none. a0=attack, ..., a7=none. j0=yes, j1=no.
+            act_a_dist = np.bincount(actions_arr["action"].reshape(-1),
+                                      minlength=config.action_n) / total_steps_epoch
+            act_m_dist = np.bincount(actions_arr["movement"].reshape(-1),
+                                      minlength=config.movement_n) / total_steps_epoch
             total_steps_epoch = damage_landed_arr.shape[0] * damage_landed_arr.shape[1]
             first_event_steps = []
             for local_i in range(damage_landed_arr.shape[1]):
@@ -682,6 +691,13 @@ async def train(config: Config):
                     for b in sorted(per_boss_step_ms, key=lambda b: -per_boss_step_ms[b])
                 )
                 print(f"  perf | per_boss_step {boss_perf_str}")
+            print(
+                f"  pol  | a[atk={act_a_dist[0]:.2f} chg={act_a_dist[1]:.2f} "
+                f"spl={act_a_dist[2]:.2f} foc={act_a_dist[3]:.2f} "
+                f"dsh={act_a_dist[4]:.2f} drm={act_a_dist[5]:.2f} "
+                f"sdsh={act_a_dist[6]:.2f} none={act_a_dist[7]:.2f}] "
+                f"m[L={act_m_dist[0]:.2f} R={act_m_dist[1]:.2f} N={act_m_dist[2]:.2f}]"
+            )
             if slow_events_epoch:
                 cum_boss = " ".join(
                     f"{b.replace('GG_', '')}:{slow_count_by_boss[b]}"

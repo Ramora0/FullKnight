@@ -102,13 +102,17 @@ class PPO:
         hp_healed is raw HP restored this step.
         heal_coef scales hp_healed (unscaled by D, like defense).
         dones[t] = True means episode ended at step t; bootstrap to 0.
-        proximity is an optional (T,) per-step exp(-dist/scale) shaping signal.
+        proximity is an optional (T,) per-step exp(-dist/scale) shaping
+        potential. Used in the **potential-based** form:
+            F_t = γΦ_{t+1} − Φ_t   (zero at terminal)
+        which gives zero reward for stationary distance, positive for
+        approach, negative for retreat. A naive coef * Φ_t shaping (which
+        we tried first) gives a near-constant per-step signal that is
+        wiped out by the per-rollout advantage centering — the agent gets
+        no usable proximity gradient. The Δ form survives centering
+        because its mean is naturally near zero.
         δ_t = δ_attack_t / D - δ_defense_t + heal_coef * hp_healed_t
-              + proximity_coef * proximity_t
-        Proximity is added directly to delta (not bootstrapped through a
-        value head): it's a per-step potential-style signal that doesn't
-        need credit assignment through V. Excluding it from atk/def returns
-        keeps the value heads tracking the raw combat signals.
+              + proximity_coef * (γΦ_{t+1} − Φ_t)
         """
         T = len(damage_landed)
         gamma = self.config.gamma
@@ -140,7 +144,16 @@ class PPO:
             # Curriculum-scaled advantage with heal reward
             delta = delta_atk / D - delta_def + heal_coef * hp_healed[t]
             if proximity is not None and proximity_coef:
-                delta = delta + proximity_coef * proximity[t]
+                # Potential-based shaping: F_t = γΦ_{t+1} − Φ_t. At episode
+                # boundaries (done at t) we bootstrap Φ_{t+1}=0 — the agent
+                # is about to be reset, so its "next state" potential is
+                # undefined and 0 is the standard convention.
+                if t + 1 < T and not (dones is not None and dones[t]):
+                    next_phi = proximity[t + 1]
+                else:
+                    next_phi = 0.0
+                phi = proximity[t]
+                delta = delta + proximity_coef * (gamma * next_phi - phi)
             lastgaelam = delta + gamma * lam * lastgaelam
             advantages[t] = lastgaelam
 
