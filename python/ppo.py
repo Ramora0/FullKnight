@@ -7,6 +7,7 @@ from tqdm import tqdm
 from model import FullKnightActorCritic
 from observation import Observation, CB, mirror_observation, mirror_movement
 from graph_runner import BucketedGraphRunner
+from train_graph_runner import BucketedTrainGraphRunner
 
 
 class RunningNormalizer:
@@ -84,14 +85,25 @@ class PPO:
         self.combat_normalizer = RunningNormalizer(config.combat_normalized_dims)
         self.terrain_normalizer = RunningNormalizer(config.terrain_normalized_dims)
 
+        # capturable=True lets the optimizer.step() be captured by CUDA
+        # graphs (training graphs, not just rollout). Step state goes on
+        # GPU. LR is still read as a Python float so it's baked into the
+        # captured graph at first capture; LR annealing post-capture is
+        # a no-op (acceptable for our 20-min experiments where LR drifts
+        # ~5%). When training graphs are off, capturable=True is a small
+        # overhead but harmless.
         self.optimizer = torch.optim.Adam(
-            self.policy.parameters(), lr=config.lr
+            self.policy.parameters(), lr=config.lr,
+            capturable=getattr(config, "use_train_cuda_graphs", False)
+                and torch.cuda.is_available(),
         )
         # LR annealing is now step-based and driven from train.py via
         # set_lr(); no torch LR scheduler needed.
 
         # Lazy-initialized on first collect_action() call once we know n_envs.
         self._graph_runner = None
+        # Lazy-initialized on first train_on_rollout() call.
+        self._train_graph_runner = None
 
     def get_advantages(self, damage_landed, hits_taken, hp_healed, values_atk, values_def, D, heal_coef, dones=None):
         """GAE with decomposed value heads and curriculum scaling.
@@ -234,6 +246,27 @@ class PPO:
         self._norm_total = 0.0
         self._tensor_prep_total = 0.0
         return result
+
+    def _ensure_train_graph_runner(self):
+        """Lazy-init the training CUDA graph runner on first train_on_rollout."""
+        if self._train_graph_runner is not None:
+            return
+        if not getattr(self.config, "use_train_cuda_graphs", False):
+            return
+        if not torch.cuda.is_available():
+            return
+        # Reuse the rollout buckets — same bounds work for training.
+        combat_buckets = [int(x) for x in self.config.graph_combat_buckets.split(",") if x.strip()]
+        terrain_buckets = [int(x) for x in self.config.graph_terrain_buckets.split(",") if x.strip()]
+        print(
+            f"  [train_cuda_graphs] capturing CPB={self.config.chunks_per_batch} "
+            f"L={self.config.seq_len} combat={combat_buckets} terrain={terrain_buckets}",
+            flush=True,
+        )
+        self._train_graph_runner = BucketedTrainGraphRunner(
+            self.policy, self.optimizer, self.config, self.device,
+            combat_buckets, terrain_buckets,
+        )
 
     def _ensure_graph_runner(self):
         """Lazy-init the bucketed CUDA graph runner on first collect_action."""
@@ -666,6 +699,13 @@ class PPO:
         pbar = tqdm(total=total_passes, unit="pass", unit_scale=True,
                     desc="  train", leave=False, dynamic_ncols=True)
         stop_training = False
+
+        # Lazy-init the training CUDA graph runner on first call. After
+        # init, run() returns None for any minibatch whose combat/terrain
+        # dims exceed the captured buckets — caller falls back to eager.
+        self._ensure_train_graph_runner()
+        train_runner = self._train_graph_runner
+
         for _ in range(cfg.train_iters):
             if stop_training:
                 break
@@ -675,6 +715,13 @@ class PPO:
 
             for start in range(0, total_chunks, CPB):
                 idx = chunk_indices[start:start + CPB]
+                # The captured graph requires a full CPB-sized minibatch.
+                # In our standard config (n_envs in {4, 8, 16}, CPB=8)
+                # total_chunks is always a multiple of CPB, so partial
+                # minibatches don't fire. If they ever do (n_envs=1
+                # debug runs), use_graph stays False this minibatch and
+                # we fall through to the eager path.
+                use_graph = train_runner is not None and len(idx) == CPB
 
                 hx_mb = hx_t[idx].detach()
 
@@ -697,9 +744,57 @@ class PPO:
                 # training. GRU initial hidden state is left un-mirrored (we
                 # don't have an equivariant permutation for it); the chunk
                 # length L absorbs that initial-state imperfection.
+                # Mirror runs OUTSIDE the captured graph (the conditional and
+                # in-place tensor ops would be variable across replays).
                 if getattr(self.config, "mirror_aug", True) and np.random.rand() < 0.5:
                     obs_mb = mirror_observation(obs_mb)
                     act_mb["movement"] = mirror_movement(act_mb["movement"])
+
+                # ---- Try captured-graph fast path. -------------------
+                graph_out = None
+                if use_graph:
+                    graph_out = train_runner.run(
+                        obs_mb, hx_mb, act_mb,
+                        adv_t[idx], atk_ret_t[idx], def_ret_t[idx],
+                        old_lp_t[idx], old_lp_a_t[idx],
+                        valid_t[idx], committed_t[idx],
+                        atk_var_eff, def_var_eff,
+                    )
+
+                if graph_out is not None:
+                    # All compute (forward + loss + backward + clip + step)
+                    # happened inside the replay. Read scalar outputs; one
+                    # implicit sync per minibatch via .item(). Acceptable —
+                    # the per-launch overhead is gone, which was the win.
+                    surrogate_val = graph_out["surrogate"].item()
+                    value_atk_val = graph_out["value_atk"].item()
+                    value_def_val = graph_out["value_def"].item()
+                    entropy_val = graph_out["entropy"].item()
+                    kl_val = graph_out["kl"].item()
+                    gru_norm_val = graph_out["gru_norm"].item()
+
+                    total_metrics["surrogate"] += surrogate_val
+                    total_metrics["value_atk"] += value_atk_val
+                    total_metrics["value_def"] += value_def_val
+                    total_metrics["entropy"] += entropy_val
+                    total_metrics["gru_norm"] += gru_norm_val
+                    total_metrics["kl"] += kl_val
+                    iter_kl_sum += kl_val
+                    iter_kl_n += 1
+                    n_updates += 1
+                    passes_done += len(idx) * L
+                    pbar.update(len(idx) * L)
+                    pbar.set_postfix_str(f"surr={surrogate_val:+.3f} kl={kl_val:.3f}")
+
+                    if (
+                        cfg.target_kl
+                        and iter_kl_n >= 2
+                        and (iter_kl_sum / iter_kl_n) > cfg.target_kl
+                    ):
+                        stop_training = True
+                        break
+                    continue
+                # ---- End graph fast path; eager fallback below. -------
 
                 _fwd_s = torch.cuda.Event(enable_timing=True)
                 _fwd_e = torch.cuda.Event(enable_timing=True)
@@ -762,7 +857,10 @@ class PPO:
                 _bwd_s = torch.cuda.Event(enable_timing=True)
                 _bwd_e = torch.cuda.Event(enable_timing=True)
                 _bwd_s.record()
-                self.optimizer.zero_grad()
+                # set_to_none=False so grad tensor addresses are stable
+                # across replays of the captured training graph (if/when
+                # the eager path runs interleaved with graph replays).
+                self.optimizer.zero_grad(set_to_none=False)
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
                 self.optimizer.step()
@@ -774,7 +872,7 @@ class PPO:
                 total_metrics["value_atk"] += ((atk_vloss * valid_flat).sum() / valid_sum).item()
                 total_metrics["value_def"] += ((def_vloss * valid_flat).sum() / valid_sum).item()
                 total_metrics["entropy"] += entropy_loss.item()
-                total_metrics["gru_norm"] += gru_info["gru_norm"]
+                total_metrics["gru_norm"] += float(gru_info["gru_norm"])
 
                 with torch.no_grad():
                     kl = (((ratio - 1) - log_ratio) * valid_flat).sum() / valid_sum

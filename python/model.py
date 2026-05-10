@@ -399,7 +399,9 @@ class FullKnightActorCritic(nn.Module):
         log_probs_action = lp_a_flat.view(B, L)
         entropies_action = ent_a_flat.view(B, L)
 
-        gru_info = {'gru_norm': gru_seq.detach().norm(dim=-1).mean().item()}
+        # Return as tensor (not .item()) so this function is CUDA-graph-captureable.
+        # Caller .item()s after replay if it needs a Python float.
+        gru_info = {'gru_norm': gru_seq.detach().norm(dim=-1).mean()}
 
         return (log_probs, entropies, values_atk, values_def, gru_info,
                 log_probs_action, entropies_action)

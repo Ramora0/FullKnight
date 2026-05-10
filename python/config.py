@@ -200,6 +200,13 @@ class Config:
     # max observed values, but not so high that wasted compute exceeds the
     # launch-overhead savings.
     use_cuda_graphs: bool = True
+    # CUDA Graphs for the training inner loop (forward_sequence + loss +
+    # backward + clip_grad_norm + optimizer.step captured per bucket pair).
+    # Adam needs capturable=True; LR is baked at capture time and set_lr()
+    # post-capture is a no-op (acceptable: 20-min runs only drift LR ~5%).
+    # Reuses graph_combat_buckets / graph_terrain_buckets below for the
+    # bucket dims; they cap per-rollout combat/terrain padded width.
+    use_train_cuda_graphs: bool = True
     graph_combat_buckets: str = "8,16,32,64"   # comma-separated
     graph_terrain_buckets: str = "96"          # one bucket is plenty if terrain is camera-clipped
 
