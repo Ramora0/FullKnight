@@ -19,7 +19,7 @@ _CLI_FIELDS = frozenset({
     # PPO / training knobs that get ablated
     "lr", "gamma", "gae_lambda", "clip_eps", "value_coeff",
     "entropy_coeff", "max_grad_norm", "target_kl",
-    "batch_size", "train_iters",
+    "batch_size", "train_iters", "mirror_aug",
     "hard_restart_every_epochs",
     "detect_glitch", "glitch_log_dir", "glitch_max_dumps",
     "debug_recoil",
@@ -130,6 +130,9 @@ class Config:
 
 
     # PPO
+    # 50% horizontal-mirror augmentation per minibatch (data aug exploiting
+    # HK's L/R symmetry). Toggle for ablation.
+    mirror_aug: bool = False
     lr: float = 3e-4
     gamma: float = 0.95
     gae_lambda: float = 0.95

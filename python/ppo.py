@@ -697,7 +697,7 @@ class PPO:
                 # training. GRU initial hidden state is left un-mirrored (we
                 # don't have an equivariant permutation for it); the chunk
                 # length L absorbs that initial-state imperfection.
-                if np.random.rand() < 0.5:
+                if getattr(self.config, "mirror_aug", True) and np.random.rand() < 0.5:
                     obs_mb = mirror_observation(obs_mb)
                     act_mb["movement"] = mirror_movement(act_mb["movement"])
 
