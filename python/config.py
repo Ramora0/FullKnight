@@ -95,7 +95,7 @@ class Config:
     combat_output: int = 64
     terrain_hidden: int = 64
     terrain_output: int = 64
-    hidden_dim: int = 256
+    hidden_dim: int = 512
 
     # GRU (temporal memory)
     gru_dim: int = 64           # bottleneck dimension for GRU (hidden_dim -> gru_dim -> hidden_dim)
