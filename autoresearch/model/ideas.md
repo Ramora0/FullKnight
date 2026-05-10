@@ -1,118 +1,136 @@
 # Ablation ideas
 
-Running list of hyperparameter experiments to try, prioritized by expected impact
-given what we've learned so far. Diagnostic-driven — reorder based on results.
+Running list of hyperparameter experiments to try, prioritized by expected
+impact under the current may10 regime. Diagnostic-driven — reorder based on
+results.
 
 **Read `session.md` first.** This file is the longer-term menu; `session.md`
-has the current-session priority. Right now the first priority is stopping a
-post-KL-fix regression (phase A in `session.md`), not general parameter
-tuning.
+has the current-session priority ordering and any urgent fixes. The current
+defaults are the may10 baseline state (post-training-collapse fixes,
+fpw=1, n_envs=8, from-scratch).
 
-## Context from apr10 ablation
+## Current baseline config
 
-- `total_steps_per_epoch` **8192 → 1024** was a huge win (D_geomean 38.9 → 81.6)
-  on single-boss Moss Charger. Default is now 1024.
-- Even at 1024 steps, we're hitting the KL boundary consistently during training.
-  This means we're **gradient-step-limited, not data-limited**: only ~1 of 4
-  nominal train_iters actually completes before early-stop fires. Most of the
-  measured win came from fresher on-policy data and more D curriculum updates,
-  not from "more gradient updates per wallclock."
-- 4-boss pool (default now) has more per-epoch variance than single-boss;
-  sub-5% deltas should be treated as noise.
-- entropy drifted -2.10 → -1.70/-1.81 during ablation — watch for collapse
-  over longer runs.
+Knobs that matter for ablation, with their as-of-may10 values:
 
-## Top priority — directly addresses the KL-clamp bottleneck
+| Field                     | Value | Range to consider |
+|---------------------------|-------|-------------------|
+| `lr`                      | 3e-4  | 1e-4 → 1e-3 |
+| `gamma`                   | 0.95  | 0.9 / 0.97 / 0.99 |
+| `gae_lambda`              | 0.95  | 0.85 / 0.90 / 0.97 |
+| `clip_eps`                | 0.2   | 0.1 / 0.3 / 0.4 |
+| `value_coeff`             | 0.5   | 0.25 / 1.0 |
+| `entropy_coeff`           | 0.02  | 0.005 / 0.01 / 0.03 / 0.05 |
+| `max_grad_norm`           | 0.5   | 0.25 / 1.0 |
+| `target_kl`               | 0.0   | 0.01 / 0.02 / 0.05 (re-enable early-stop) |
+| `total_steps_per_epoch`   | 1024  | 512 / 2048 |
+| `batch_size`              | 128   | 64 / 256 |
+| `train_iters`             | 2     | 1 / 3 / 4 |
+| `chunks_per_batch`        | 8     | 4 / 16 |
+| `seq_len`                 | 16    | 8 / 32 |
 
-These should all compound with each other and with the steps=1024 win.
+Off-limits (see `program.md`): structural fields, observation dims, action
+dims, architecture dims, the reward-shape constants
+(`D_*`, `heal_coef`, `D_initial`, …), and the action-head init bias.
 
-### clip_eps 0.2 → 0.1
-Single most informative experiment. Tighter ratio bound means less policy
-drift per minibatch, which lets more iters complete before early-stop fires.
-If we're currently finishing ~1 iter and this gets us to ~3 iters, we triple
-the effective gradient updates per rollout. Watch `final_surrogate` — it
-should stay nonzero across all iters if the clip is doing its job.
+## Top priority — exploration / drift / gradient-step efficiency
 
-### train_iters 4 → 1 or 2
-If we're only completing ~1 iter anyway, dropping the nominal count costs
-nothing and saves loop overhead. Also a sanity check: if D_geomean doesn't
-move, confirms the KL-clamp hypothesis. If it drops, we were getting more
-than 1 iter of value after all.
+These should compound and address the three things most likely to be
+limiting from-scratch 20-min performance.
 
-### lr 5e-4 → 2.5e-4 (and maybe 1e-4)
-Smaller per-step moves, more of them before hitting the boundary. Caveat:
-Adam optimizer state is restored on resume, so need to verify the lr change
-actually takes effect (may require manually overwriting `optimizer.param_groups[0]["lr"]`
-after load, or turning off `anneal_lr` since scheduler state restore overrides it).
+### entropy_coeff 0.02 → 0.03 → 0.05 (or 0.01 / 0.005 if entropy is healthy)
+The init bias gives the action distribution a sane shape, but the entropy
+term is what keeps it spread out. If `final_entropy < -3.0` we're losing
+exploration; bump up. If `final_entropy > -1.5` and D isn't moving, we're
+over-exploring; bump down. Read `final_entropy` from the baseline first to
+pick direction.
 
-### target_kl 0.03 → 0.05 (permissive direction)
-Opposite of tightening clip: let more updates through by raising the ceiling.
-Risk: allows policy to drift further from rollout policy per epoch, so
-advantages get staler. Worth trying as an orthogonal lever to clip_eps.
+### lr 3e-4 → 1.5e-4 / 5e-4 / 1e-4 / 1e-3
+Apr11 found 3e-4 + lr-anneal optimal on warm-start. We dropped the
+anneal, so the constant 3e-4 is what the policy gets end-to-end. Worth
+re-baselining: from random init, a higher constant lr might help the
+early phase enough to outweigh late-phase drift. Watch `final_kl` —
+spikes above ~0.05 say the lr is too aggressive; clamp via
+`clip_eps`/`target_kl` or drop lr.
 
-### entropy_coeff 0.01 → 0.02 (→ 0.03/0.05)
-Keeps the policy flatter. Flatter distribution → smaller KL per logit change
-→ more headroom before early-stop. Also insurance against entropy collapse
-over long runs. Direction driven by `final_entropy` diagnostic.
+### train_iters 2 → 1 / 3 / 4
+With `target_kl=0` (no early-stop), this is a deterministic count of
+gradient passes per rollout. 2 is the apr11 winner under the warm-start
+regime; from-scratch may want more (more updates per fresh batch) or
+less (less per-rollout drift while the value head is still fitting).
+
+### target_kl 0.0 → 0.02 / 0.03 / 0.05 (re-enable early-stop)
+Setting target_kl > 0 re-enables the epoch-mean-KL early-stop in
+`train.py`. With aggressive lrs or larger train_iters this gives a
+soft trust region. Cheap to combine with lr / train_iters experiments.
+
+### clip_eps 0.2 → 0.1 / 0.3
+Tighter (0.1) reduces per-minibatch policy drift, lets more iters land
+useful gradient. Looser (0.3) lets the policy move further per update —
+might help early when the random-init policy is far from optimal.
 
 ## Second tier — orthogonal knobs
 
-### gae_lambda 0.95 → 0.9 / 0.98
-Bias-variance tradeoff in the advantage estimator. Cheap to try.
+### gae_lambda 0.95 → 0.9 / 0.85 / 0.97
+Variance-bias tradeoff in the advantage estimator. With `gamma=0.95` and
+short rollouts (T=128 per env), lower lambda focuses credit on closer
+events — might help when the per-step damage signal is the main thing
+that matters.
 
-### chunks_per_batch / seq_len
-Effective batch = chunks_per_batch × seq_len = 8 × 16 = 128 samples.
-- Smaller (chunks_per_batch 4): higher gradient variance, more updates per iter
-- Larger (chunks_per_batch 16): smoother updates, fewer per iter
-- seq_len 8 or 32: BPTT window; affects credit assignment through the GRU
+### gamma 0.95 → 0.97 / 0.99 / 0.9
+Boss attacks chain over many steps; higher gamma weights long-term
+returns more. But high gamma + per-step normalized advantage makes the
+critic harder to fit. Test cautiously.
+
+### total_steps_per_epoch 1024 → 512 / 2048
+Apr11 showed 256-step epochs were best on warm-start with
+reset-amortization. From-scratch may need bigger rollouts to overcome
+critic noise, or stay small to maximize curriculum updates per minute.
+
+### batch_size 128 → 64 / 256 (effective batch = chunks_per_batch × seq_len)
+Smaller = more updates per iter + higher gradient variance. Larger =
+smoother but fewer updates.
+
+### chunks_per_batch 8 → 4 / 16, seq_len 16 → 8 / 32
+The BPTT chunk shape. Longer seq_len = more credit through the GRU but
+a stricter on-policy assumption (the GRU hidden state from chunk-start
+becomes increasingly off-policy as the policy updates).
 
 ### value_coeff 0.5 → 0.25 / 1.0
-Critic-vs-actor loss weighting.
+Critic-vs-actor loss weighting. From-scratch the critic is initially
+useless; pushing value_coeff up may help it catch up sooner.
 
-### max_grad_norm 0.5 → 1.0 / 0.25
-Gradient clipping for numerical stability.
+### max_grad_norm 0.5 → 0.25 / 1.0
+Gradient clipping. If `final_kl` is clean and surrogate is stable, this
+probably doesn't matter; if you see KL spikes, tighter clipping is
+cheap insurance.
+
+## Combinations to try after individual peaks
+
+Only run combinations once each individual knob has a known peak:
+
+- entropy_coeff(peak) + lr(peak)
+- train_iters(peak) + target_kl(peak)
+- entropy_coeff(peak) + lr(peak) + train_iters(peak) — the "all-best"
+  end-of-session run.
+
+Compounding doesn't always work; if the combination is below the best
+individual, pick the best individual.
 
 ## Lower priority / specific hypotheses
 
-### n_envs (6-12 range, per user direction)
-8 is the current default. Try 6 down / 12 up. Not expected to be a huge
-signal — the throughput win is already baked in. Per-boss variance changes
-with n_envs in the 4-boss setup.
+### `hard_restart_every_epochs`
+Currently 1200 (~25k epochs at 20min, so basically never). If you see
+state-creep over the run (D drift, action-distribution drift), try 200
+or 400 to force fresh HK processes mid-run. Cost: ~30s reset per cadence.
 
-### Hidden-state reset frequency
-train.py currently does staggered resets: `envs_per_reset = max(1, n_envs // 4)`
-envs get their GRU hidden state reset each epoch. Try:
-- More frequent resets (n_envs // 2) — fresher hidden state, less carryover
-- Less frequent resets (n_envs // 8 or no staggered reset) — more temporal context
-This probably needs either a train.py tweak or a new config knob.
+## Risky / large-scope (require user approval before trying)
 
-### total_steps_per_epoch 2048 (re-test)
-The steps=1024 win was measured on single-boss. On 4-boss, per-boss variance
-might favor slightly longer rollouts. Worth re-baselining 1024 vs 2048 on
-the 4-boss setup before assuming 1024 is still optimal.
+These are NOT default ablations — surface to the user first.
 
-## Risky / large-scope
-
-### frames_per_wait 5 → 3 / 7
-Changes the effective time horizon. Forces re-tuning of most other knobs.
-Only try with a specific hypothesis from diagnostics (e.g. if we see consistent
-step0 latency issues or action timing misses).
-
-## Combinations to try after individual winners
-
-- clip_eps 0.1 + train_iters 2
-- clip_eps 0.1 + entropy_coeff 0.02
-- lr 2.5e-4 + target_kl 0.05
-- All-in: clip_eps 0.1 + train_iters 2 + entropy_coeff 0.02 (the "fully KL-aware" setup)
-
-## Open investigations (not ablations per se)
-
-- **Does lr change actually take effect on resume?** Verify by printing
-  `optimizer.param_groups[0]["lr"]` immediately after `load_checkpoint` and
-  comparing to config.lr. If not, need to manually override post-load.
-- **How many train_iters are actually completing on average?** Instrument
-  train.py to log the real iter count per epoch. This would directly confirm
-  the KL-clamp hypothesis and let us tune more precisely.
-- **Is advantage normalization happening?** Check ppo.py — if not, adding
-  per-batch advantage normalization (mean 0, std 1) might stabilize the
-  gradient magnitude and reduce KL variance.
+- Modifying the action-head init bias magnitudes (`bias[0]`, `bias[1,3,5,6]`,
+  `bias[7]`).
+- Re-introducing reward shaping (proximity / idle penalty / attack bonus /
+  shaped intermediate signals).
+- Architecture-dim sweeps (`hidden_dim`, `gru_dim`, etc.).
+- Changing `frames_per_wait` away from 1.
