@@ -12,7 +12,6 @@ namespace FullKnight.Environment
 	{
 		private string _level;
 		private int _frameSkipCount;
-		private int _timeScaleValue;
 		private int _hitsTakenInStep;
 		private float _damageLandedInStep;
 		private float _hpHealedInStep;
@@ -61,9 +60,41 @@ namespace FullKnight.Environment
 		// natural end transition.
 		private byte _resetBranch;
 
+		// Silent-HP-damage probe state. _inHeroTakeDamage is set true while
+		// HeroController.TakeDamage is executing (its hooks fire AfterTakeDamage
+		// and OnKnightDamaged for us). Any PlayerData.TakeHealth call that
+		// decrements health while this flag is false bypassed the standard
+		// damage path — i.e. an FSM action / charm / direct write performed
+		// the hit. Logged with a stack trace so we can attribute the source.
+		private bool _inHeroTakeDamage;
+		private int _silentHpDeltaInStep;
+		private int _silentHpEventsInStep;
+
+		// Recoil-duration probe. When _debugRecoil is set (via FK_DEBUG_RECOIL),
+		// Step() detects rising/falling edges of (cState.recoiling || recoilFrozen)
+		// and emits a [Recoil] log line per knockback event with duration measured
+		// in agent-steps, scaled game-time, and wallclock time. Used to verify
+		// fps_cap / frames_per_wait don't change how long the agent perceives
+		// knockback. The horizontal recoil is FixedUpdate-driven (recoilSteps
+		// counter); freeze + invul windows are WaitForSeconds-driven on scaled
+		// time. Both should translate to a fixed agent-step count given the
+		// pinned captureDeltaTime, but the probe verifies that empirically.
+		private bool _debugRecoil;
+		private bool _recoilActive;
+		private int _recoilStartStep;
+		private float _recoilStartGameTime;
+		private float _recoilStartRealTime;
+
+		// Stored hook delegates so Dispose can detach them. The FreezeMoment kill
+		// is a global override — installed once in Setup() and held for the
+		// process lifetime — so we keep refs to the actual delegates we hooked.
+		private On.GameManager.hook_FreezeMoment_float_float_float_float _killFreezeFloat;
+		private On.GameManager.hook_FreezeMoment_float_float_float_bool _killFreezeBool;
+		private On.GameManager.hook_FreezeMoment_int _killFreezeInt;
+		private On.GameManager.hook_FreezeMomentGC _killFreezeMomentGC;
+
 		private HitboxObserver _hitboxObserver = new();
 		private InputDeviceShim _inputShim = new();
-		private Game.TimeScale _timeManager;
 
 		public TrainingEnv(string url, params string[] protocols) : base(url, protocols) { }
 
@@ -110,11 +141,14 @@ namespace FullKnight.Environment
 			PhaseBegin();
 			_level = data.level ?? _level;
 			_frameSkipCount = data.frames_per_wait ?? _frameSkipCount;
-			_timeScaleValue = data.time_scale ?? _timeScaleValue;
 			_evalMode = data.eval ?? false;
 			_hitsTakenInStep = 0;
 			_damageLandedInStep = 0;
 			_hpHealedInStep = 0;
+			_silentHpDeltaInStep = 0;
+			_silentHpEventsInStep = 0;
+			_inHeroTakeDamage = false;
+			_recoilActive = false;
 			_stepCount = 0;
 			_bossDied = false;
 			_episodeDone = false;
@@ -128,26 +162,19 @@ namespace FullKnight.Environment
 			// runs the knight for the entire transition + intro-skip window.
 			// Also clear any hard-commit lock left over from a mid-charge death.
 			_inputShim.ResetCommit();
-			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 },
-				_frameSkipCount, _timeScaleValue);
+			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 });
 
-			// FIRST-PRINCIPLES SIMPLIFICATION: removed the timeScale=20 crank
-			// during reset (was lines 142-164 + 230-237 — dual SetMultiplier
-			// to fast-forward HK transition coroutines and back). Testing
-			// whether the crank is actually load-bearing or whether resets
-			// work fine at the normal _timeScaleValue. Also removed the
-			// suicide branch (forced mid-fight resets are disabled upstream)
-			// and consolidated the two-branch arena-exit logic into a single
-			// "wait for scene change away from boss" check.
-			//
-			// Always SetMultiplier — Step() ends with Time.timeScale = 0 to
-			// freeze for the Python obs handoff, and we need to unfreeze
-			// here so HK's queued DoDreamReturn / hero-death transition
-			// can actually tick during WaitForSceneChange.
-			if (_timeManager == null)
-				_timeManager = new Game.TimeScale(_timeScaleValue);
-			else
-				_timeManager.SetMultiplier(_timeScaleValue);
+			// Step() ends with Time.timeScale=0 to freeze for the Python obs
+			// handoff. Unfreeze here so HK's queued DoDreamReturn / hero-death
+			// transition can tick during WaitForSceneChange and downstream
+			// LoadBossScene coroutines.
+			Time.timeScale = 1f;
+			// Pin per-frame game time so it doesn't depend on Unity's wallclock
+			// fps. Held constant from here on (never restored to 0); the inter-
+			// step pause uses Time.timeScale=0 instead, which gives deltaTime=0
+			// even with captureDeltaTime non-zero.
+			const float kBaselineGtime = 0.0424f;
+			Time.captureDeltaTime = kBaselineGtime / _frameSkipCount;
 
 			var preScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
 			if (preScene != "GG_Workshop")
@@ -238,42 +265,19 @@ namespace FullKnight.Environment
 				yield break;
 			}
 
-			Time.timeScale = _timeScaleValue;
+			Time.timeScale = 1f;
 
 			bool committedThisStep = ActionDecoder.ApplyAction(
-				_inputShim, data.action_vec, _frameSkipCount, _timeScaleValue);
+				_inputShim, data.action_vec);
 			data.action_committed = committedThisStep;
 
 			// Track HP at step start for heal detection
 			_knightHpAtStepStart = PlayerData.instance.health;
 
-			// Pin Time.deltaTime to a constant during the agent's frame-skip so
-			// per-step game-time is decoupled from Unity's wallclock framerate.
-			// Without this, faster wallclock fps = smaller deltaTime = the agent
-			// sees a different gtime regime than it was trained on, even when
-			// nothing about the simulation changed.
-			//
-			// EMPIRICAL: under capture, Time.deltaTime = captureDeltaTime ×
-			// Time.timeScale (NOT just captureDeltaTime as Unity docs imply).
-			// First attempt at 0.00848 produced gtime=0.126/step (3× baseline)
-			// because timeScale=3 multiplied through; quality cratered.
-			// Calibration: gtime_baseline / (frames × timeScale) = 0.0424 /
-			// (5 × 3) ≈ 0.00283, giving Time.deltaTime ≈ 0.00848/frame and
-			// gtime ≈ 0.0424/step — matches the trained regime.
-			//
-			// Restore captureDeltaTime=0 between steps because Unity ignores
-			// Time.timeScale=0 under capture (would break the inter-step pause
-			// and the intro-skip timeScale=20 fast-forward).
-			//
-			// Computed (not const) so that lowering _frameSkipCount automatically
-			// raises captureDeltaTime to preserve gtime. Baseline regime is
-			// gtime=0.0424s/step; we keep that invariant and trade Unity frames
-			// for per-frame game-time. Going from frames=5 to frames=2 means
-			// 60% fewer Unity frames per agent step → ~60% less Unity sim cost,
-			// while the agent's gtime/step stays exactly 0.0424.
-			const float kBaselineGtime = 0.0424f;
-			float kStepDeltaTime = kBaselineGtime / (_frameSkipCount * _timeScaleValue);
-			Time.captureDeltaTime = kStepDeltaTime;
+			// captureDeltaTime is pinned in Reset() and held constant — it
+			// makes per-frame game time deterministic regardless of machine
+			// wallclock fps. We don't toggle it here; inter-step pause uses
+			// Time.timeScale=0 (deltaTime=captureDeltaTime*0=0).
 
 			float frameSkipT0 = Time.realtimeSinceStartup;
 			float gameTimeElapsed = 0f;
@@ -289,12 +293,38 @@ namespace FullKnight.Environment
 				if (_bossDied || PlayerData.instance.health <= 0)
 					break;
 			}
-			Time.captureDeltaTime = 0;  // restore real-time so timeScale gymnastics work
 			float frameSkipMs = (Time.realtimeSinceStartup - frameSkipT0) * 1000f;
 
 			Time.timeScale = 0;
 			data.step_game_time = gameTimeElapsed;
 			data.step_real_time = realTimeElapsed;
+
+			if (_debugRecoil)
+			{
+				var hc = HeroController.instance;
+				bool recoilNow = hc != null
+					&& (hc.cState.recoiling
+						|| hc.cState.recoilFrozen
+						|| hc.cState.recoilingLeft
+						|| hc.cState.recoilingRight);
+				if (recoilNow && !_recoilActive)
+				{
+					_recoilActive = true;
+					_recoilStartStep = _stepCount;
+					_recoilStartGameTime = Time.time;
+					_recoilStartRealTime = Time.realtimeSinceStartup;
+				}
+				else if (!recoilNow && _recoilActive)
+				{
+					_recoilActive = false;
+					int dSteps = _stepCount - _recoilStartStep;
+					float dGtMs = (Time.time - _recoilStartGameTime) * 1000f;
+					float dRtMs = (Time.realtimeSinceStartup - _recoilStartRealTime) * 1000f;
+					Log($"[Recoil] reset#{_resetCount} steps={dSteps} "
+						+ $"gt={dGtMs:F0}ms rt={dRtMs:F0}ms "
+						+ $"fpw={_frameSkipCount}");
+				}
+			}
 
 			// Check for episode end (both modes now have real HP and death)
 			if (!_episodeDone)
@@ -308,6 +338,95 @@ namespace FullKnight.Environment
 				{
 					_episodeDone = true;
 					_episodeResult = "loss";
+				}
+				else
+				{
+					// Glitch detector: target the specific "knight + boss
+					// disappeared, no done event" failure mode. Three
+					// independent same-step signals; any of them flipping
+					// is enough to declare the episode lost. None of these
+					// trigger in normal mid-fight play (unlike a count of
+					// "N steps without events"), so detection is immediate
+					// and false-positive-resistant.
+					//
+					//   1. BossSceneController.endedScene: set the moment
+					//      any tracked boss HM's OnDeath fires (regardless
+					//      of whether it routed through TakeDamage), or any
+					//      manual EndBossScene call. Catches FSM-driven
+					//      boss kills that bypass our OnBossDamaged hook.
+					//   2. Active scene name no longer matches _level: the
+					//      scene flipped under us during the step. Catches
+					//      transitions kicked off by anything other than
+					//      our Reset() coroutine.
+					//   3. All tracked _bossHMs entries are null /
+					//      destroyed / disabled / hp<=0: every boss is gone
+					//      but neither (1) nor _bossDied flagged it. Catches
+					//      Object.Destroy on the boss GameObject without an
+					//      OnDeath dispatch (rare but observed in dump).
+					//
+					// _bossHMs.Count == 0 means InitBossRefs hasn't run
+					// yet (we're still inside the first Step after a
+					// just-completed Reset where boss spawn lags) — skip
+					// the "all gone" check there to avoid a false positive.
+					// endedScene is a private bool on BossSceneController (HK
+					// source line ~217). We read it via ReflectionHelper —
+					// same pattern StateExtractor uses for HeroController.rb2d.
+					var bsc = BossSceneController.Instance;
+					bool sceneEnded = false;
+					if (bsc != null)
+					{
+						try
+						{
+							sceneEnded = ReflectionHelper
+								.GetField<BossSceneController, bool>(
+									bsc, "endedScene");
+						}
+						catch { sceneEnded = false; }
+					}
+
+					string activeScene = UnityEngine.SceneManagement
+						.SceneManager.GetActiveScene().name;
+					bool sceneFlipped = !string.IsNullOrEmpty(_level)
+						&& activeScene != _level;
+
+					bool allBossesGone = false;
+					if (_bossHMs.Count > 0)
+					{
+						allBossesGone = true;
+						foreach (var hm in _bossHMs)
+						{
+							if (hm == null) continue;
+							if (hm.gameObject == null) continue;
+							if (!hm.gameObject.activeInHierarchy) continue;
+							if (hm.hp <= 0) continue;
+							allBossesGone = false;
+							break;
+						}
+					}
+
+					if (sceneEnded || sceneFlipped || allBossesGone)
+					{
+						_episodeDone = true;
+						string reason = sceneEnded ? "glitch_scene_ended"
+							: sceneFlipped ? "glitch_scene_flipped"
+							: "glitch_bosses_gone";
+						_episodeResult = reason;
+						int liveHms = 0;
+						foreach (var hm in _bossHMs)
+						{
+							if (hm != null && hm.gameObject != null
+								&& hm.gameObject.activeInHierarchy
+								&& hm.hp > 0) liveHms++;
+						}
+						Log($"[GlitchDetector] reset#{_resetCount} "
+							+ $"step#{_stepCount} reason={reason} "
+							+ $"scene={activeScene} expected={_level} "
+							+ $"bsc.endedScene={sceneEnded} "
+							+ $"hmCount={_bossHMs.Count} liveHms={liveHms} "
+							+ $"hp={PlayerData.instance.health} "
+							+ $"silentHpEvents={_silentHpEventsInStep} "
+							+ $"silentHpDelta={_silentHpDeltaInStep}");
+					}
 				}
 			}
 
@@ -323,6 +442,12 @@ namespace FullKnight.Environment
 			_hitsTakenInStep = 0;
 			_damageLandedInStep = 0;
 			_hpHealedInStep = 0;
+			// Silent-HP probe is per-step: clear after the step completes so
+			// each [SilentHP] log line is attributable to its own step. The
+			// glitch-detector log above already includes this step's accumulator
+			// before we wipe it.
+			_silentHpDeltaInStep = 0;
+			_silentHpEventsInStep = 0;
 
 			// Long-run leak probes. Cheap: cache sizes are integer field reads,
 			// GC.GetTotalMemory(false) is non-blocking (no collection). Populated
@@ -344,7 +469,7 @@ namespace FullKnight.Environment
 					+ $"({frameSkipFrames}f) "
 					+ $"gameTime={gameTimeElapsed * 1000:F0}ms "
 					+ $"realTime={realTimeElapsed * 1000:F0}ms "
-					+ $"timeScale={_timeScaleValue} done={_episodeDone}");
+					+ $"done={_episodeDone}");
 			}
 
 			if (_episodeDone)
@@ -379,8 +504,8 @@ namespace FullKnight.Environment
 		// Phase timing helpers. PhaseBegin() resets the stopwatch at the start of
 		// Reset() / Step(); LogPhase() emits a "[Phase-Timing]" line with the
 		// delta since the last call and the cumulative total. Wall-clock based
-		// (Time.realtimeSinceStartup) so Time.timeScale gymnastics during reset
-		// don't confuse the readings.
+		// (Time.realtimeSinceStartup) so Time.timeScale=0 freezes during the
+		// Python obs handoff don't confuse the readings.
 		private void PhaseBegin()
 		{
 			_phaseStart = Time.realtimeSinceStartup;
@@ -419,16 +544,52 @@ namespace FullKnight.Environment
 
 			// Uncap Unity's frame loop. With -nographics there's no display to
 			// vsync against; the only thing throttling Update() is targetFrameRate
-			// (default cap on Windows). Pairing this with captureDeltaTime in
-			// Step() decouples wallclock framerate from per-step game-time, so
-			// faster frames don't shrink dt out from under the agent. Uncap-alone
+			// (default cap on Windows). Pairing this with captureDeltaTime
+			// decouples wallclock framerate from per-step game-time, so faster
+			// frames don't shrink dt out from under the agent. Uncap-alone
 			// (commit e094f23, reverted) gave +63% throughput but cratered
 			// quality via the regime shift; capture-alone (a2f7136) preserves
 			// regime but Unity stays at ~360fps cap and there's no speedup.
 			// Combined, the uncap delivers the wallclock win and capture holds
 			// the regime steady.
+			//
+			// FK_FPS_CAP env var (set by train.py from config.fps_cap) overrides
+			// the uncap with a positive integer cap — useful when watching
+			// graphical runs locally so HK doesn't burn CPU at hundreds of fps.
+			int fpsCap = -1;
+			var capStr = System.Environment.GetEnvironmentVariable("FK_FPS_CAP");
+			if (!string.IsNullOrEmpty(capStr) && int.TryParse(capStr, out int parsed) && parsed > 0)
+				fpsCap = parsed;
 			QualitySettings.vSyncCount = 0;
-			Application.targetFrameRate = -1;
+			Application.targetFrameRate = fpsCap;
+			Log($"[Setup] targetFrameRate={fpsCap} (FK_FPS_CAP={capStr ?? "unset"})");
+
+			var dbgRecoil = System.Environment.GetEnvironmentVariable("FK_DEBUG_RECOIL");
+			_debugRecoil = !string.IsNullOrEmpty(dbgRecoil) && dbgRecoil != "0";
+			Log($"[Setup] debugRecoil={_debugRecoil} (FK_DEBUG_RECOIL={dbgRecoil ?? "unset"})");
+
+			// Kill HK's hit-stop. On every hit, HeroController.StartRecoil yields
+			// to gm.FreezeMoment(0.01, 0.35, 0.1, 0.0001), which ramps Time.timeScale
+			// down to 0.0001 and back up to 1 via TimeController.GenericTimeScale.
+			// That ramp coroutine runs across our inter-step boundaries — and our
+			// explicit `Time.timeScale = 0/1` writes in Step() bypass TimeController,
+			// so any subsequent `genericTimeScale` mutation by the ramp recomputes
+			// and clobbers our value (TimeController.cs:69-80). Net effect: a hit
+			// can leak a fractional timeScale into the following agent step, making
+			// per-step game-time non-deterministic and dependent on Python wallclock
+			// pause cadence. For RL training the visual hit-stop has no value, so
+			// we no-op all FreezeMoment overloads. The void `FreezeMoment(int)`
+			// overload internally StartCoroutine's the IEnumerator overloads, so
+			// hooking those is sufficient — we hook the int form too for paranoia.
+			_killFreezeFloat = (orig, self, rd, w, ru, ts) => EmptyCoroutine();
+			_killFreezeBool = (orig, self, rd, w, ru, gc) => EmptyCoroutine();
+			_killFreezeMomentGC = (orig, self, rd, w, ru, ts) => EmptyCoroutine();
+			_killFreezeInt = (orig, self, type) => { /* no-op */ };
+			On.GameManager.FreezeMoment_float_float_float_float += _killFreezeFloat;
+			On.GameManager.FreezeMoment_float_float_float_bool += _killFreezeBool;
+			On.GameManager.FreezeMomentGC += _killFreezeMomentGC;
+			On.GameManager.FreezeMoment_int += _killFreezeInt;
+			Log("[Setup] FreezeMoment killed (hit-stop disabled)");
 
 			On.GameManager.SaveGame += SaveFileProxy.DisableSaveGame;
 			SaveFileProxy.LoadCompletedSave();
@@ -445,23 +606,36 @@ namespace FullKnight.Environment
 		protected override IEnumerator Dispose()
 		{
 			UnhookDamage();
-			_timeManager?.Dispose();
+			if (_killFreezeFloat != null) On.GameManager.FreezeMoment_float_float_float_float -= _killFreezeFloat;
+			if (_killFreezeBool != null) On.GameManager.FreezeMoment_float_float_float_bool -= _killFreezeBool;
+			if (_killFreezeMomentGC != null) On.GameManager.FreezeMomentGC -= _killFreezeMomentGC;
+			if (_killFreezeInt != null) On.GameManager.FreezeMoment_int -= _killFreezeInt;
 			InputManager.DetachDevice(_inputShim);
 			_hitboxObserver.Unload();
 			CloseSocket();
 			yield break;
 		}
 
+		private static IEnumerator EmptyCoroutine() { yield break; }
+
 		private void HookDamage()
 		{
 			ModHooks.AfterTakeDamageHook += OnKnightDamaged;
 			On.HealthManager.TakeDamage += OnBossDamaged;
+			// Silent-HP-damage probe: wrap HeroController.TakeDamage so we can
+			// distinguish HP decrements that came through the normal damage
+			// pipeline (hooks fire) from FSM/charm/direct-write paths that
+			// bypass it (only PlayerData.TakeHealth fires).
+			On.HeroController.TakeDamage += OnHeroTakeDamage;
+			On.PlayerData.TakeHealth += OnPlayerTakeHealth;
 		}
 
 		private void UnhookDamage()
 		{
 			ModHooks.AfterTakeDamageHook -= OnKnightDamaged;
 			On.HealthManager.TakeDamage -= OnBossDamaged;
+			On.HeroController.TakeDamage -= OnHeroTakeDamage;
+			On.PlayerData.TakeHealth -= OnPlayerTakeHealth;
 		}
 
 		// AfterTakeDamageHook fires past HeroController.TakeDamage's iframe
@@ -506,6 +680,61 @@ namespace FullKnight.Environment
 				}
 				if (allDead) _bossDied = true;
 			}
+		}
+
+		// Hooks for silent-HP detection. HeroController.TakeDamage is the
+		// canonical "knight got hit" path — its hooks (ModHooks.OnTakeDamage,
+		// AfterTakeDamageHook) fire reliably from inside it. We wrap it just
+		// to flip a flag so the PlayerData.TakeHealth hook below can tell
+		// whether the decrement came from inside that path or from an
+		// external write (FSM SetIntValue, charm self-damage, etc.).
+		private void OnHeroTakeDamage(On.HeroController.orig_TakeDamage orig,
+			HeroController self, GameObject go, GlobalEnums.CollisionSide damageSide,
+			int damageAmount, int hazardType)
+		{
+			_inHeroTakeDamage = true;
+			try { orig(self, go, damageSide, damageAmount, hazardType); }
+			finally { _inHeroTakeDamage = false; }
+		}
+
+		// PlayerData.TakeHealth is the lowest-rung HP write inside HK.
+		// Damage paths we observe via hooks all funnel through here, but so
+		// do paths we DON'T observe (FSM-driven hits, direct calls). When
+		// the "in HeroController.TakeDamage" flag is false and HP went down,
+		// the hit bypassed AfterTakeDamageHook — log full attribution.
+		private void OnPlayerTakeHealth(On.PlayerData.orig_TakeHealth orig,
+			PlayerData self, int amount)
+		{
+			int hpBefore = self.health;
+			orig(self, amount);
+			int delta = hpBefore - self.health;
+			if (delta <= 0) return;
+			if (_inHeroTakeDamage) return;  // normal path; AfterTakeDamage will log it
+			_silentHpDeltaInStep += delta;
+			_silentHpEventsInStep++;
+			// Skip 2 frames so the printed top is the unobserved caller, not
+			// PlayerData.TakeHealth or our own hook. Limit depth so the line
+			// doesn't blow up the mod log on a deep FSM chain.
+			string callers = "?";
+			try
+			{
+				var st = new System.Diagnostics.StackTrace(skipFrames: 2,
+					fNeedFileInfo: false);
+				int n = System.Math.Min(st.FrameCount, 8);
+				var parts = new List<string>(n);
+				for (int i = 0; i < n; i++)
+				{
+					var m = st.GetFrame(i)?.GetMethod();
+					if (m == null) continue;
+					string typeName = m.DeclaringType != null
+						? m.DeclaringType.Name : "?";
+					parts.Add(typeName + "." + m.Name);
+				}
+				callers = string.Join(" <- ", parts);
+			}
+			catch { }
+			Log($"[SilentHP] reset#{_resetCount} step#{_stepCount} amount={amount} "
+				+ $"hp:{hpBefore}->{self.health} delta={delta} stack: {callers}");
 		}
 
 		// Wait for HK's natural end-of-episode transition (boss-complete

@@ -448,6 +448,25 @@ class PPO:
         n_chunks_per_env = T // L
         T_used = n_chunks_per_env * L
         total_chunks = n_chunks_per_env * N
+        # Catastrophic-rollout guard: if every env died before reaching one
+        # full BPTT chunk, T_used == 0 and Observation.stack(obs_buf[:0])
+        # raises. Skip training this epoch and return a zero-metric stub so
+        # downstream wandb/print code doesn't KeyError. The collected (but
+        # discarded) experience is fine to drop — a <16-step rollout is
+        # signal-starved anyway.
+        if T_used == 0 or len(obs_buf) == 0:
+            print(
+                f"  train | SKIPPED — T={T} < seq_len={L}, "
+                f"no usable BPTT chunks this rollout",
+                flush=True,
+            )
+            return {
+                "surrogate": 0.0, "value_atk": 0.0, "value_def": 0.0,
+                "entropy": 0.0, "kl": 0.0, "gru_norm": 0.0,
+                "ev_atk": 0.0, "ev_def": 0.0, "pass_frac": 0.0,
+                "adv_std_raw": 0.0, "atk_return_var": 0.0,
+                "def_return_var": 0.0, "train_phase_t": {},
+            }
         max_combat_dim = max(o.combat_hb.shape[1] for o in obs_buf)
         max_terrain_dim = max(o.terrain_hb.shape[1] for o in obs_buf)
         rollout_samples = T_used * N

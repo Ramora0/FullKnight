@@ -153,9 +153,18 @@ class FullKnightActorCritic(nn.Module):
         nn.init.orthogonal_(self.gru_proj_out.weight, gain=0.1)
         nn.init.constant_(self.gru_proj_out.bias, 0.0)
 
-        # Bias action head toward attack_tap (idx 0) at init
+        # Bias action head toward attack_tap (idx 0) at init, and away from
+        # the four hold actions (1=nail_charge, 3=focus, 5=dream_nail,
+        # 6=super_dash). Each hold pick triggers a long C#-side commit
+        # (36 / 12 / 71 / 24 steps under the captureDeltaTime regime, see
+        # ProxyController.LockedStepsFor); without a bias, random init puts
+        # ~50% mass on holds → the agent spends most of early training
+        # frozen in useless commits. -2.0 brings combined hold mass to ~8%
+        # at init, roughly matching pre-lock-fix time-in-commit.
         with torch.no_grad():
             self.head_action.bias[0] = 1.0
+            for idx in (1, 3, 5, 6):
+                self.head_action.bias[idx] = -2.0
 
     def _encode(self, obs: Observation, hx=None):
         global_emb = self.global_encoder(obs.global_state)

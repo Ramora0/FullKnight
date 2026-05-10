@@ -76,7 +76,7 @@ The GRU provides temporal memory across timesteps. Hidden state flows during rol
 - `TrainingEnv`: Main environment loop. Handles reset/step/pause/resume. Reports per-step reward signals to Python — `damage_landed` (% of boss max HP dealt), `hits_taken` (integer hit count), `hp_healed` (raw HP restored). Reward is computed Python-side as `δ_attack/D − hits_taken + heal_coef·hp_healed` (`ppo.py:131`); no terminal win/loss bonus. Auto-resets on episode end (knight death or boss death).
 - `ProxyController.cs` (`InputDeviceShim` + `ActionDecoder`): Virtual InControl device that injects actions. Checks `Can*` methods before applying actions.
 - `HitboxObserver`: Tracks all active Collider2Ds via `HitboxReader` MonoBehaviour, classifies into Knight/Enemy/Attack/Terrain.
-- `TimeScale`: IL-hooks `GameManager.FreezeMoment*` coroutines and shims `SetTimeScale` to maintain configurable game speed.
+- Time control: `Time.captureDeltaTime` is set in `TrainingEnv.Reset()` to `0.0424 / frames_per_wait` and held constant. `Time.timeScale` toggles between 1 (running) and 0 (paused for inter-step Python obs handoff). The previous `TimeScale` IL-hook + multiplier infrastructure was removed; `time_scale` config field is now ignored.
 - `SaveFileProxy`: Loads an embedded completed save file (`Resource/save_file.json`) and disables saving.
 - `SceneHooks`: Loads boss scenes via Hall of Gods transition sequence.
 

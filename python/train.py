@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import os
 import time
 from collections import deque
@@ -10,6 +11,19 @@ from config import Config
 from vec_env import VecEnv
 from ppo import PPO
 from instance_manager import InstanceManager
+from observation import GS, CB, TR
+
+
+# Action sub-token labels for the glitch log. Must match config.{movement,direction,action,jump}_n
+# and the decoding in C# ActionDecoder. Keeping them inline (not in config) so the
+# log format is self-describing without callers needing to import anything.
+_GLITCH_MOVE_LABELS = ("left", "right", "none")
+_GLITCH_DIR_LABELS = ("up", "down", "none")
+_GLITCH_ACTION_LABELS = (
+    "attack", "nail_charge", "spell", "focus", "dash",
+    "dream_nail", "super_dash", "none",
+)
+_GLITCH_JUMP_LABELS = ("yes", "no")
 
 
 def merge_padded(old, new, indices, fill=0.0):
@@ -147,6 +161,210 @@ def _print_diag_summary(diag):
     print("=" * 78)
 
 
+def _decode_kind(vocab, idx):
+    """Look up a vocab id; tolerate ids past the table (shouldn't happen, but
+    we don't want the dump to crash in pathological cases)."""
+    try:
+        return vocab._i2s[int(idx)]
+    except (IndexError, TypeError):
+        return f"<id={int(idx)}?>"
+
+
+def _dump_glitch_epoch(f, label, snap, vocab):
+    """Write one epoch's per-step state to the glitch log.
+
+    `snap` is the dict built by the main loop. Layout: header with epoch-level
+    aggregates, then per-step blocks (one per (t, env) row) with action,
+    rewards, done/committed flags, global state, combat hitboxes, terrain
+    counts, diag counters, and step timings.
+    """
+    f.write(f"\n{'=' * 80}\n")
+    f.write(f"  {label}\n")
+    f.write(f"{'=' * 80}\n")
+    if snap is None:
+        f.write("  (no data — first epoch, prior history empty)\n")
+        return
+
+    f.write(f"  epoch                  {snap['epoch']}\n")
+    f.write(f"  env_steps_collected    {snap['env_steps_collected']}\n")
+    f.write(f"  active_envs            {snap['active_envs']}\n")
+    f.write(f"  env_boss               {snap['env_boss']}\n")
+    f.write(f"  active_steps           {snap['active_steps']}/{snap['total_steps']}\n")
+    f.write(f"  first_event_steps      {snap['first_event_steps']}\n")
+    dl = snap['damage_landed']
+    ht = snap['hits_taken']
+    hh = snap['hp_healed']
+    f.write(f"  total damage_landed    {float(dl.sum()):.4f} "
+            f"(per-step max {float(dl.max()):.4f})\n")
+    f.write(f"  total hits_taken       {float(ht.sum()):.0f} "
+            f"(per-step max {float(ht.max()):.0f})\n")
+    f.write(f"  total hp_healed        {float(hh.sum()):.2f}\n")
+    f.write(f"  done flags fired       {int(snap['dones'].sum())} "
+            f"(per-env: {snap['dones'].sum(axis=0).tolist()})\n")
+    f.write(f"  committed steps        {int(snap['committed'].sum())}\n")
+    if snap.get('diag_enemy') is not None:
+        de, da, dt = snap['diag_enemy'], snap['diag_attack'], snap['diag_terrain']
+        f.write(f"  diag enemy_count       avg={float(de.mean()):.1f} "
+                f"min={int(de.min())} max={int(de.max())}\n")
+        f.write(f"  diag attack_count      avg={float(da.mean()):.1f} "
+                f"min={int(da.min())} max={int(da.max())}\n")
+        f.write(f"  diag terrain_count     avg={float(dt.mean()):.1f} "
+                f"min={int(dt.min())} max={int(dt.max())}\n")
+
+    T, N = dl.shape
+    f.write(f"\n  per-step rows  (T={T} steps, N={N} active envs):\n")
+
+    actions = snap['actions']
+    dones = snap['dones']
+    committed = snap['committed']
+    wt = snap['wall_time']
+    rt = snap['real_time']
+    gt = snap.get('game_time')
+    de = snap.get('diag_enemy')
+    da = snap.get('diag_attack')
+    dt_arr = snap.get('diag_terrain')
+    dkc = snap.get('diag_kcache')
+    dheap = snap.get('diag_heap')
+
+    # Per-step rows per env. Most epochs will pin N=1 here (the run command
+    # uses --n_envs 1) but the format scales to N>1; env 0 first, then env 1.
+    for li in range(N):
+        env_i = snap['active_envs'][li]
+        boss = snap['env_boss'][li]
+        f.write(f"\n  --- env_idx={env_i}  boss={boss}  local_col={li} ---\n")
+        for t in range(T):
+            obs = snap['buf_obs'][t]
+            chb = obs.combat_hb[li]
+            cmask = obs.combat_mask[li]
+            ckids = obs.combat_kind_ids[li]
+            cpids = obs.combat_parent_ids[li]
+            thb = obs.terrain_hb[li]
+            tmask = obs.terrain_mask[li]
+            gs = obs.global_state[li]
+
+            mv = int(actions['movement'][t, li])
+            di = int(actions['direction'][t, li])
+            ac = int(actions['action'][t, li])
+            jp = int(actions['jump'][t, li])
+            mv_l = _GLITCH_MOVE_LABELS[mv] if mv < len(_GLITCH_MOVE_LABELS) else mv
+            di_l = _GLITCH_DIR_LABELS[di] if di < len(_GLITCH_DIR_LABELS) else di
+            ac_l = _GLITCH_ACTION_LABELS[ac] if ac < len(_GLITCH_ACTION_LABELS) else ac
+            jp_l = _GLITCH_JUMP_LABELS[jp] if jp < len(_GLITCH_JUMP_LABELS) else jp
+
+            f.write(
+                f"  t={t:4d}  act=[{mv_l},{di_l},{ac_l},jump={jp_l}]  "
+                f"dmg={float(snap['damage_landed'][t, li]):.4f} "
+                f"hits={int(snap['hits_taken'][t, li])} "
+                f"heal={float(snap['hp_healed'][t, li]):.2f} "
+                f"done={int(bool(dones[t, li]))} "
+                f"commit={int(bool(committed[t, li]))} "
+                f"wall={float(wt[t, li]) * 1000:.0f}ms "
+                f"real={float(rt[t, li]) * 1000:.0f}ms"
+            )
+            if gt is not None:
+                f.write(f" game={float(gt[t, li]):.4f}s")
+            f.write("\n")
+
+            f.write(
+                f"      gs: vel=({gs[GS.VEL_X]:+.2f},{gs[GS.VEL_Y]:+.2f}) "
+                f"hp={gs[GS.HP]:.2f} soul={gs[GS.SOUL]:.2f} "
+                f"size=({gs[GS.KNIGHT_W]:.2f},{gs[GS.KNIGHT_H]:.2f}) "
+                f"abil[dash={int(gs[GS.HAS_DASH])} "
+                f"wj={int(gs[GS.HAS_WALL_JUMP])} "
+                f"dj={int(gs[GS.HAS_DOUBLE_JUMP])} "
+                f"sd={int(gs[GS.HAS_SUPER_DASH])} "
+                f"dn={int(gs[GS.HAS_DREAM_NAIL])} "
+                f"aa={int(gs[GS.HAS_ACID_ARMOUR])} "
+                f"na={int(gs[GS.HAS_NAIL_ART])}] "
+                f"can[j={int(gs[GS.CAN_JUMP])} "
+                f"dj={int(gs[GS.CAN_DOUBLE_JUMP])} "
+                f"wj={int(gs[GS.CAN_WALL_JUMP])} "
+                f"d={int(gs[GS.CAN_DASH])} "
+                f"a={int(gs[GS.CAN_ATTACK])} "
+                f"c={int(gs[GS.CAN_CAST])} "
+                f"nc={int(gs[GS.CAN_NAIL_CHARGE])} "
+                f"dn={int(gs[GS.CAN_DREAM_NAIL])} "
+                f"sd={int(gs[GS.CAN_SUPER_DASH])}]\n"
+            )
+
+            if de is not None:
+                f.write(
+                    f"      diag: enemy={int(de[t, li])} "
+                    f"attack={int(da[t, li])} "
+                    f"terrain={int(dt_arr[t, li])} "
+                    f"kcache={int(dkc[t, li])} "
+                    f"heap={float(dheap[t, li]):.1f}MB\n"
+                )
+
+            n_combat_active = int(cmask.sum())
+            n_terrain_active = int(tmask.sum())
+            f.write(f"      combat hitboxes ({n_combat_active}):\n")
+            for i in range(chb.shape[0]):
+                if cmask[i] == 0:
+                    continue
+                kind = _decode_kind(vocab, ckids[i])
+                parent = _decode_kind(vocab, cpids[i])
+                flags = []
+                if chb[i, CB.IS_TRIGGER] > 0.5: flags.append("trig")
+                if chb[i, CB.GIVES_DAMAGE] > 0.5: flags.append("hurts")
+                if chb[i, CB.TAKES_DAMAGE] > 0.5: flags.append("hittable")
+                if chb[i, CB.IS_TARGET] > 0.5: flags.append("TARGET")
+                fs = ",".join(flags) if flags else "-"
+                f.write(
+                    f"        [{i}] rel=({chb[i, CB.REL_X]:+.2f},"
+                    f"{chb[i, CB.REL_Y]:+.2f}) "
+                    f"size=({chb[i, CB.W]:.2f},{chb[i, CB.H]:.2f}) "
+                    f"hp={chb[i, CB.HP_RAW]:.0f}/{chb[i, CB.HP_MAX_RAW]:.0f} "
+                    f"{fs} kind={kind!r} parent={parent!r}\n"
+                )
+
+            f.write(f"      terrain segments ({n_terrain_active}):\n")
+            for i in range(thb.shape[0]):
+                if tmask[i] == 0:
+                    continue
+                ttrig = "trig" if thb[i, TR.IS_TRIGGER] > 0.5 else "-"
+                f.write(
+                    f"        [{i}] mid=({thb[i, TR.MX]:+.2f},"
+                    f"{thb[i, TR.MY]:+.2f}) "
+                    f"hd=({thb[i, TR.HDX]:+.2f},{thb[i, TR.HDY]:+.2f}) "
+                    f"np=({thb[i, TR.NPX]:+.2f},{thb[i, TR.NPY]:+.2f}) "
+                    f"dist={thb[i, TR.DIST]:.2f} {ttrig}\n"
+                )
+
+
+def dump_glitch_log(log_dir, prev_snap, curr_snap, vocab,
+                    extra_context=None):
+    """Write the prior epoch + current (zero-event) epoch to a .log file.
+
+    Returns the path written. Crash-resilient: bubbles up errors so the caller
+    can decide whether to keep training (we currently do — the dump is best
+    effort, training shouldn't die over a logging failure).
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    epoch_n = curr_snap["epoch"]
+    path = os.path.join(log_dir, f"glitch_epoch{epoch_n:05d}_{ts}.log")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "FullKnight glitch detector dump\n"
+            "================================\n"
+            "Trigger: an entire epoch passed with zero damage_landed AND zero\n"
+            "hits_taken events across every active env. Most likely cause is\n"
+            "the 'knight + boss disappeared' bug. The glitch typically fires\n"
+            "in either the current epoch or the prior one — both are dumped\n"
+            "below for full context.\n"
+        )
+        if extra_context:
+            f.write("\nContext:\n")
+            for k, v in extra_context.items():
+                f.write(f"  {k}: {v}\n")
+        _dump_glitch_epoch(f, "PRIOR EPOCH (one before zero-event detection)",
+                           prev_snap, vocab)
+        _dump_glitch_epoch(f, "CURRENT EPOCH (zero-event detection fired here)",
+                           curr_snap, vocab)
+    return path
+
+
 async def hard_restart_all(vec_env, mgr, env_boss, agent, graphical=False):
     """Synchronously kill and relaunch every HK instance, then reset to bosses.
 
@@ -240,6 +458,10 @@ async def train(config: Config):
         os.environ["FK_FPS_CAP"] = str(config.fps_cap)
     else:
         os.environ.pop("FK_FPS_CAP", None)
+    if config.debug_recoil:
+        os.environ["FK_DEBUG_RECOIL"] = "1"
+    else:
+        os.environ.pop("FK_DEBUG_RECOIL", None)
     mgr = None
     if config.hk_path and os.path.exists(config.hk_path):
         print(f"Spawning {config.n_envs} HK instance(s)...")
@@ -384,6 +606,27 @@ async def train(config: Config):
         slow_step_threshold_s = 2.0
         slow_count_by_boss = {b: 0 for b in bosses}
         slow_count_by_env = [0] * config.n_envs
+
+        # Glitch-detector state. epoch_history holds the most recent two
+        # epoch snapshots (this epoch + the prior one) so when a zero-event
+        # epoch is detected we can dump both — the bug typically fires in
+        # one or the other. glitch_dump_count caps how many .log files we
+        # write per run (config.glitch_max_dumps).
+        epoch_history = deque(maxlen=2) if config.detect_glitch else None
+        glitch_dump_count = 0
+
+        # Glitch-done frequency monitor. The C# TrainingEnv glitch detector
+        # (TrainingEnv.cs Step() — three signals: BSC.endedScene flipped,
+        # active scene name != _level, all _bossHMs gone) sets done=true with
+        # _episodeResult="glitch_*" when the disappearance bug fires. The
+        # result string isn't on the wire, so we identify the glitched done
+        # with a same-step heuristic: damage_landed==0 AND hits_taken==0 on
+        # the done step. This excludes both wins (damage_landed>0) and
+        # standard losses (hits_taken>0, since OnKnightDamaged always fires
+        # on the lethal hit). glitch_done_count is cumulative across the run
+        # and gets printed loudly each time a glitch fires so we can spot
+        # if the C# detector is tripping more often than expected.
+        glitch_done_count = 0
 
         # First epoch: full reset to load boss scenes
         obs_full = await vec_env.reset_all(levels=env_boss)
@@ -570,13 +813,39 @@ async def train(config: Config):
                         continue
                     done_in_rollout.add(env_i)
                     just_died.append(env_i)
+                    boss = env_boss[env_i]
+                    # Three-way classification of the done event. WIN: agent
+                    # landed the killing hit (damage_landed > 0 on this step).
+                    # LOSS: knight took a hit through HeroController.TakeDamage
+                    # — AfterTakeDamageHook fires hits_taken++ even on the
+                    # lethal frame. GLITCH: neither — the C# glitch detector
+                    # tripped (BSC.endedScene flip / scene flip / all bosses
+                    # gone) and ended the episode without either side dying
+                    # via the standard damage path.
+                    dmg_step = float(damage_landed_sub[sub_li])
+                    hits_step = int(hits_taken_sub[sub_li])
+                    if dmg_step > 0:
+                        result = "WIN"
+                    elif hits_step > 0:
+                        result = "LOSS"
+                    else:
+                        result = "GLITCH"
+                        glitch_done_count += 1
+                        # Always-on print regardless of debug_transitions —
+                        # we want the user to spot frequency at a glance.
+                        print(
+                            f"  !! GLITCH-DONE #{glitch_done_count}: env {env_i} "
+                            f"({boss}) at epoch {epoch} rollout-step {t}, "
+                            f"env_steps {env_steps_collected} "
+                            f"(C# glitch detector fired — see HK ModLog "
+                            f"[GlitchDetector])",
+                            flush=True,
+                        )
                     if config.debug_transitions:
-                        boss = env_boss[env_i]
-                        result = "WIN" if damage_landed_sub[sub_li] > 0 else "LOSS"
                         print(
                             f"  episode-end env {env_i} ({boss}): {result} "
-                            f"step={t} dmg={damage_landed_sub[sub_li]:.2f} "
-                            f"hits={int(hits_taken_sub[sub_li])}",
+                            f"step={t} dmg={dmg_step:.2f} "
+                            f"hits={hits_step}",
                             flush=True,
                         )
 
@@ -606,8 +875,26 @@ async def train(config: Config):
                         )
 
                 # Append PRE-step obs / hx (matches the action that was
-                # taken) before mutating obs from the step result.
-                buf_obs.append(obs)
+                # taken) before mutating obs from the step result. Note that
+                # merge_obs_padded mutates obs's underlying numpy arrays in
+                # place when the per-step max_combat / max_terrain happens
+                # to match between consecutive steps. The training-time
+                # consumer (Observation.stack in train_on_rollout) tolerates
+                # this — but the glitch dumper needs the actual per-step
+                # contents, so we deep-copy when detection is enabled.
+                if config.detect_glitch:
+                    obs_for_buf = obs.replace(
+                        combat_hb=obs.combat_hb.copy(),
+                        combat_mask=obs.combat_mask.copy(),
+                        combat_kind_ids=obs.combat_kind_ids.copy(),
+                        combat_parent_ids=obs.combat_parent_ids.copy(),
+                        terrain_hb=obs.terrain_hb.copy(),
+                        terrain_mask=obs.terrain_mask.copy(),
+                        global_state=obs.global_state.copy(),
+                    )
+                    buf_obs.append(obs_for_buf)
+                else:
+                    buf_obs.append(obs)
                 buf_hx.append(buf_hx_full)
                 for k in buf_actions:
                     buf_actions[k].append(actions_np[k])
@@ -683,6 +970,71 @@ async def train(config: Config):
                 first_event_steps.append(int(idxs[0]) if len(idxs) > 0 else damage_landed_arr.shape[0])
             wall_time_arr = np.stack(buf_step_wall_times)  # (T, N_active)
             real_time_arr = np.stack(buf_step_real_times)  # (T, N_active) — C# unscaled sim time
+            game_time_arr = np.stack(buf_step_game_times) if buf_step_game_times else None
+
+            # Glitch detector: when active_steps == 0 the entire epoch had no
+            # damage_landed AND no hits_taken events — usually because the
+            # knight + boss fell out of the world / despawned. Build a snapshot
+            # of this epoch's per-step state so we can dump it (alongside the
+            # prior epoch) when that condition fires below. We always build
+            # the snapshot, but only retain the most-recent two via the
+            # length-2 deque. Cheap relative to rollout cost (~10 MB / epoch
+            # for 1024 steps × 1 env at typical hitbox counts).
+            if config.detect_glitch:
+                this_snap = {
+                    "epoch": epoch,
+                    "env_steps_collected": env_steps_collected,
+                    "active_envs": list(active_envs),
+                    "env_boss": [env_boss[i] for i in active_envs],
+                    "buf_obs": list(buf_obs),
+                    "actions": {k: actions_arr[k].copy() for k in actions_arr},
+                    "damage_landed": damage_landed_arr,
+                    "hits_taken": hits_taken_arr,
+                    "hp_healed": hp_healed_arr,
+                    "dones": dones_arr,
+                    "committed": committed_arr,
+                    "wall_time": wall_time_arr,
+                    "real_time": real_time_arr,
+                    "game_time": game_time_arr,
+                    "diag_enemy": np.stack(buf_diag_enemy) if buf_diag_enemy else None,
+                    "diag_attack": np.stack(buf_diag_attack) if buf_diag_attack else None,
+                    "diag_terrain": np.stack(buf_diag_terrain) if buf_diag_terrain else None,
+                    "diag_kcache": np.stack(buf_diag_kind_cache) if buf_diag_kind_cache else None,
+                    "diag_heap": np.stack(buf_diag_gc_heap) if buf_diag_gc_heap else None,
+                    "active_steps": active_steps,
+                    "total_steps": total_steps_epoch,
+                    "first_event_steps": list(first_event_steps),
+                }
+                if active_steps == 0 and glitch_dump_count < config.glitch_max_dumps:
+                    prev_snap = epoch_history[-1] if epoch_history else None
+                    try:
+                        path = dump_glitch_log(
+                            config.glitch_log_dir, prev_snap, this_snap,
+                            vec_env.vocab,
+                            extra_context={
+                                "epoch": epoch,
+                                "env_steps_collected": env_steps_collected,
+                                "boss_pool": ",".join(bosses),
+                                "rollout_len": config.rollout_len,
+                                "n_envs": config.n_envs,
+                                "frames_per_wait": config.frames_per_wait,
+                            },
+                        )
+                        glitch_dump_count += 1
+                        print(
+                            f"\n!! GLITCH DETECTED: epoch {epoch} had zero "
+                            f"damage events across {N_active} active env(s). "
+                            f"Dumped snapshot ({glitch_dump_count}/"
+                            f"{config.glitch_max_dumps}) -> {path}",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(
+                            f"\n!! GLITCH DETECTED but dump failed: {e!r}",
+                            flush=True,
+                        )
+                epoch_history.append(this_snap)
+
             # First step may include intro skip — show it separately
             step0_ms = wall_time_arr[0].mean() * 1000 if wall_time_arr.shape[0] > 0 else 0
             avg_wall_ms = wall_time_arr[1:].mean() * 1000 if wall_time_arr.shape[0] > 1 else 0
@@ -964,10 +1316,14 @@ async def train(config: Config):
             )
 
             # Wallclock attribution from C# real_time. Buckets:
-            #   intro = first step of each rollout-active env (boss intro
-            #     animation lives here now that the intro skip is gone).
-            #   combat = all subsequent valid steps (death step included —
-            #     the knight died fighting, that's combat time).
+            #   intro = steps before the boss wakes up. Detected per-env as
+            #     the run of leading rollout steps where combat_mask is all
+            #     zeros (no active enemy/attack collider visible). The boss
+            #     FSM keeps its colliders disabled through the GG transition
+            #     + intro animation, so HitboxObserver emits nothing combat
+            #     until the FSM flips them on.
+            #   combat = valid steps from first-awake onward (death step
+            #     included — knight died fighting, that's combat time).
             #   death+exit = NATURAL-END reset phase (knight death animation
             #     + HK auto-transition out of the boss arena).
             #   load = LoadBossScene reset phase (workshop bounce + boss
@@ -977,10 +1333,38 @@ async def train(config: Config):
             # Resets reaped this epoch were initiated at the end of the
             # previous epoch (or mid-rollout on a death), so the attribution
             # is one-epoch-lagged — consistent in the average over many epochs.
-            intro_es = float(real_time_arr[0].sum()) if real_time_arr.shape[0] > 0 else 0.0
-            if real_time_arr.shape[0] > 1:
-                combat_es = float((real_time_arr[1:] * valid_arr[1:].astype(np.float32)).sum())
+            if real_time_arr.shape[0] > 0:
+                # (T, N_active) bool — does this step's obs have any *enemy*
+                # hitbox? Combat features include both Enemy-type and the
+                # knight's own Attack-type colliders (HitboxObserver.cs:686);
+                # filtering on `gives_damage > 0` (column 5, set to 1 only
+                # for HitboxType.Enemy at HitboxObserver.cs:691) excludes
+                # the knight's swing so a free attack during intro doesn't
+                # falsely declare the boss awake. combat_hb's hitbox-axis
+                # size can vary across steps (merge_obs_padded re-pads),
+                # so reduce per step then stack the booleans.
+                IDX_GIVES_DAMAGE = 5
+                has_hb_arr = np.stack([
+                    ((o.combat_mask > 0) &
+                     (o.combat_hb[..., IDX_GIVES_DAMAGE] > 0.5)).any(axis=-1)
+                    for o in buf_obs
+                ])
+                T = has_hb_arr.shape[0]
+                # First step at which boss is awake. T (= never) for envs
+                # that died entirely inside the intro.
+                first_awake = np.where(
+                    has_hb_arr.any(axis=0),
+                    has_hb_arr.argmax(axis=0),
+                    T,
+                )
+                step_idx = np.arange(T)[:, None]
+                intro_per_step = (step_idx < first_awake[None, :])
+                combat_per_step = ~intro_per_step
+                valid_f = valid_arr.astype(np.float32)
+                intro_es = float((real_time_arr * intro_per_step * valid_f).sum())
+                combat_es = float((real_time_arr * combat_per_step * valid_f).sum())
             else:
+                intro_es = 0.0
                 combat_es = 0.0
             death_es = sum(e.get("transition_out", 0.0) for e in epoch_reset_dts) / 1000.0
             load_es = sum(e.get("load_boss_scene", 0.0) for e in epoch_reset_dts) / 1000.0

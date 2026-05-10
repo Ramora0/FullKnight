@@ -21,6 +21,8 @@ _CLI_FIELDS = frozenset({
     "entropy_coeff", "max_grad_norm", "target_kl",
     "batch_size", "train_iters",
     "hard_restart_every_epochs",
+    "detect_glitch", "glitch_log_dir", "glitch_max_dumps",
+    "debug_recoil",
 })
 
 
@@ -40,16 +42,18 @@ class Config:
     n_envs: int = 16
     level: str = "GG_Mega_Moss_Charger"  # used by eval
     boss_levels: str = "GG_False_Knight,GG_Mega_Moss_Charger,GG_Gruz_Mother,GG_Hornet_1"  # comma-separated pool for training
-    # 1 Unity frame per agent step. Total game-time per step is preserved
-    # at 0.0424s by the C# captureDeltaTime calculation
-    # (kStepDeltaTime = kBaselineGtime / (frames_per_wait * time_scale)),
-    # so per-frame Time.deltaTime grows from 0.00848s (5fpw) to 0.0424s
-    # (1fpw). The agent sees the same per-step game-time it was trained
-    # on, but each step costs 1/5 the Unity frames → ~5x less sim cost
-    # per env-step. Note: 0.0424s/frame is ~24 game-fps; near the lower
-    # bound where HK FSM/animator timing stays sane (per ideas.md).
+    # 1 Unity frame per agent step. Per-step game-time is pinned at 0.0424s
+    # by the C# captureDeltaTime calculation (kBaselineGtime / frames_per_wait),
+    # so per-frame Time.deltaTime is 0.0424s at fpw=1 and 0.00848s at fpw=5.
+    # The agent sees the same per-step game-time regardless of fpw, but lower
+    # fpw means fewer Unity frames per step (~5x less sim cost at fpw=1 vs 5).
+    # Note: 0.0424s/frame is ~24 game-fps; near the lower bound where HK
+    # FSM/animator timing stays sane (per ideas.md).
     frames_per_wait: int = 1
-    time_scale: int = 3
+    # time_scale is currently ignored on the C# side (the timeScale mechanism
+    # was ripped out so we can isolate captureDeltaTime as the only time knob).
+    # Field kept for protocol compat; default 1 reflects current effective value.
+    time_scale: int = 1
     # Cap Unity's frame rate (Application.targetFrameRate). 0 = uncapped (-1),
     # the default used in training. Set to e.g. 60 when watching graphical
     # runs locally, so HK doesn't burn CPU at hundreds of fps. Plumbed to C#
@@ -180,6 +184,23 @@ class Config:
     # of each, reset overhead). Used to identify where time is going so we
     # can target the right bottleneck.
     diag_epochs: int = 0
+
+    # Glitch detection: when an entire epoch passes with zero damage events
+    # (no `damage_landed > 0` and no `hits_taken > 0` across every active env
+    # for the full rollout), assume the knight/boss-disappeared bug fired and
+    # dump the prior epoch + current epoch (per-step actions, global state,
+    # combat/terrain hitboxes, kinds, diag counts, step timings) into a .log
+    # file. Bounded by glitch_max_dumps so a stuck-glitched run doesn't fill
+    # the disk. Logs land under glitch_log_dir; training continues.
+    detect_glitch: bool = True
+    glitch_log_dir: str = "glitch_logs"
+    glitch_max_dumps: int = 5
+
+    # When true, the C# mod logs `[Recoil]` lines on each rising/falling edge of
+    # `cState.recoiling || cState.recoilFrozen`, with duration in agent-steps,
+    # game-time ms, and real-time ms. Used to verify that knockback duration is
+    # invariant to fps_cap / frames_per_wait. Plumbed via FK_DEBUG_RECOIL env var.
+    debug_recoil: bool = False
 
     # Debug
     visualize: bool = False

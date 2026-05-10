@@ -235,10 +235,8 @@ namespace FullKnight.Game
 
 	public static class ActionDecoder
 	{
-		// Hard-commit hold durations, expressed in game-time seconds. The
-		// per-env-step duration is computed at apply-time from frames_per_wait
-		// and time_scale so the same wall-clock charge time holds across
-		// configs. Each entry counts only the locked phase; one extra "release"
+		// Hard-commit hold durations, expressed in game-time seconds.
+		// Each entry counts only the locked phase; one extra "release"
 		// step (action[2]=none) is appended automatically to fire the action
 		// (nail art swing / focus heal / dream nail / super dash).
 		// Values are conservative — slightly above the actual HK charge times.
@@ -246,22 +244,21 @@ namespace FullKnight.Game
 		{
 			{ 1, 1.5f },   // nail_charge: nail art charges in ~1.4s
 			{ 3, 0.5f },   // focus: ~0.45s for one mask of healing
-			{ 5, 3.0f },   // dream_nail: ~2.7s charge
+			{ 5, 4.2f },   // dream_nail: ~2.7s charge + 40% margin
 			{ 6, 1.0f },   // super_dash: ~0.85s charge
 		};
 
-		private static int LockedStepsFor(int actionIdx, int framesPerWait, int timeScale)
+		private static int LockedStepsFor(int actionIdx)
 		{
 			if (!HoldGameSeconds.TryGetValue(actionIdx, out float gs)) return 0;
-			// Pinned to baseline (framesPerWait=5, timeScale=3) so the locked-step
-			// count is invariant to the current fpw. Otherwise trained agents
-			// would see a different lock duration when we lower fpw to cut sim
-			// cost — at fpw=2 the lock would balloon from 6 -> 15 steps and
-			// the agent would freeze through boss attacks. Behavioral parity
-			// with training matters more here than the (always-wrong) game-
-			// seconds derivation; agents learned the lock count, not the wallclock.
-			const float kBaselineStepGameSeconds = 5f * 3f / 60f;  // 0.25
-			int n = (int)System.Math.Ceiling(gs / kBaselineStepGameSeconds);
+			// Per-step game-time. Mirrors TrainingEnv.Reset's captureDeltaTime
+			// pin: kBaselineGtime/fpw per Unity frame × fpw frames per step
+			// = 0.0424s per step, invariant to fpw. The previous baseline of
+			// 0.25s came from the old fpw=5/timeScale=3/60fps regime and made
+			// every commit window ~5.9× too short under the current regime
+			// (e.g. nail_charge locked for 0.25s of game-time vs ~1.4s charge).
+			const float kStepGameSeconds = 0.0424f;
+			int n = (int)System.Math.Ceiling(gs / kStepGameSeconds);
 			return n > 0 ? n : 1;
 		}
 
@@ -284,8 +281,7 @@ namespace FullKnight.Game
 		/// Apply order: movement -> direction -> jump -> action
 		/// so that dash overrides jump when both are requested.
 		/// </summary>
-		public static bool ApplyAction(InputDeviceShim shim, int[] action,
-			int framesPerWait, int timeScale)
+		public static bool ApplyAction(InputDeviceShim shim, int[] action)
 		{
 			bool committed = false;
 
@@ -313,7 +309,7 @@ namespace FullKnight.Game
 			else if (HoldGameSeconds.ContainsKey(action[2]))
 			{
 				// Idle + free hold pick: lock starting next step.
-				int totalLocked = LockedStepsFor(action[2], framesPerWait, timeScale);
+				int totalLocked = LockedStepsFor(action[2]);
 				shim.LockedAction = action[2];
 				// This step counts toward the locked phase (the agent picked
 				// it freely, KeyAttack/etc gets set true now). Subsequent
