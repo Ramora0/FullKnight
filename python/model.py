@@ -7,16 +7,25 @@ from observation import Observation, GS
 
 
 class HitboxEncoder(nn.Module):
-    """Single-head attention pooling over hitboxes, queried by global state.
+    """Multi-head attention pooling over hitboxes, queried by global state.
+
+    output_dim is split evenly across n_heads, so each head operates at
+    head_dim = output_dim // n_heads. Total params/flops for the attention
+    are unchanged vs the prior single-head version; the only added cost is
+    the reshape. Different heads can specialize on different hitbox roles
+    (target body vs attack collider vs projectile etc).
 
     Optionally accepts a per-hitbox extra feature (e.g. concatenated kind
     embedding) which is appended to each raw hitbox vector before phi.
     """
 
-    def __init__(self, input_dim=5, hidden_dim=64, output_dim=64, query_dim=14, extra_dim=0):
+    def __init__(self, input_dim=5, hidden_dim=64, output_dim=64, query_dim=14, extra_dim=0, n_heads=1):
         super().__init__()
+        assert output_dim % n_heads == 0, f"output_dim {output_dim} must be divisible by n_heads {n_heads}"
         self.output_dim = output_dim
         self.extra_dim = extra_dim
+        self.n_heads = n_heads
+        self.head_dim = output_dim // n_heads
 
         self.phi = nn.Sequential(
             nn.Linear(input_dim + extra_dim, hidden_dim),
@@ -28,8 +37,9 @@ class HitboxEncoder(nn.Module):
         self.W_q = nn.Linear(query_dim, output_dim)
         self.W_k = nn.Linear(output_dim, output_dim)
         self.W_v = nn.Linear(output_dim, output_dim)
+        self.W_o = nn.Linear(output_dim, output_dim)
 
-        self.scale = output_dim ** 0.5
+        self.scale = self.head_dim ** 0.5
 
     def forward(self, hitboxes, mask, global_state, extra=None):
         """
@@ -53,17 +63,20 @@ class HitboxEncoder(nn.Module):
         if extra is not None:
             hitboxes = torch.cat([hitboxes, extra], dim=-1)
         h = self.phi(hitboxes)  # (B, N, output_dim)
+        N = h.shape[1]
+        H, D = self.n_heads, self.head_dim
 
-        q = self.W_q(global_state).unsqueeze(1)  # (B, 1, output_dim)
-        k = self.W_k(h)                           # (B, N, output_dim)
-        v = self.W_v(h)                           # (B, N, output_dim)
+        q = self.W_q(global_state).view(B, H, 1, D)        # (B, H, 1, D)
+        k = self.W_k(h).view(B, N, H, D).transpose(1, 2)   # (B, H, N, D)
+        v = self.W_v(h).view(B, N, H, D).transpose(1, 2)   # (B, H, N, D)
 
-        attn_logits = (q @ k.transpose(-2, -1)) / self.scale  # (B, 1, N)
-        attn_mask = mask.unsqueeze(1)  # (B, 1, N)
+        attn_logits = (q @ k.transpose(-2, -1)) / self.scale  # (B, H, 1, N)
+        attn_mask = mask.view(B, 1, 1, N)                     # (B, 1, 1, N)
         attn_logits = attn_logits.masked_fill(attn_mask == 0, -1e9)
 
-        attn_weights = torch.softmax(attn_logits, dim=-1)  # (B, 1, N)
-        out = (attn_weights @ v).squeeze(1)  # (B, output_dim)
+        attn_weights = torch.softmax(attn_logits, dim=-1)  # (B, H, 1, N)
+        head_out = (attn_weights @ v).squeeze(2)           # (B, H, D)
+        out = self.W_o(head_out.reshape(B, self.output_dim))  # (B, output_dim)
 
         return out
 
@@ -86,12 +99,14 @@ class FullKnightActorCritic(nn.Module):
             output_dim=config.combat_output,
             query_dim=config.global_output,
             extra_dim=2 * config.kind_embed_dim,  # leaf kind ‖ parent kind, concatenated
+            n_heads=config.attn_n_heads,
         )
         self.terrain_encoder = HitboxEncoder(
             input_dim=config.terrain_feature_dim,
             hidden_dim=config.terrain_hidden,
             output_dim=config.terrain_output,
             query_dim=config.global_output,
+            n_heads=config.attn_n_heads,
         )
 
         # Per-hitbox semantic identity. Index 0 == "unknown" (used by padding too).

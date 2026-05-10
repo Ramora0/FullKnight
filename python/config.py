@@ -97,6 +97,11 @@ class Config:
     terrain_hidden: int = 64
     terrain_output: int = 64
     hidden_dim: int = 512
+    # Multi-head attention pooling in HitboxEncoder. output_dim is split
+    # evenly across n_heads (head_dim = output_dim // n_heads). Same param
+    # count as single-head; lets different heads specialize on different
+    # hitbox roles (target body vs attack collider vs projectile).
+    attn_n_heads: int = 4
 
     # GRU (temporal memory)
     gru_dim: int = 64           # bottleneck dimension for GRU (hidden_dim -> gru_dim -> hidden_dim)
