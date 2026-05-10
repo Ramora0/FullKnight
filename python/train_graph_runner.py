@@ -1,24 +1,31 @@
 """Bucketed CUDA-graph runner for the PPO training inner loop.
 
-Captures forward_sequence + loss + backward + clip_grad_norm + optimizer.step
-as a single CUDA graph per (combat_bucket, terrain_bucket) pair. Replay
-costs ~kernel launch * 1 instead of ~kernel launch * O(layers) per minibatch
-in eager mode.
+Captures forward_sequence + loss + backward + clip_grad_norm as a single
+CUDA graph per (combat_bucket, terrain_bucket) pair. Replay costs ~kernel
+launch * 1 instead of ~kernel launch * O(layers) per minibatch.
 
-Why this works:
+optimizer.step() is intentionally OUTSIDE the captured graph: it runs
+eagerly after each replay. Capturing optim.step requires Adam(capturable=
+True), which has had subtle quality regressions in some PyTorch versions
+(can drift Adam state across many replays, hurting D_geo). Eager optim.step
+costs only a handful of ms — small compared to the forward+backward we
+graph — and lets the optimizer continue using the standard, well-tested
+non-capturable code path. Side benefit: LR annealing via set_lr() now
+works again (capturable=True would have baked LR at capture time).
+
+Why this is safe:
   - The training pass has fixed shapes: (CPB, L, ...) per minibatch.
-  - Adam with capturable=True keeps step state on GPU and is replay-safe.
   - clip_grad_norm_ uses _foreach_* ops; graph-compatible.
   - All Categorical distributions in the policy already pass
     validate_args=False (required: capture rejects host-syncing ops).
   - gru_info["gru_norm"] is now a tensor (model.py forward_sequence) so
     we can copy it into the static output buffer instead of .item()ing.
+  - Grad tensors are allocated during warmup with set_to_none=False, so
+    their addresses stay stable across capture and all subsequent
+    replays. The captured backward writes to those addresses; eager
+    optim.step reads them post-replay.
 
 Caveats:
-  - LR is baked into the captured optim.step(). A `set_lr` between replays
-    has NO effect on the captured graph. Caller should be aware (this
-    project's training script anneals LR ~5% over 800 epochs which is
-    noise-level; we accept the bake-in).
   - Mirror augmentation MUST happen on the source minibatch tensors before
     we copy them into the static buffers — the mirror op itself is not
     inside the graph.
@@ -163,7 +170,8 @@ class BucketedTrainGraphRunner:
             self.optimizer.zero_grad(set_to_none=False)
             loss.backward()
             nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
-            self.optimizer.step()
+            # NOTE: optimizer.step() is NOT in the graph — it runs eagerly
+            # after each replay. See module docstring for rationale.
 
             with torch.no_grad():
                 kl = (((ratio - 1) - log_ratio) * valid_flat).sum() / valid_sum
@@ -265,4 +273,9 @@ class BucketedTrainGraphRunner:
         d_in["def_var_eff"].fill_(def_var_eff)
 
         slot["graph"].replay()
+        # optimizer.step runs EAGER, after the captured backward has
+        # populated p.grad. The grad tensor addresses are stable (they
+        # were allocated during warmup with set_to_none=False), so the
+        # optimizer reads the values the captured graph just wrote.
+        self.optimizer.step()
         return slot["d_out"]

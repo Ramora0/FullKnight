@@ -85,17 +85,12 @@ class PPO:
         self.combat_normalizer = RunningNormalizer(config.combat_normalized_dims)
         self.terrain_normalizer = RunningNormalizer(config.terrain_normalized_dims)
 
-        # capturable=True lets the optimizer.step() be captured by CUDA
-        # graphs (training graphs, not just rollout). Step state goes on
-        # GPU. LR is still read as a Python float so it's baked into the
-        # captured graph at first capture; LR annealing post-capture is
-        # a no-op (acceptable for our 20-min experiments where LR drifts
-        # ~5%). When training graphs are off, capturable=True is a small
-        # overhead but harmless.
+        # Plain Adam — capturable=True is NOT needed because optimizer.step
+        # is now run eagerly outside the captured training graph (forward
+        # + backward + clip_grad_norm are captured; optim.step is not).
+        # See train_graph_runner.py docstring for rationale.
         self.optimizer = torch.optim.Adam(
             self.policy.parameters(), lr=config.lr,
-            capturable=getattr(config, "use_train_cuda_graphs", False)
-                and torch.cuda.is_available(),
         )
         # LR annealing is now step-based and driven from train.py via
         # set_lr(); no torch LR scheduler needed.
