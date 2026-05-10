@@ -462,6 +462,10 @@ async def train(config: Config):
         os.environ["FK_DEBUG_RECOIL"] = "1"
     else:
         os.environ.pop("FK_DEBUG_RECOIL", None)
+    # Fake-reset probability: 0.0 = always real (existing behavior),
+    # 0.9 = 90% fake (clamp lethal damage, restore HPs in-place, skip
+    # scene transition).
+    os.environ["FK_FAKE_RESET_PROB"] = str(float(config.fake_reset_prob))
     mgr = None
     if config.hk_path and os.path.exists(config.hk_path):
         print(f"Spawning {config.n_envs} HK instance(s)...")
@@ -537,6 +541,12 @@ async def train(config: Config):
         } for b in bosses}
         rng = np.random.default_rng(config.seed or None)
         env_boss = [bosses[int(rng.integers(len(bosses)))] for _ in range(config.n_envs)]
+        # Per-env episode counter for boss-rotation throttling. With
+        # boss_rotation_period > 0, an env stays on its current boss for
+        # N consecutive episodes before being assigned a new boss; the
+        # in-cluster episode-ends become same-boss resets that the C# mod
+        # fast-paths (fake-reset, no scene load).
+        env_episode_count = [0 for _ in range(config.n_envs)]
         dprint(f"Boss pool: {bosses}")
         # Initial env→boss assignment is transition-relevant (every reset
         # may change it). Always print on startup.
@@ -850,10 +860,20 @@ async def train(config: Config):
                         )
 
                 if just_died:
-                    new_levels = [bosses[int(rng.integers(len(bosses)))]
-                                   for _ in just_died]
-                    for env_i, b in zip(just_died, new_levels):
-                        env_boss[env_i] = b
+                    # Boss rotation throttling: each env stays on its current
+                    # boss for boss_rotation_period episodes, then rotates to
+                    # a new randomly-chosen boss. Same-boss episode-ends become
+                    # fake resets on the C# side (no scene load); the rotation
+                    # boundary forces a real reset that flushes HK FSM state.
+                    rot = config.boss_rotation_period
+                    new_levels = []
+                    for env_i in just_died:
+                        env_episode_count[env_i] += 1
+                        if rot <= 0 or env_episode_count[env_i] >= rot:
+                            new_b = bosses[int(rng.integers(len(bosses)))]
+                            env_boss[env_i] = new_b
+                            env_episode_count[env_i] = 0
+                        new_levels.append(env_boss[env_i])
                     if config.debug_transitions:
                         for env_i, b in zip(just_died, new_levels):
                             print(

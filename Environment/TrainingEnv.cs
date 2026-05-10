@@ -85,6 +85,20 @@ namespace FullKnight.Environment
 		private float _recoilStartGameTime;
 		private float _recoilStartRealTime;
 
+		// Fake-reset: with probability _fakeResetProb, intercept lethal damage
+		// (boss or knight) by clamping it to leave 1 HP, then immediately
+		// restoring both knight and all boss HPs to max in-place. This avoids
+		// the ~85%-of-wallclock scene-transition Reset() while still emitting
+		// a done=true boundary so the curriculum / GAE bootstrap fire normally.
+		// Set via FK_FAKE_RESET_PROB env var. _fakeResetPending is flipped on
+		// inside the damage hooks; Step() converts it into _episodeDone with
+		// info="fake_reset". _lastEpisodeWasFake then takes Reset() through
+		// a fast-path that skips the scene-load entirely.
+		private float _fakeResetProb;
+		private bool _fakeResetPending;
+		private bool _lastEpisodeWasFake;
+		private int _fakeResetCount;
+
 		// Stored hook delegates so Dispose can detach them. The FreezeMoment kill
 		// is a global override — installed once in Setup() and held for the
 		// process lifetime — so we keep refs to the actual delegates we hooked.
@@ -139,7 +153,18 @@ namespace FullKnight.Environment
 		private IEnumerator Reset(MessageData data)
 		{
 			PhaseBegin();
-			_level = data.level ?? _level;
+			// Fake-reset is only valid if the next episode targets the SAME
+			// boss arena we're already in. Python's boss_rotation_period
+			// keeps an env on the same boss for N episodes; on rotation it
+			// picks a new boss and we MUST do a real scene-load reset.
+			string requestedLevel = data.level ?? _level;
+			string activeScene = UnityEngine.SceneManagement.SceneManager
+				.GetActiveScene().name;
+			if (_lastEpisodeWasFake && requestedLevel != activeScene)
+			{
+				_lastEpisodeWasFake = false;  // boss rotated: fall through to full reset
+			}
+			_level = requestedLevel;
 			_frameSkipCount = data.frames_per_wait ?? _frameSkipCount;
 			_evalMode = data.eval ?? false;
 			_hitsTakenInStep = 0;
@@ -154,6 +179,47 @@ namespace FullKnight.Environment
 			_episodeDone = false;
 			_episodeResult = null;
 			_resetCount++;
+
+			// Fake-reset fast-path. Damage hooks already restored both knight
+			// and boss HPs to max in-place; no HK death FSM ran (we clamped
+			// the lethal hit at 1 HP). Scene state is whatever it was mid-fight,
+			// so the only work we have to do here is rebuild the obs and reply.
+			// Skips ~85% of typical reset wallclock (PRE-UNLOAD + LoadBossScene).
+			if (_lastEpisodeWasFake)
+			{
+				_lastEpisodeWasFake = false;
+				// captureDeltaTime was pinned at last real reset and is held
+				// constant through fake resets. timeScale was set to 0 by the
+				// previous Step()'s freeze; leave it there since obs build
+				// doesn't need ticks.
+				const float kBaselineGtime_fake = 0.0424f;
+				Time.captureDeltaTime = kBaselineGtime_fake / _frameSkipCount;
+				_resetBranch = 2;
+				// Stub LogPhase calls to keep wire alignment with the 7-slot
+				// reset_phase_deltas_ms array Python expects (binary_protocol).
+				LogPhase("Reset", "FAKE-PRE-UNLOAD");
+				LogPhase("Reset", "FAKE-NATURAL-END");
+				LogPhase("Reset", "FAKE-settle");
+				LogPhase("Reset", "FAKE-LoadBossScene");
+				LogPhase("Reset", "FAKE-RecreateReader");
+				LogPhase("Reset", "FAKE-InitBossRefs");
+				var fakeObs = _hitboxObserver.GetSplitFeatures(_bossHMs, emitTerrainDebug: _evalMode);
+				var fakeGs = StateExtractor.GetGlobalState(fakeObs.KnightWidth, fakeObs.KnightHeight);
+				data.combat_hitboxes = fakeObs.CombatHitboxes;
+				data.combat_kinds = fakeObs.CombatKinds;
+				data.combat_parents = fakeObs.CombatParents;
+				data.terrain_hitboxes = fakeObs.TerrainHitboxes;
+				data.terrain_debug = fakeObs.TerrainDebug;
+				data.global_state = fakeGs;
+				LogPhase("Reset", "obs+freeze (fake)");
+				float fakeResetMs = (Time.realtimeSinceStartup - _phaseStart) * 1000f;
+				Log($"[Reset-Timing] reset#{_resetCount} FAKE TOTAL {fakeResetMs:F1}ms (count={_fakeResetCount})");
+				data.reset_phase_deltas_ms = _resetPhaseDeltasMs.ToArray();
+				data.reset_phase_frames = _resetPhaseFrames.ToArray();
+				data.reset_branch = _resetBranch;
+				SendMessage(new Message { type = "reset", data = data });
+				yield break;
+			}
 
 			LogPhase("Reset", "PRE-UNLOAD");
 
@@ -329,15 +395,40 @@ namespace FullKnight.Environment
 			// Check for episode end (both modes now have real HP and death)
 			if (!_episodeDone)
 			{
-				if (_bossDied)
+				if (_fakeResetPending)
+				{
+					// Damage hook clamped a lethal hit; HPs already restored.
+					// Mark the boundary so curriculum / GAE bootstrap fire,
+					// but signal Reset() to take the fast-path (no scene load).
+					_fakeResetPending = false;
+					_lastEpisodeWasFake = true;
+					_fakeResetCount++;
+					_episodeDone = true;
+					_episodeResult = "fake_reset";
+				}
+				else if (_bossDied)
 				{
 					_episodeDone = true;
 					_episodeResult = "win";
 				}
 				else if (PlayerData.instance.health <= 0)
 				{
-					_episodeDone = true;
-					_episodeResult = "loss";
+					// Knight dropped to 0 outside the TakeDamage hook (silent
+					// FSM/charm/spike write). Roll fake here too so this path
+					// also benefits — clamp HP back up and treat as fake.
+					if (_fakeResetProb > 0f && UnityEngine.Random.value < _fakeResetProb)
+					{
+						RestoreFightHPs();
+						_lastEpisodeWasFake = true;
+						_fakeResetCount++;
+						_episodeDone = true;
+						_episodeResult = "fake_reset";
+					}
+					else
+					{
+						_episodeDone = true;
+						_episodeResult = "loss";
+					}
 				}
 				else
 				{
@@ -568,6 +659,16 @@ namespace FullKnight.Environment
 			_debugRecoil = !string.IsNullOrEmpty(dbgRecoil) && dbgRecoil != "0";
 			Log($"[Setup] debugRecoil={_debugRecoil} (FK_DEBUG_RECOIL={dbgRecoil ?? "unset"})");
 
+			_fakeResetProb = 0f;
+			var fakeProbStr = System.Environment.GetEnvironmentVariable("FK_FAKE_RESET_PROB");
+			if (!string.IsNullOrEmpty(fakeProbStr)
+				&& float.TryParse(fakeProbStr, System.Globalization.NumberStyles.Float,
+					System.Globalization.CultureInfo.InvariantCulture, out float parsedProb))
+			{
+				_fakeResetProb = Mathf.Clamp01(parsedProb);
+			}
+			Log($"[Setup] fakeResetProb={_fakeResetProb:F3} (FK_FAKE_RESET_PROB={fakeProbStr ?? "unset"})");
+
 			// Kill HK's hit-stop. On every hit, HeroController.StartRecoil yields
 			// to gm.FreezeMoment(0.01, 0.35, 0.1, 0.0001), which ramps Time.timeScale
 			// down to 0.0001 and back up to 1 via TimeController.GenericTimeScale.
@@ -668,6 +769,31 @@ namespace FullKnight.Environment
 
 			// Real damage in both modes — episode ends when all bosses are dead
 			bool wouldDie = self.hp - hitInstance.DamageDealt <= 0;
+
+			// Fake-reset: if this hit would kill the LAST live boss, with
+			// probability _fakeResetProb clamp it so the boss survives at 1 HP,
+			// then immediately restore all boss HPs and the knight HP to max.
+			// No HK death FSM fires because hp never reaches 0.
+			if (wouldDie && _fakeResetProb > 0f)
+			{
+				bool wouldFinish = true;
+				foreach (var hm in _bossHMs)
+				{
+					if (hm == null) continue;
+					if (hm == self) continue;
+					if (hm.hp > 0) { wouldFinish = false; break; }
+				}
+				if (wouldFinish && UnityEngine.Random.value < _fakeResetProb)
+				{
+					var clamped = hitInstance;
+					clamped.DamageDealt = Mathf.Max(0, self.hp - 1);
+					orig(self, clamped);
+					RestoreFightHPs();
+					_fakeResetPending = true;
+					return;
+				}
+			}
+
 			orig(self, hitInstance);
 			if (wouldDie)
 			{
@@ -692,9 +818,44 @@ namespace FullKnight.Environment
 			HeroController self, GameObject go, GlobalEnums.CollisionSide damageSide,
 			int damageAmount, int hazardType)
 		{
+			// Fake-reset: if this hit would kill the knight, with probability
+			// _fakeResetProb clamp it so knight survives at 1 HP, then restore
+			// HPs to max and flag fake reset. Avoids the death FSM entirely.
+			if (_fakeResetProb > 0f && damageAmount > 0)
+			{
+				int currentHp = PlayerData.instance.health;
+				if (currentHp - damageAmount <= 0
+					&& UnityEngine.Random.value < _fakeResetProb)
+				{
+					int safeDmg = Mathf.Max(0, currentHp - 1);
+					_inHeroTakeDamage = true;
+					try { orig(self, go, damageSide, safeDmg, hazardType); }
+					finally { _inHeroTakeDamage = false; }
+					RestoreFightHPs();
+					_fakeResetPending = true;
+					return;
+				}
+			}
+
 			_inHeroTakeDamage = true;
 			try { orig(self, go, damageSide, damageAmount, hazardType); }
 			finally { _inHeroTakeDamage = false; }
+		}
+
+		// Restore knight HP and all tracked boss HPs to their max values, in-place.
+		// Called by the damage hooks after they've clamped a lethal hit. The FSM
+		// state for both is whatever it was mid-hit; HP is now safely above zero
+		// so the death FSM never triggered.
+		private void RestoreFightHPs()
+		{
+			PlayerData.instance.health = _knightMaxHP;
+			foreach (var hm in _bossHMs)
+			{
+				if (hm == null) continue;
+				if (hm.gameObject == null) continue;
+				if (!_bossMaxHPs.TryGetValue(hm, out int maxHp)) continue;
+				hm.hp = maxHp;
+			}
 		}
 
 		// PlayerData.TakeHealth is the lowest-rung HP write inside HK.

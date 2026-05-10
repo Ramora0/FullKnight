@@ -19,7 +19,8 @@ _CLI_FIELDS = frozenset({
     # PPO / training knobs that get ablated
     "lr", "gamma", "gae_lambda", "clip_eps", "value_coeff",
     "entropy_coeff", "max_grad_norm", "target_kl",
-    "batch_size", "train_iters", "mirror_aug",
+    "batch_size", "train_iters", "mirror_aug", "fake_reset_prob",
+    "boss_rotation_period",
     "hard_restart_every_epochs",
     "detect_glitch", "glitch_log_dir", "glitch_max_dumps",
     "debug_recoil",
@@ -133,6 +134,21 @@ class Config:
     # 50% horizontal-mirror augmentation per minibatch (data aug exploiting
     # HK's L/R symmetry). Toggle for ablation.
     mirror_aug: bool = False
+    # Fake-reset probability: when knight or boss would die, with this
+    # probability we clamp the lethal damage and instantly restore both HPs
+    # to max in-place — skipping the full scene-transition reset (~85% of
+    # wallclock at baseline). Plumbed to C# via FK_FAKE_RESET_PROB env var.
+    # 0.0 disables (full real reset every death). 1.0 = always fake.
+    # Used in conjunction with boss_rotation_period: each env stays on its
+    # boss for boss_rotation_period episodes (each fake-reset), then gets
+    # a real reset to a new boss to flush HK FSM state.
+    fake_reset_prob: float = 1.0
+    # Number of consecutive same-boss episodes per env before Python rotates
+    # to a new boss. With fake_reset_prob=1.0 + period=10: each cluster is
+    # 9 fake-resets (instant in-place HP restore, no scene load) + 1 real
+    # reset (with new boss assignment). 0 disables (re-roll every death,
+    # the original behavior).
+    boss_rotation_period: int = 10
     lr: float = 3e-4
     gamma: float = 0.95
     gae_lambda: float = 0.95
