@@ -1037,7 +1037,6 @@ async def train(config: Config):
                                 "boss_pool": ",".join(bosses),
                                 "rollout_len": config.rollout_len,
                                 "n_envs": config.n_envs,
-                                "frames_per_wait": config.frames_per_wait,
                             },
                         )
                         glitch_dump_count += 1

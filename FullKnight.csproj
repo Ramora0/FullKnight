@@ -156,4 +156,12 @@
   <ItemGroup>
     <EmbeddedResource Include="Resource\save_file.json" />
   </ItemGroup>
+  <!-- The standalone ShmEcho test app under tools/ is its own .NET project.
+       Without this exclude, SDK default Compile globs (**/*.cs) sweep its
+       sources + obj-generated AssemblyInfo into the FullKnight build and
+       trigger CS0579 duplicate-attribute errors. -->
+  <ItemGroup>
+    <Compile Remove="tools\**\*.cs" />
+    <None Remove="tools\**\*" />
+  </ItemGroup>
 </Project>

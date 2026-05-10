@@ -165,6 +165,17 @@ namespace FullKnight.Net
 
 			switch (typeId)
 			{
+				case MSG_INIT:
+					// Slot + use_shm trailers were added when the shm step
+					// transport landed. Length-defensive: if the buffer is
+					// just the 1-byte type tag (older Python client), leave
+					// both fields null and the WebSocket-only legacy path
+					// stays in effect.
+					if (ms.Position + 4 <= ms.Length)
+						msg.data.slot = r.ReadUInt32();
+					if (ms.Position + 1 <= ms.Length)
+						msg.data.use_shm = r.ReadByte() != 0;
+					break;
 				case MSG_RESET:
 					msg.data.frames_per_wait = r.ReadInt32();
 					msg.data.time_scale = r.ReadInt32();

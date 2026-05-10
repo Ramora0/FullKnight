@@ -16,7 +16,6 @@ namespace FullKnight.Environment
 		private float _damageLandedInStep;
 		private float _hpHealedInStep;
 		private int _knightHpAtStepStart;
-		private int _knightMaxHP;
 
 		// Eval mode: real damage, real death, episode ends on kill
 		private bool _evalMode;
@@ -109,6 +108,16 @@ namespace FullKnight.Environment
 
 		private HitboxObserver _hitboxObserver = new();
 		private InputDeviceShim _inputShim = new();
+
+		// Shared-memory channel for the step hot path. Opened in Setup() when
+		// Python's MSG_INIT carries use_shm=true; null otherwise (then step
+		// actions/responses stay on the WebSocket). The _shmActionLoop
+		// background coroutine polls _shm.TryReadAction every frame and
+		// dispatches Step() when an action arrives. Type lookup uses the
+		// `using FullKnight.Net;` at the top of this file — naming the type
+		// `FullKnight.Net.ShmChannel` here collides with the FullKnight class
+		// (CS0426: namespace vs. type ambiguity).
+		private ShmChannel _shm;
 
 		public TrainingEnv(string url, params string[] protocols) : base(url, protocols) { }
 
@@ -284,7 +293,6 @@ namespace FullKnight.Environment
 			// "[BounceCheck]" to audit every reset at a glance.
 			bool bossAwake = HasActiveCombatHitboxes();
 			Log($"[BounceCheck] reset#{_resetCount} level={_level} bossAwake={bossAwake}");
-			_knightMaxHP = PlayerData.instance.maxHealth;
 
 			UnhookDamage();
 			HookDamage();
@@ -327,7 +335,7 @@ namespace FullKnight.Environment
 				data.hp_healed = 0;
 				data.step_game_time = 0;
 				data.step_real_time = 0;
-				SendMessage(new Message { type = "step", data = data });
+				EmitStepResponse(data);
 				yield break;
 			}
 
@@ -570,7 +578,7 @@ namespace FullKnight.Environment
 				data.combat_hitboxes = new List<float[]>();
 				data.terrain_hitboxes = new List<float[]>();
 				data.global_state = new float[22];
-				SendMessage(new Message { type = "step", data = data });
+				EmitStepResponse(data);
 				yield break;
 			}
 
@@ -586,7 +594,7 @@ namespace FullKnight.Environment
 			data.global_state = gs;
 			data.done = false;
 
-			SendMessage(new Message { type = "step", data = data });
+			EmitStepResponse(data);
 			yield break;
 		}
 
@@ -701,7 +709,68 @@ namespace FullKnight.Environment
 
 			_hitboxObserver.Load();
 			InputManager.AttachDevice(_inputShim);
+
+			// If Python negotiated the shared-memory step transport during
+			// init, open our end of the channel and spin up a background
+			// coroutine that polls the action event each frame and dispatches
+			// Step(). init/reset/pause/resume/close stay on the WebSocket.
+			if ((message.data.use_shm ?? false) && message.data.slot.HasValue)
+			{
+				int slot = (int)message.data.slot.Value;
+				try
+				{
+					_shm = new ShmChannel(slot);
+					Log($"[Setup] shm step channel opened (slot={slot})");
+					GameManager.instance.StartCoroutine(_shmActionLoop());
+				}
+				catch (System.Exception e)
+				{
+					Log($"[Setup] shm open failed for slot={slot}: {e.Message}; falling back to WebSocket");
+					_shm = null;
+				}
+			}
+			else
+			{
+				Log($"[Setup] shm step channel disabled (use_shm={message.data.use_shm}, slot={message.data.slot}); using WebSocket");
+			}
+
 			SendMessage(message);
+		}
+
+		// Background dispatch for the shm step transport. WaitOne(0) inside
+		// TryReadAction is a cheap user-mode check when the event isn't
+		// signaled, so per-frame polling cost is essentially zero. When an
+		// action arrives we run Step() inline (yields through frame_skip
+		// frames just like the WebSocket dispatch did); EmitStepResponse
+		// writes the obs back via shm and signals Python.
+		private IEnumerator _shmActionLoop()
+		{
+			while (!_terminate && _shm != null)
+			{
+				if (_shm.TryReadAction(out int[] action))
+				{
+					var data = new MessageData { action_vec = action };
+					yield return Step(data);
+				}
+				yield return null;
+			}
+		}
+
+		// Emit a step response over whichever transport is active for this
+		// instance. The packed bytes are identical between paths
+		// (BinaryProtocol.Pack); only the wire changes.
+		private void EmitStepResponse(MessageData data)
+		{
+			var msg = new Message { type = "step", data = data, sender = "client" };
+			if (_shm != null)
+			{
+				byte[] bytes = BinaryProtocol.Pack(msg);
+				_shm.SendObs(bytes);
+			}
+			else
+			{
+				SendMessage(msg);
+			}
 		}
 
 		protected override IEnumerator Dispose()
@@ -713,6 +782,11 @@ namespace FullKnight.Environment
 			if (_killFreezeInt != null) On.GameManager.FreezeMoment_int -= _killFreezeInt;
 			InputManager.DetachDevice(_inputShim);
 			_hitboxObserver.Unload();
+			if (_shm != null)
+			{
+				_shm.Dispose();
+				_shm = null;
+			}
 			CloseSocket();
 			yield break;
 		}
@@ -846,9 +920,19 @@ namespace FullKnight.Environment
 		// Called by the damage hooks after they've clamped a lethal hit. The FSM
 		// state for both is whatever it was mid-hit; HP is now safely above zero
 		// so the death FSM never triggered.
+		//
+		// Knight: must go through HeroController.MaxHealth() — a raw write to
+		// PlayerData.instance.health skips proxyFSM "HeroCtrl-MaxHealth" (HUD
+		// mask redraw), prevHealth bookkeeping (delta-listeners desync),
+		// blockerHits reset, and UpdateBlueHealth(). MaxHealth() also reads
+		// CurrentMaxHealth live, so charm-modified caps (Joni's / Fragile Heart)
+		// stay correct without our own cache.
+		// Boss: HealthManager.hp is a plain public field with no listeners on
+		// write, so direct assignment is fine.
 		private void RestoreFightHPs()
 		{
-			PlayerData.instance.health = _knightMaxHP;
+			var hc = HeroController.instance;
+			if (hc != null) hc.MaxHealth();
 			foreach (var hm in _bossHMs)
 			{
 				if (hm == null) continue;

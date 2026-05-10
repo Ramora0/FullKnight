@@ -5,7 +5,7 @@
 #
 # Each experiment:
 #   - trains for TIME_BUDGET seconds (20 min) FROM SCRATCH
-#   - n_envs=8, frames_per_wait=1, 4-boss pool (config defaults for everything else)
+#   - n_envs=8, frames_per_wait=1 (hardcoded), Moss Charger only (config defaults for everything else)
 #   - logs to wandb under WANDB_PROJECT, named "<short_hash> <commit_subject>"
 #     so every run in the dashboard maps 1:1 to a git commit on the ablation branch.
 
@@ -24,7 +24,6 @@ export PYTHONIOENCODING=utf-8
 
 .venv/Scripts/python.exe python/train.py \
     --n_envs 8 \
-    --frames_per_wait 1 \
     --time_budget "$TIME_BUDGET" \
     --resume "$RESUME_CKPT" \
     --wandb_project "$WANDB_PROJECT" \

@@ -10,8 +10,8 @@ from dataclasses import dataclass, fields
 _CLI_FIELDS = frozenset({
     # Run control
     "n_envs", "level", "boss_levels",
-    "frames_per_wait", "time_scale", "fps_cap",
-    "hk_path",
+    "time_scale", "fps_cap",
+    "hk_path", "ipc",
     "seed", "resume", "time_budget", "diag_epochs", "visualize",
     "debug_transitions",
     "wandb_project", "save_path", "save_every_steps",
@@ -41,15 +41,20 @@ class Config:
     server_host: str = "localhost"
     server_port: int = 8765
     n_envs: int = 16
+    # Transport for the step() hot path. "shm" routes action/obs through a
+    # named shared-memory + Win32 EventWaitHandle channel (see
+    # python/shm_transport.py + Net/ShmChannel.cs); "websocket" keeps the
+    # legacy path for A/B testing or rollback. init/reset/pause/resume/close
+    # always go over WebSocket regardless. Validated at ~7us mean RTT vs
+    # ~340us for WebSocket (python/bench_ipc_mono.py).
+    ipc: str = "shm"
     level: str = "GG_Mega_Moss_Charger"  # used by eval
-    boss_levels: str = "GG_False_Knight,GG_Mega_Moss_Charger,GG_Gruz_Mother,GG_Hornet_1"  # comma-separated pool for training
-    # 1 Unity frame per agent step. Per-step game-time is pinned at 0.0424s
-    # by the C# captureDeltaTime calculation (kBaselineGtime / frames_per_wait),
-    # so per-frame Time.deltaTime is 0.0424s at fpw=1 and 0.00848s at fpw=5.
-    # The agent sees the same per-step game-time regardless of fpw, but lower
-    # fpw means fewer Unity frames per step (~5x less sim cost at fpw=1 vs 5).
-    # Note: 0.0424s/frame is ~24 game-fps; near the lower bound where HK
-    # FSM/animator timing stays sane (per ideas.md).
+    boss_levels: str = "GG_Mega_Moss_Charger"  # comma-separated pool for training
+    # Hardcoded to 1: the agent acts every Unity frame. Per-step game-time is
+    # 0.0424s (the C# captureDeltaTime, ~24 game-fps — near the lower bound
+    # where HK FSM/animator timing stays sane). Field kept for protocol
+    # compat with eval/validate/test tools that still surface it as a knob;
+    # train.py does not plumb it.
     frames_per_wait: int = 1
     # time_scale is currently ignored on the C# side (the timeScale mechanism
     # was ripped out so we can isolate captureDeltaTime as the only time knob).

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- net472 mirrors the Hollow Knight mod target so we measure under the
+         same BCL surface (System.IO.MemoryMappedFiles, EventWaitHandle). -->
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>ShmEcho</RootNamespace>
+    <AssemblyName>ShmEcho</AssemblyName>
+  </PropertyGroup>
+</Project>

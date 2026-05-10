@@ -6,6 +6,7 @@ import websockets
 from env import HKEnv
 from vocab import KindVocab
 from observation import Observation, filter_terrain_in_view
+from shm_transport import ShmChannel
 
 
 class VecEnv:
@@ -17,6 +18,10 @@ class VecEnv:
         self.envs = [None] * self.n_envs
         self.connected = [asyncio.Event() for _ in range(self.n_envs)]
         self._ws_connections = [None] * self.n_envs
+        # Per-slot ShmChannel for the step hot path. Created lazily on
+        # _on_connect when config.ipc == "shm". None when ipc=="websocket"
+        # (legacy / rollback path) or for slots that haven't connected yet.
+        self._shm_channels: list = [None] * self.n_envs
         self._server = None
         self.vocab = KindVocab(max_size=config.kind_vocab_size)
         # Latest level assigned per env. Annotates slow-op prints and lets
@@ -51,9 +56,28 @@ class VecEnv:
             await websocket.close()
             return
 
+        # If a previous run for this slot leaked a ShmChannel (slot recycled
+        # after a crash), tear it down before creating the new one — the
+        # named kernel objects ref-count down and the new ShmChannel binds
+        # to fresh state.
+        if self._shm_channels[idx] is not None:
+            try:
+                self._shm_channels[idx].close()
+            except Exception:
+                pass
+            self._shm_channels[idx] = None
+
+        # Create the shm channel BEFORE the init handshake. The C# side's
+        # Setup() reads the slot from MSG_INIT and opens its end — Python
+        # is the creator, so the kernel objects must already exist.
+        shm = None
+        if getattr(self.config, "ipc", "shm") == "shm":
+            shm = ShmChannel(slot=idx)
+            self._shm_channels[idx] = shm
+
         self._ws_connections[idx] = websocket
-        self.envs[idx] = HKEnv(websocket, self.config, idx=idx)
-        print(f"Instance {idx} connected.")
+        self.envs[idx] = HKEnv(websocket, self.config, idx=idx, shm=shm)
+        print(f"Instance {idx} connected (ipc={getattr(self.config, 'ipc', 'shm')}).")
 
         await self.envs[idx].init()
         self.connected[idx].set()
@@ -65,6 +89,12 @@ class VecEnv:
             print(f"Instance {idx} disconnected.")
             self._ws_connections[idx] = None
             self.envs[idx] = None
+            if self._shm_channels[idx] is not None:
+                try:
+                    self._shm_channels[idx].close()
+                except Exception:
+                    pass
+                self._shm_channels[idx] = None
             self.connected[idx].clear()
 
     async def _timed_op(self, label, idx, coro, loud=False):

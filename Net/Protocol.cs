@@ -78,5 +78,16 @@ namespace FullKnight.Net
 		// 1 = natural-end (waited for HK's death/win transition),
 		// 2 = suicide (synthetic kill, mid-fight reset).
 		public byte? reset_branch;
+
+		// Env slot index, sent by Python on MSG_INIT. Used to address the
+		// per-instance shared-memory step channel (Local\fk_inst_{slot}_*).
+		// Null when the wire didn't carry a slot (old Python client).
+		public uint? slot;
+
+		// True if Python wants the step hot path routed through ShmChannel.
+		// When false (or null = old client), step actions/responses stay on
+		// the WebSocket. Both transports always coexist in the C# code; this
+		// flag just gates which one is wired up at Setup time.
+		public bool? use_shm;
 	}
 }

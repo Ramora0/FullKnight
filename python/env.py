@@ -1,3 +1,4 @@
+import asyncio
 import time
 import numpy as np
 from binary_protocol import (
@@ -21,12 +22,17 @@ class HKEnv:
     Callers only see numpy arrays and Python scalars.
     """
 
-    def __init__(self, websocket, config, idx=0):
+    def __init__(self, websocket, config, idx=0, shm=None):
         self.ws = websocket
         self.config = config
         # Numeric env slot, used in debug-transitions wire prints so the
         # user can disambiguate which game instance issued each command.
         self.idx = idx
+        # Optional ShmChannel for the step hot path. When non-None, step()
+        # routes action/obs through shared memory + Win32 events instead of
+        # the WebSocket; init/reset/pause/resume/close still use the ws.
+        # Created and owned by VecEnv (see vec_env._on_connect).
+        self.shm = shm
         # Debug-only: last terrain_debug strings pulled off the wire.
         # Populated after each reset/step by reading the protocol side channel.
         self.last_terrain_debug: list = []
@@ -51,9 +57,16 @@ class HKEnv:
             print(f"  [{ts}.{ms:03d} env {self.idx}] {msg}", flush=True)
 
     async def init(self):
-        """Send init handshake and wait for ack."""
-        self._dbg("-> INIT")
-        await self.ws.send(pack_init())
+        """Send init handshake and wait for ack.
+
+        Sends the env slot ID + a use_shm flag as trailers on MSG_INIT so
+        the C# side can open its end of the shared-memory step channel
+        (Local\\fk_inst_{idx}_*) when this env was constructed with one.
+        An older mod DLL that ignores the trailers still parses the
+        leading byte cleanly."""
+        use_shm = self.shm is not None
+        self._dbg(f"-> INIT (slot={self.idx}, use_shm={use_shm})")
+        await self.ws.send(pack_init(slot=self.idx, use_shm=use_shm))
         await self.ws.recv()
         self._dbg("<- INIT ack")
 
@@ -99,17 +112,38 @@ class HKEnv:
         Returns (combat_hb, terrain_hb, global_state, combat_kinds, combat_parents,
                  damage_landed, hits_taken, hp_healed, step_game_time, step_real_time, done,
                  committed).
+
+        Uses the ShmChannel when one is attached (production fast path);
+        falls back to WebSocket for A/B testing or older mod DLLs that
+        don't open the shm side. Both paths receive the same packed bytes
+        produced by BinaryProtocol.Pack on the C# side, so unpack_step is
+        transport-agnostic.
         """
         self._dbg(f"-> STEP action={action_vec}")
         t0 = time.perf_counter()
-        await self.ws.send(pack_action(action_vec))
-        t1 = time.perf_counter()
-        data = await self.ws.recv()
+        action_bytes = pack_action(action_vec)
+        if self.shm is not None:
+            # Run the synchronous shm round-trip on the asyncio default
+            # executor. step_all's asyncio.gather across envs gives us
+            # one worker per env, so per-step waits parallelize naturally.
+            # The alive_check distinguishes a true peer crash (raise
+            # ChannelClosedError) from a genuine timeout in a still-alive
+            # peer (raise TimeoutError). The websockets library exposes
+            # state via .state (newer) or .closed (older); we read both
+            # defensively from a worker thread — values are atomic so
+            # cross-thread reads are safe even if not formally documented.
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(
+                None, self._shm_step_sync, action_bytes,
+            )
+        else:
+            await self.ws.send(action_bytes)
+            data = await self.ws.recv()
         t2 = time.perf_counter()
         if (t2 - t0) > _SLOW_OP_THRESHOLD_S:
-            print(f"    [step-wire] env {self.idx} action={action_vec} "
-                  f"send={(t1-t0)*1000:.0f}ms"
-                  f" recv={(t2-t1)*1000:.0f}ms total={(t2-t0)*1000:.0f}ms",
+            transport = "shm" if self.shm is not None else "ws"
+            print(f"    [step-wire/{transport}] env {self.idx} action={action_vec} "
+                  f"total={(t2-t0)*1000:.0f}ms",
                   flush=True)
         (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
          damage_landed, hits_taken, hp_healed, game_time, real_time, done,
@@ -121,7 +155,7 @@ class HKEnv:
             kn_h = float(gs[5]) if len(gs) > 5 else 0.0
             hp = int(gs[2]) if len(gs) > 2 else 0
             self._dbg(
-                f"<- STEP {(t2-t1)*1000:.0f}ms done={done} "
+                f"<- STEP {(t2-t0)*1000:.0f}ms done={done} "
                 f"combat={len(combat_hb)} terrain={len(terrain_hb)} "
                 f"knight={kn_w:.1f}x{kn_h:.1f} hp={hp} "
                 f"dmg={damage_landed:.2f} hits={int(hits_taken)} "
@@ -130,6 +164,31 @@ class HKEnv:
         return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
                 damage_landed, hits_taken, hp_healed, game_time, real_time, done,
                 committed)
+
+    def _peer_alive(self):
+        """Best-effort liveness probe used by ShmChannel.step_sync on timeout.
+        Returns False if the websocket has visibly closed — the C# side has
+        crashed or disconnected and won't be responding to shm signals.
+        Reads the websockets state field, which is atomic-int-backed and
+        safe to query from a worker thread."""
+        ws = self.ws
+        if ws is None:
+            return False
+        # `state` attr present on websockets >=10. Older releases used
+        # boolean `closed`. Probe both — first match wins.
+        state = getattr(ws, "state", None)
+        if state is not None:
+            try:
+                from websockets.protocol import State
+                return state is State.OPEN
+            except Exception:
+                pass
+        return not getattr(ws, "closed", False)
+
+    def _shm_step_sync(self, action_bytes):
+        """Worker-thread entry for the shm step round-trip. Bound here so
+        we can pass `self._peer_alive` cleanly into ShmChannel.step_sync."""
+        return self.shm.step_sync(action_bytes, alive_check=self._peer_alive)
 
     async def step_eval(self, action_vec):
         """Like step() but also returns done flag. For eval mode."""

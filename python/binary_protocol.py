@@ -21,8 +21,15 @@ GLOBAL_DIM   = 22  # must match config.global_state_dim
 
 # --- Pack (Python -> C#) ---
 
-def pack_init():
-    return struct.pack('B', MSG_INIT)
+def pack_init(slot=0, use_shm=False):
+    """Init handshake. Wire: [u8 MSG_INIT][u32 slot][u8 use_shm].
+    `slot` is the per-instance index used to address the shared-memory
+    channel for this env (Local\\fk_inst_{slot}_*). `use_shm` tells the C#
+    side whether to actually open its end and route step() through shm
+    (vs keep the WebSocket-only legacy path). Both trailers are read
+    length-defensively, so an older mod DLL that ignores them still parses
+    the leading byte cleanly."""
+    return struct.pack('<BIB', MSG_INIT, int(slot), 1 if use_shm else 0)
 
 def pack_reset(level, frames_per_wait, time_scale, eval_mode=False):
     level_bytes = level.encode('utf-8')
