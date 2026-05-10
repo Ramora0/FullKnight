@@ -1381,7 +1381,7 @@ async def train(config: Config):
                 print(
                     f"  wall | combat {pct(combat_es):.0f}% intro {pct(intro_es):.0f}% "
                     f"death+exit {pct(death_es):.0f}% load {pct(load_es):.0f}% "
-                    f"reset-other {pct(reset_other_es):.0f}% (Σ {total_es:.1f}env-s)",
+                    f"reset-other {pct(reset_other_es):.0f}% (sum {total_es:.1f}env-s)",
                     flush=True,
                 )
             # Cumulative breakdown every 10 epochs so user gets a stable
@@ -1398,7 +1398,7 @@ async def train(config: Config):
                     f"death+exit {cpct(cum_wall['death']):.0f}% "
                     f"load {cpct(cum_wall['load']):.0f}% "
                     f"reset-other {cpct(cum_wall['reset_other']):.0f}% "
-                    f"(Σ {cum_total:.1f}env-s)",
+                    f"(sum {cum_total:.1f}env-s)",
                     flush=True,
                 )
 
@@ -1638,7 +1638,7 @@ async def train(config: Config):
                     f"death+exit {cpct(cum_wall['death']):.1f}% "
                     f"load {cpct(cum_wall['load']):.1f}% "
                     f"reset-other {cpct(cum_wall['reset_other']):.1f}% "
-                    f"(Σ {cum_total:.1f}env-s)"
+                    f"(sum {cum_total:.1f}env-s)"
                 )
 
         agent.save_checkpoint(
