@@ -288,11 +288,22 @@ namespace FullKnight.Environment
 			LogPhase("Reset", "RecreateReader+frame");
 
 			InitBossRefs();
-			LogPhase("Reset", "InitBossRefs");
-			// One-line pass/fail signal for the same-scene-reload bug. Grep for
-			// "[BounceCheck]" to audit every reset at a glance.
+			// BossSceneController.bosses can populate lazily — retry until
+			// colliders enable. Replaces a fixed-duration realtime settle that
+			// gave 0.4–3.5 sim-s of FSM advance depending on fps.
+			int wakeFrames = 0;
+			const int kMaxWakeFrames = 600;
+			while (wakeFrames < kMaxWakeFrames)
+			{
+				if (_bossHMs.Count == 0) InitBossRefs();
+				if (_bossHMs.Count > 0 && HasActiveCombatHitboxes()) break;
+				yield return null;
+				wakeFrames++;
+			}
 			bool bossAwake = HasActiveCombatHitboxes();
-			Log($"[BounceCheck] reset#{_resetCount} level={_level} bossAwake={bossAwake}");
+			LogPhase("Reset", "InitBossRefs+BossWake");
+			Log($"[BounceCheck] reset#{_resetCount} level={_level} "
+				+ $"bossAwake={bossAwake} wakeFrames={wakeFrames}");
 
 			UnhookDamage();
 			HookDamage();
@@ -1065,17 +1076,6 @@ namespace FullKnight.Environment
 						_bossMaxHPs[hm] = hm.hp;
 					}
 				}
-				// Strip the 5-second `bossesDeadWaitTime` HK adds after a boss
-				// dies. EndSceneDelayed yields `WaitForSeconds(bossesDeadWaitTime)`
-				// before any transition logic runs (BossSceneController.cs:234 in
-				// the decomp); zeroing it is the single largest win-side wallclock
-				// reduction available without breaking the GG transition FSM
-				// chain. We DO leave doTransitionOut=true (default): turning it
-				// off skips the `GG TRANSITION OUT` event broadcast that HK's
-				// transition FSM listens for, and the fallback path is strictly
-				// slower (+1s wallclock measured).
-				if (bsc != null)
-					bsc.bossesDeadWaitTime = 0f;
 			}
 			catch { }
 		}

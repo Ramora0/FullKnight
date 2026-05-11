@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 from torch.distributions import Categorical
 
-from observation import Observation, GS
+from env.observation import Observation, GS
 
 
 class HitboxEncoder(nn.Module):
@@ -176,10 +176,12 @@ class FullKnightActorCritic(nn.Module):
         # ~50% mass on holds → the agent spends most of early training
         # frozen in useless commits. -2.0 brings combined hold mass to ~8%
         # at init, roughly matching pre-lock-fix time-in-commit.
+        hold_bias = float(getattr(self.config, "hold_action_init_bias", -2.0))
         with torch.no_grad():
             self.head_action.bias[0] = 1.0
-            for idx in (1, 3, 5, 6):
-                self.head_action.bias[idx] = -2.0
+            if hold_bias != 0.0:
+                for idx in (1, 3, 5, 6):
+                    self.head_action.bias[idx] = hold_bias
 
     def _encode(self, obs: Observation, hx=None):
         global_emb = self.global_encoder(obs.global_state)

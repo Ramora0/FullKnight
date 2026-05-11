@@ -6,21 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 FullKnight is a reinforcement learning system for Hollow Knight boss fights. It has two halves:
 
-- **C# mod** (`FullKnight.cs`, `Game/`, `Net/`, `Environment/`): A Hollow Knight mod that exposes a gym-like environment over WebSocket. It extracts observations (hitboxes, game state), receives actions, applies them via a virtual input device, and computes rewards.
+- **C# mod** (`mod/` — `FullKnight.cs`, `Game/`, `Net/`, `Environment/`): A Hollow Knight mod that exposes a gym-like environment over WebSocket. It extracts observations (hitboxes, game state), receives actions, applies them via a virtual input device, and computes rewards.
 - **Python trainer** (`python/`): A PPO training loop that connects to one or more running game instances, collects rollouts, and trains a set-based actor-critic network.
 
 ## Build Commands
 
 ### C# Mod
 
-Requires Hollow Knight's managed DLLs. The `LocalRefs` MSBuild property must point to the game's `Managed` folder (set per-configuration in `FullKnight.csproj`).
+Requires Hollow Knight's managed DLLs. The `LocalRefs` MSBuild property must point to the game's `Managed` folder (set per-configuration in `mod/FullKnight.csproj`).
 
 ```bash
 # Debug: builds and copies DLL + dependencies to HK Mods folder
-dotnet build -c Debug
+dotnet build mod/FullKnight.csproj -c Debug
 
-# Release: builds and packages into Output/FullKnight.zip
-dotnet build -c Release
+# Release: builds and packages into mod/Output/FullKnight.zip
+dotnet build mod/FullKnight.csproj -c Release
 ```
 
 ### Python Trainer
@@ -77,7 +77,7 @@ The GRU provides temporal memory across timesteps. Hidden state flows during rol
 - `ProxyController.cs` (`InputDeviceShim` + `ActionDecoder`): Virtual InControl device that injects actions. Checks `Can*` methods before applying actions.
 - `HitboxObserver`: Tracks all active Collider2Ds via `HitboxReader` MonoBehaviour, classifies into Knight/Enemy/Attack/Terrain.
 - Time control: `Time.captureDeltaTime` is set in `TrainingEnv.Reset()` to `0.0424 / frames_per_wait` and held constant. `Time.timeScale` toggles between 1 (running) and 0 (paused for inter-step Python obs handoff). The previous `TimeScale` IL-hook + multiplier infrastructure was removed; `time_scale` config field is now ignored.
-- `SaveFileProxy`: Loads an embedded completed save file (`Resource/save_file.json`) and disables saving.
+- `SaveFileProxy`: Loads an embedded completed save file (`mod/Resource/save_file.json`) and disables saving.
 - `SceneHooks`: Loads boss scenes via Hall of Gods transition sequence.
 
 ### Multi-Instance (`instance_manager.py`)

@@ -2,13 +2,16 @@
 CUDA graphs on synthetic observations. Compares deterministic outputs and
 times both paths.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import time
 import numpy as np
 import torch
 
 from config import Config
 from ppo import PPO
-from observation import Observation
+from env.observation import Observation
 
 
 def make_np_obs(n_envs, n_combat, n_terrain, cfg):

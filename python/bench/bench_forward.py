@@ -11,13 +11,16 @@ Tests several variants:
 
 Skips torch.compile entirely — not supported on Windows + CUDA.
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import time
 import numpy as np
 import torch
 
 from config import Config
 from model import FullKnightActorCritic
-from observation import Observation, GS
+from env.observation import Observation, GS
 
 
 def make_obs(B, n_combat, n_terrain, cfg, device):

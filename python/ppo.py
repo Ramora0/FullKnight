@@ -5,9 +5,9 @@ import numpy as np
 from tqdm import tqdm
 
 from model import FullKnightActorCritic
-from observation import Observation, CB, mirror_observation, mirror_movement
+from env.observation import Observation, CB, mirror_observation, mirror_movement
 from graph_runner import BucketedGraphRunner
-from train_graph_runner import BucketedTrainGraphRunner
+from bench.train_graph_runner import BucketedTrainGraphRunner
 
 
 class RunningNormalizer:

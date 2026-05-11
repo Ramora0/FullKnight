@@ -24,7 +24,7 @@ Why this works with continuous training:
 import torch
 import numpy as np
 
-from observation import Observation
+from env.observation import Observation
 
 
 class BucketedGraphRunner:

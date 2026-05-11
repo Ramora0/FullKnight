@@ -3,10 +3,10 @@ import time
 import numpy as np
 import websockets
 
-from env import HKEnv
-from vocab import KindVocab
-from observation import Observation, filter_terrain_in_view
-from shm_transport import ShmChannel
+from .env import HKEnv
+from .vocab import KindVocab
+from .observation import Observation, filter_terrain_in_view
+from .shm_transport import ShmChannel
 
 
 class VecEnv:

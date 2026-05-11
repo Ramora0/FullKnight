@@ -98,12 +98,8 @@ namespace FullKnight.Game
 			yield return new WaitForSceneLoad(scene_name);
 			Stage("SCENE-LOAD-DONE");
 			yield return new WaitForFinishedEnteringScene();  // 1-frame yield
-			// Realtime settle: gives HK wallclock time for the boss FSM to
-			// finish its wake sequence. Scales with timeScale otherwise, so
-			// timeScale=20 would collapse it to ~33ms and the intro-skip
-			// would time out (per the comment that used to live here). 0.667s
-			// was the empirically-proven magnitude.
-			yield return new WaitForSecondsRealtime(0.667f);
+			// Wake settle moved to TrainingEnv.Reset() — polls for active boss
+			// colliders instead of a fixed wallclock wait.
 			Stage("SETTLE-DONE");
 		}
 
@@ -131,25 +127,6 @@ namespace FullKnight.Game
 				+ $" WaitForSceneLoad={(t2 - t1) * 1000f:F0}ms"
 				+ $" WaitForFinishedEnteringScene={(t3 - t2) * 1000f:F0}ms"
 				+ $" total={(t3 - t0) * 1000f:F0}ms");
-		}
-
-		private static IEnumerator FixSoul()
-		{
-			float t0 = Time.realtimeSinceStartup;
-			yield return new WaitForFinishedEnteringScene();
-			float t1 = Time.realtimeSinceStartup;
-			yield return null;
-			// Realtime — see LoadBossScene's note. 0.333s wallclock matches
-			// the prior baseline (1f / timeScale=3) and is empirically enough
-			// for HeroController to be ready for the soul-charge refresh.
-			yield return new WaitForSecondsRealtime(0.333f);
-			float t2 = Time.realtimeSinceStartup;
-			HeroController.instance.AddMPCharge(1);
-			HeroController.instance.AddMPCharge(-1);
-			FullKnight.Instance.Log(
-				$"[Phase-Timing] FixSoul: WaitForFinishedEnteringScene={(t1 - t0) * 1000f:F0}ms"
-				+ $" WaitForSecondsRealtime(0.333)+frame={(t2 - t1) * 1000f:F0}ms"
-				+ $" total={(t2 - t0) * 1000f:F0}ms");
 		}
 
 		public class WaitForSceneLoad : CustomYieldInstruction, IDisposable

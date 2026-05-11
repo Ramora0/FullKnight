@@ -1,7 +1,7 @@
 import asyncio
 import time
 import numpy as np
-from binary_protocol import (
+from .binary_protocol import (
     pack_init, pack_reset, pack_action, pack_pause, pack_resume,
     unpack_reset, unpack_step, pop_last_terrain_debug, pop_last_diag,
     pop_last_reset_phases, MSG_CLOSE,

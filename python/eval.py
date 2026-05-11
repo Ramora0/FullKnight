@@ -16,10 +16,10 @@ from tqdm import tqdm
 from config import Config
 from ppo import PPO
 from instance_manager import InstanceManager
-from env import HKEnv
-from vec_env import VecEnv
-from vocab import KindVocab
-from observation import Observation, filter_terrain_in_view
+from env.env import HKEnv
+from env.vec_env import VecEnv
+from env.vocab import KindVocab
+from env.observation import Observation, filter_terrain_in_view
 from train import merge_obs_padded, slice_obs
 
 

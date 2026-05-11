@@ -24,6 +24,9 @@ _CLI_FIELDS = frozenset({
     "hard_restart_every_epochs",
     "detect_glitch", "glitch_log_dir", "glitch_max_dumps",
     "debug_recoil",
+    # 02adzmax-vs-HEAD ablation knobs (see Config docstrings below)
+    "hidden_dim", "attn_n_heads", "view_w", "view_h",
+    "hold_action_init_bias", "d_first_epoch_jump",
 })
 
 
@@ -123,6 +126,17 @@ class Config:
     action_n: int = 8     # attack_tap, nail_charge, spell_tap, focus, dash, dream_nail, super_dash, none
     jump_n: int = 2       # yes, no
 
+    # Init bias added to the four hold action logits (idx 1=nail_charge,
+    # 3=focus, 5=dream_nail, 6=super_dash). -2.0 brings combined hold mass
+    # to ~8% at init. Set to 0.0 to recover the pre-may10 behavior where
+    # only attack_tap was biased (run 02adzmax).
+    hold_action_init_bias: float = -2.0
+    # When True, on the very first non-empty D-update for each boss, set
+    # D = D_raw (the observed landed/taken ratio) instead of EMA-ing from
+    # D_initial. Lets D start wherever the env naturally lands rather than
+    # anchoring to the arbitrary D_initial=2.0 for many epochs.
+    d_first_epoch_jump: bool = True
+
     # Adaptive reward scaling: D = % of boss HP dealt per hit taken.
     # D_window / D_ema / D_max_delta below are specified at the reference
     # rollout size of total_steps_per_epoch=8192 (where they were tuned);
@@ -152,13 +166,13 @@ class Config:
     # Used in conjunction with boss_rotation_period: each env stays on its
     # boss for boss_rotation_period episodes (each fake-reset), then gets
     # a real reset to a new boss to flush HK FSM state.
-    fake_reset_prob: float = 1.0
+    fake_reset_prob: float = 0.0
     # Number of consecutive same-boss episodes per env before Python rotates
     # to a new boss. With fake_reset_prob=1.0 + period=10: each cluster is
     # 9 fake-resets (instant in-place HP restore, no scene load) + 1 real
     # reset (with new boss assignment). 0 disables (re-roll every death,
     # the original behavior).
-    boss_rotation_period: int = 10
+    boss_rotation_period: int = 0
     lr: float = 3e-4
     gamma: float = 0.95
     gae_lambda: float = 0.95
@@ -183,7 +197,7 @@ class Config:
     # that doesn't exist on fresh launches; D inflates and doesn't transfer).
     # All instances restart synchronously at the same epoch boundary; cost is
     # ~30s of training pause every cadence. 0 disables.
-    hard_restart_every_epochs: int = 0
+    hard_restart_every_epochs: int = 1000
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
 

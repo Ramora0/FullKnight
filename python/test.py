@@ -29,7 +29,7 @@ import time
 import numpy as np
 
 from config import Config
-from vec_env import VecEnv
+from env.vec_env import VecEnv
 from instance_manager import InstanceManager
 
 

@@ -21,7 +21,8 @@ import subprocess
 import sys
 import time
 
-from shm_transport import ShmChannel
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from env.shm_transport import ShmChannel
 
 SLOT = 99  # arbitrary; chosen out of band of any real training slot
 ITERS = 10_000
@@ -30,10 +31,10 @@ ACT_PAYLOAD = 17       # mirrors production action wire size (1B type + 4xi32)
 
 
 def _locate_echo_exe():
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     candidates = [
-        os.path.join(repo_root, "tools", "ShmEcho", "bin", "Release", "net472", "ShmEcho.exe"),
-        os.path.join(repo_root, "tools", "ShmEcho", "bin", "Debug", "net472", "ShmEcho.exe"),
+        os.path.join(repo_root, "mod", "tools", "ShmEcho", "bin", "Release", "net472", "ShmEcho.exe"),
+        os.path.join(repo_root, "mod", "tools", "ShmEcho", "bin", "Debug", "net472", "ShmEcho.exe"),
     ]
     for p in candidates:
         if os.path.exists(p):

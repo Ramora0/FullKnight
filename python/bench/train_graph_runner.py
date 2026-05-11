@@ -35,7 +35,7 @@ Caveats:
 import torch
 import torch.nn as nn
 
-from observation import Observation
+from env.observation import Observation
 
 
 class BucketedTrainGraphRunner:

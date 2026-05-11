@@ -18,7 +18,6 @@ models/
 logs/
 wandb/
 python/glitch_logs/
-python/train_glitch_run.log
 python/*.log
 
 # Recordings

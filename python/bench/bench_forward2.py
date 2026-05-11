@@ -1,11 +1,14 @@
 """Diagnose why forward pass is 87ms in training but 5ms in benchmark."""
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import time
 import random
 import torch
 import numpy as np
 from config import Config
 from model import FullKnightActorCritic
-from observation import Observation, GS
+from env.observation import Observation, GS
 
 config = Config()
 device = torch.device("cuda")

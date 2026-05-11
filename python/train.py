@@ -8,10 +8,10 @@ import torch
 import wandb
 
 from config import Config
-from vec_env import VecEnv
+from env.vec_env import VecEnv
 from ppo import PPO
 from instance_manager import InstanceManager
-from observation import GS, CB, TR
+from env.observation import GS, CB, TR
 
 
 # Action sub-token labels for the glitch log. Must match config.{movement,direction,action,jump}_n
@@ -1163,8 +1163,32 @@ async def train(config: Config):
                 if vis is not None:
                     vis.update(obs)
 
-                if not rollout_active:
-                    break
+                # All rollout-active envs have died. Instead of truncating the
+                # rollout, block until at least one in-flight reset completes
+                # and splice the env back in. Keeps the rollout length fixed at
+                # config.rollout_len even when n_envs is small.
+                while not rollout_active:
+                    assert vec_env._reset_tasks, (
+                        "rollout stalled: no live envs and no pending resets"
+                    )
+                    await asyncio.wait(
+                        list(vec_env._reset_tasks.values()),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    reaped = vec_env.reap_completed_resets()
+                    epoch_reset_dts.extend(vec_env.pop_reset_dts())
+                    if not reaped:
+                        continue
+                    rj_indices = [ei for ei, _ in reaped]
+                    rj_obs_batch = vec_env._batch_observations(
+                        [raw for _, raw in reaped]
+                    )
+                    rj_sub_local = [n_active_local_for[ei] for ei in rj_indices]
+                    obs = merge_obs_padded(obs, rj_obs_batch, rj_sub_local)
+                    agent.reset_hidden_for(rj_indices)
+                    for ei in rj_indices:
+                        done_in_rollout.discard(ei)
+                    rollout_active = sorted(set(rollout_active) | set(rj_indices))
 
             # Bootstrap final values
             _, _, _, final_vatk, final_vdef = agent.collect_action(
@@ -1468,20 +1492,26 @@ async def train(config: Config):
                 d_ideal_window[boss] = (window_landed / window_taken) if window_taken > 0 else float("nan")
 
                 if window_landed > 0 and window_taken > 0:
-                    # Always EMA from current D toward the raw ratio with a
+                    # Default: EMA from current D toward the raw ratio with a
                     # per-epoch clamp. The previous "first epoch sets D=D_raw"
                     # branch instantly clobbered D_initial with a single
                     # noisy ratio (ratio of ~12 events from random init can
                     # jump D from 2 to 5+, halving the attack reward before
                     # the policy has time to learn). Slow-and-steady from
                     # D_initial gives the policy a stable curriculum.
+                    # Ablation knob (config.d_first_epoch_jump): the 02adzmax
+                    # behavior — on the first non-empty window for each boss,
+                    # set D = D_raw — is restored when True.
                     D_raw = max(window_landed / window_taken, config.D_min)
-                    D_new = D_ema_eff * bs["D"] + (1 - D_ema_eff) * D_raw
-                    bs["D"] = float(np.clip(
-                        D_new,
-                        bs["D"] * (1 - D_max_delta_eff),
-                        bs["D"] * (1 + D_max_delta_eff),
-                    ))
+                    if config.d_first_epoch_jump and len(bs["landed_window"]) == 1:
+                        bs["D"] = D_raw
+                    else:
+                        D_new = D_ema_eff * bs["D"] + (1 - D_ema_eff) * D_raw
+                        bs["D"] = float(np.clip(
+                            D_new,
+                            bs["D"] * (1 - D_max_delta_eff),
+                            bs["D"] * (1 + D_max_delta_eff),
+                        ))
                 elif window_landed == 0 and window_taken > 0:
                     # Policy is taking hits but landing nothing.
                     # Curriculum is too hard — drop D at the normal clamp rate.

@@ -1,6 +1,6 @@
 import pygame
 
-from observation import Observation, GS, CB, TR
+from env.observation import Observation, GS, CB, TR
 
 
 class Visualizer:
