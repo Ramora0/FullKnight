@@ -3,6 +3,249 @@ import pygame
 from env.observation import Observation, GS, CB, TR
 
 
+class FsmTracker:
+    """Pure-data tracker for boss FSM state.
+
+    Owns the transition graph, junction detection, attack-fingerprint
+    inventory, in-progress chain, and per-FSM state-change history.
+    Decoupled from the pygame Visualizer so the trainer can record and
+    save graph data even when the live visualizer is disabled (the
+    common case for long training runs).
+
+    The trainer feeds `update(fsm_snapshots)` each rollout step; the
+    Visualizer (when enabled) holds a reference to the same tracker and
+    reads from it for rendering — no double-parsing.
+
+    Boss-only: src=B FSMs feed the graph, history, and segmentation.
+    E/A FSMs (projectiles, knight attacks) are still parsed into
+    `last_groups` so the Visualizer can show them in the live panel,
+    but they don't contribute to anything that gets saved.
+    """
+
+    FSM_WARM_FRAMES = 4         # initial _changed_age seed (display-side)
+    RESET_PREV_AFTER_ABSENCE = 30
+    MAX_HISTORY_PER_FSM = 20000
+
+    def __init__(self):
+        # Per-FSM display state — last seen state name, frames since last
+        # change (drives the Visualizer's pulse coloring).
+        self._prev_states: dict = {}
+        self._changed_age: dict = {}
+        # Segmentation: current in-progress chain, fingerprint inventory,
+        # mint counter, sticky last-finalized label, active-highlight set.
+        self._current_sequence: dict = {}
+        self._fingerprint_to_id: dict = {}
+        self._next_attack_idx: dict = {}
+        self._current_attack_id: dict = {}
+        self._current_attack_seq: dict = {}
+        self._attack_age: dict = {}
+        self._active_ids: dict = {}
+        self._segment_runaway_cap = 30
+        # Observed transition graph + junction promotion.
+        self._transition_graph: dict = {}
+        self._known_junctions: dict = {}
+        # Cross-fight bookkeeping. `_absence_count` ticks up for keys not
+        # seen on the wire so we can reset per-fight running state (prev
+        # state, in-progress sequence) lazily without losing the learned
+        # graph/inventory when the boss reappears.
+        self._absence_count: dict = {}
+        # Per-FSM tick + state-change history for replay (src=B only).
+        self._fsm_tick: dict = {}
+        self._state_history: dict = {}
+        # Cached parse result for the Visualizer.
+        self.last_groups = {"B": [], "E": [], "A": []}
+        self.last_on_wire = 0
+        self.empty_ticks = 0
+
+    def update(self, fsm_snapshots):
+        """Ingest one FSM snapshot batch from env 0."""
+        if fsm_snapshots is None:
+            fsm_snapshots = []
+        if not fsm_snapshots:
+            self.empty_ticks += 1
+        else:
+            self.empty_ticks = 0
+        self.last_on_wire = len(fsm_snapshots)
+
+        groups = {"B": [], "E": [], "A": []}
+        seen_keys = set()
+        for raw in fsm_snapshots:
+            parts = raw.split("|", 3)
+            if len(parts) != 4:
+                continue
+            src, owner, fsm_name, state = parts
+            if src not in groups:
+                continue
+            key = (src, owner, fsm_name)
+            seen_keys.add(key)
+            # If this FSM has been missing from the wire for a while, the
+            # most recent _prev_states value is from a previous fight and
+            # would synthesize a cross-fight edge. Drop per-fight running
+            # state cleanly; learned data (graph, junctions, fingerprints,
+            # history) is retained.
+            absence = self._absence_count.pop(key, 0)
+            if absence > self.RESET_PREV_AFTER_ABSENCE:
+                self._prev_states.pop(key, None)
+                self._current_sequence.pop(key, None)
+            prev = self._prev_states.get(key)
+            state_changed = prev != state
+            if state_changed:
+                self._prev_states[key] = state
+                self._changed_age[key] = 0
+            else:
+                self._changed_age[key] = self._changed_age.get(key, self.FSM_WARM_FRAMES) + 1
+
+            state_is_junction = False
+            if src == "B":
+                self._fsm_tick[key] = self._fsm_tick.get(key, 0) + 1
+                if state_changed:
+                    hist = self._state_history.setdefault(key, [])
+                    hist.append([self._fsm_tick[key], state])
+                    if len(hist) > self.MAX_HISTORY_PER_FSM:
+                        del hist[: len(hist) // 2]
+
+                if state_changed and prev is not None:
+                    g = self._transition_graph.setdefault(key, {})
+                    g.setdefault(prev, set()).add(state)
+                    if len(g[prev]) >= 2:
+                        junctions_set = self._known_junctions.setdefault(key, set())
+                        if prev not in junctions_set:
+                            junctions_set.add(prev)
+                            self._retro_split(key, prev)
+
+                junctions = self._known_junctions.get(key, set())
+                state_is_junction = state in junctions
+                seq_list = self._current_sequence.setdefault(key, [])
+                if not seq_list or seq_list[-1] != state:
+                    seq_list.append(state)
+                if state_is_junction:
+                    self._finalize_segment(key)
+                elif len(seq_list) >= self._segment_runaway_cap:
+                    self._finalize_segment(key)
+                else:
+                    self._update_active_ids(key)
+                self._attack_age[key] = self._attack_age.get(key, 0) + 1
+
+            groups[src].append((owner, fsm_name, state, key, state_is_junction))
+
+        for k in list(self._prev_states.keys()):
+            if k not in seen_keys:
+                self._absence_count[k] = self._absence_count.get(k, 0) + 1
+
+        self.last_groups = groups
+
+    def _retro_split(self, key, newly_junction):
+        """Walk the in-progress chain, finalizing at each occurrence of
+        the newly-promoted junction so chains stay graph-coherent."""
+        seq = self._current_sequence.get(key)
+        if not seq or newly_junction not in seq:
+            return
+        working = []
+        for s in seq:
+            working.append(s)
+            if s == newly_junction:
+                self._current_sequence[key] = working
+                self._finalize_segment(key)
+                working = []
+        self._current_sequence[key] = working
+
+    def _finalize_segment(self, key):
+        """Close the current chain, mint or reuse an ID, reset for next."""
+        seq_list = self._current_sequence.get(key)
+        if not seq_list:
+            return
+        if len(seq_list) < 2:
+            # Length-1 chains aren't attacks — junction-to-junction with
+            # no committed run between them.
+            self._current_sequence[key] = []
+            self._active_ids[key] = set()
+            return
+        seq = tuple(seq_list)
+        fp_map = self._fingerprint_to_id.setdefault(key, {})
+        if seq not in fp_map:
+            idx = self._next_attack_idx.get(key, 0)
+            fp_map[seq] = f"a{idx}"
+            self._next_attack_idx[key] = idx + 1
+        new_id = fp_map[seq]
+        if self._current_attack_id.get(key) != new_id:
+            self._current_attack_id[key] = new_id
+            self._current_attack_seq[key] = seq
+            self._attack_age[key] = 0
+        self._active_ids[key] = {new_id}
+        self._current_sequence[key] = []
+
+    def _update_active_ids(self, key):
+        """Active = chains whose fingerprint has the current sequence as
+        a prefix. Multiple matches mean ambiguity (boss hasn't yet
+        diverged). No matches = new pattern being built."""
+        seq = self._current_sequence.get(key, [])
+        if not seq:
+            return
+        fp_map = self._fingerprint_to_id.get(key, {})
+        if not fp_map:
+            return
+        seq_tuple = tuple(seq)
+        n = len(seq_tuple)
+        active = {
+            atk_id
+            for fp, atk_id in fp_map.items()
+            if len(fp) >= n and fp[:n] == seq_tuple
+        }
+        self._active_ids[key] = active
+
+    def save_graph_state(self, filepath, epoch=None):
+        """Dump per-FSM transition graph, fingerprint inventory, and
+        state history to JSON. Atomic temp+rename so an in-progress save
+        never leaves the file half-written for graph_viewer.py to read.
+        """
+        import json
+        import os
+        import tempfile
+        data = {"epoch": epoch, "fsms": {}}
+        # Union over every B-key we've ever seen — _fsm_tick is broadest.
+        all_keys = (
+            set(self._transition_graph)
+            | set(self._state_history)
+            | set(self._fsm_tick)
+        )
+        for key in all_keys:
+            src, owner, fsm_name = key
+            key_str = f"{src}|{owner}|{fsm_name}"
+            graph = self._transition_graph.get(key, {})
+            junctions = self._known_junctions.get(key, set())
+            current = self._prev_states.get(key)
+            fp_map = self._fingerprint_to_id.get(key, {})
+            active = self._active_ids.get(key, set())
+            in_progress = list(self._current_sequence.get(key, []))
+            history = self._state_history.get(key, [])
+            total_ticks = self._fsm_tick.get(key, 0)
+            data["fsms"][key_str] = {
+                "src": src,
+                "owner": owner,
+                "fsm": fsm_name,
+                "transitions": {s: sorted(dsts) for s, dsts in graph.items()},
+                "junctions": sorted(junctions),
+                "current_state": current,
+                "in_progress_sequence": in_progress,
+                "active_ids": sorted(active),
+                "fingerprints": [
+                    {"id": atk_id, "sequence": list(fp)}
+                    for fp, atk_id in sorted(
+                        fp_map.items(), key=lambda kv: int(kv[1][1:])
+                    )
+                ],
+                "state_history": [list(e) for e in history],
+                "total_ticks": total_ticks,
+            }
+        d = os.path.dirname(os.path.abspath(filepath))
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".json")
+        os.close(fd)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, filepath)
+
+
 class Visualizer:
     """Live pygame visualization of env 0's observation.
 
@@ -10,8 +253,13 @@ class Visualizer:
     terrain segments as line strokes with nearest-point dots.
     """
 
-    WIDTH = 1200
-    HEIGHT = 600
+    # Window is split into the world canvas on the left and a fixed-width
+    # FSM/info panel on the right. WORLD_W controls the canvas; PANEL_W is
+    # added on top so the world layout is unaffected when the panel grows.
+    WORLD_W = 1200
+    PANEL_W = 460
+    WIDTH = WORLD_W + PANEL_W
+    HEIGHT = 720
     SCALE = 6.0  # pixels per world unit
 
     BG = (245, 245, 245)
@@ -28,6 +276,26 @@ class Visualizer:
     VIEW_BOX = (90, 110, 200)
     TEXT = (35, 35, 35)
 
+    # FSM panel palette. PANEL_BG is a faint gray so the panel reads as a
+    # distinct region; PANEL_RULE separates sections. State text uses a
+    # transition gradient: bright red on the frame a state changed, fading
+    # to orange over the next few frames, then settling to plain text.
+    PANEL_BG = (250, 250, 252)
+    PANEL_RULE = (200, 200, 210)
+    PANEL_HEADER = (30, 30, 80)
+    PANEL_SECTION = (90, 50, 130)
+    PANEL_DIM = (120, 120, 130)
+    FSM_STATE = (35, 35, 35)
+    FSM_CHANGED_HOT = (210, 30, 30)
+    FSM_CHANGED_WARM = (220, 120, 30)
+    FSM_DISPATCHER = (110, 110, 180)  # dim purple for "boss is choosing"
+    FSM_ATTACK = (20, 100, 30)        # green for the current attack label
+    # How many frames a state change stays visually highlighted. The
+    # visualizer ticks at agent-step rate (~1/frames_per_wait of game time),
+    # so 4 ticks ≈ a half-second pulse.
+    FSM_HOT_FRAMES = 1
+    FSM_WARM_FRAMES = 4
+
     # Combat colors mirror the matplotlib version:
     # red=target, orange=damageable enemy, magenta=hazard,
     # green=peaceful damageable, yellow=knight attack.
@@ -37,12 +305,14 @@ class Visualizer:
     COLOR_PEACEFUL = ( 60, 180,  60)
     COLOR_ATTACK   = (235, 215,  20)
 
-    def __init__(self, vocab=None, terrain_max_dist=None, view_w=None, view_h=None):
+    def __init__(self, vocab=None, terrain_max_dist=None, view_w=None, view_h=None, tracker=None):
         pygame.display.init()
         pygame.font.init()
         pygame.display.set_caption("FullKnight Observation Viewer")
         self.screen = pygame.display.set_mode((self.WIDTH, self.HEIGHT))
         self.font = pygame.font.SysFont("consolas", 11)
+        self.fsm_font = pygame.font.SysFont("consolas", 12)
+        self.fsm_state_font = pygame.font.SysFont("consolas", 12, bold=True)
         self.title_font = pygame.font.SysFont("consolas", 14, bold=True)
         self.vocab = vocab
         # Optional terrain-gating preview: segments outside the gate are still
@@ -52,8 +322,14 @@ class Visualizer:
         self.view_w = view_w
         self.view_h = view_h
         self._closed = False
-        self._cx = self.WIDTH // 2
+        # World canvas is centered inside the LEFT WORLD_W pixels; the right
+        # PANEL_W pixels are reserved for FSM text. Keeping cx tied to WORLD_W
+        # rather than WIDTH means the panel doesn't shift the knight off-axis.
+        self._cx = self.WORLD_W // 2
         self._cy = self.HEIGHT // 2
+        # All FSM-tracking state lives on the tracker so the trainer can
+        # record/save graph data without a live pygame visualizer.
+        self.tracker = tracker if tracker is not None else FsmTracker()
 
     def _w2s(self, x, y):
         return self._cx + int(x * self.SCALE), self._cy - int(y * self.SCALE)
@@ -76,7 +352,7 @@ class Visualizer:
             return self.COLOR_PEACEFUL
         return self.COLOR_ATTACK
 
-    def update(self, obs: Observation, terrain_debug=None):
+    def update(self, obs: Observation, terrain_debug=None, fsm_snapshots=None):
         if self._closed:
             return
         for ev in pygame.event.get():
@@ -237,7 +513,206 @@ class Visualizer:
         )
         screen.blit(self.title_font.render(title, True, self.TEXT), (8, 6))
 
+        # Feed the tracker if the caller handed us a snapshot — train.py
+        # always feeds the tracker directly when vis is None, so we only
+        # do this when vis IS the entry point (back-compat path).
+        if fsm_snapshots is not None:
+            self.tracker.update(fsm_snapshots)
+        # FSM panel on the right. Drawn last so it sits above whatever combat
+        # labels happen to cross into the panel region.
+        self._render_fsm_panel()
+
         pygame.display.flip()
+
+    def _render_wrapped_attack(self, x, y, head, seq, color, line_h, max_w):
+        """Render `head + s1→s2→...→sn` wrapping at → boundaries.
+
+        First line uses `head` as prefix; continuation lines use a hanging
+        indent the width of `head` so the sequence aligns. Returns the y
+        coordinate AFTER the rendered block (one line_h past the last line).
+        """
+        if not seq:
+            self.screen.blit(self.fsm_font.render(head + "(empty)", True, color), (x, y))
+            return y + line_h
+        head_w = self.fsm_font.size(head)[0]
+        indent = " " * max(0, int(head_w / self.fsm_font.size(" ")[0]))
+        # Greedily pack parts into lines.
+        parts = list(seq)
+        lines = []
+        current = [parts[0]]
+        for p in parts[1:]:
+            trial = current + [p]
+            prefix = head if not lines else indent
+            if self.fsm_font.size(prefix + "→".join(trial))[0] <= max_w:
+                current = trial
+            else:
+                lines.append(current)
+                current = [p]
+        if current:
+            lines.append(current)
+        for i, lp in enumerate(lines):
+            prefix = head if i == 0 else indent
+            text = prefix + "→".join(lp) + ("→" if i < len(lines) - 1 else "")
+            self.screen.blit(self.fsm_font.render(text, True, color), (x, y))
+            y += line_h
+            if y > self.HEIGHT - line_h:
+                return y
+        return y
+
+    def _render_fsm_panel(self):
+        """Render the right-hand FSM panel from the tracker's cached groups.
+
+        Parsing happens in FsmTracker.update; we just read.
+        """
+        groups = self.tracker.last_groups
+        empty_ticks = self.tracker.empty_ticks
+        on_wire = self.tracker.last_on_wire
+
+        # Panel background + separator rule.
+        panel_x = self.WORLD_W
+        pygame.draw.rect(
+            self.screen, self.PANEL_BG,
+            pygame.Rect(panel_x, 0, self.PANEL_W, self.HEIGHT),
+        )
+        pygame.draw.line(
+            self.screen, self.PANEL_RULE,
+            (panel_x, 0), (panel_x, self.HEIGHT), 1,
+        )
+
+        x_label = panel_x + 10
+        y = 10
+        total = sum(len(v) for v in groups.values())
+        header = f"FSM SNAPSHOTS  ({total} parsed / {on_wire} on wire)"
+        self.screen.blit(
+            self.title_font.render(header, True, self.PANEL_HEADER),
+            (x_label, y),
+        )
+        y += 22
+
+        # Two failure modes that look identical in the per-section "(none)"
+        # output:
+        #   (a) wire delivered zero entries — likely an old mod DLL still
+        #       loaded in HK (mod DLLs load once at HK startup; rebuild +
+        #       restart HK to pick up the new code).
+        #   (b) wire delivered entries but parse rejected them all (delimiter
+        #       mismatch or unrecognized src tag).
+        # The header above shows both numbers; the warning below names
+        # whichever case we're in so the fix is obvious from the panel.
+        if empty_ticks > 5:
+            warn = "NO FSM DATA ON WIRE — rebuild mod + restart HK"
+            self.screen.blit(
+                self.fsm_state_font.render(warn, True, self.FSM_CHANGED_HOT),
+                (x_label, y),
+            )
+            y += 16
+        elif on_wire > 0 and total == 0:
+            warn = f"PARSE FAIL — {on_wire} entries arrived but none matched"
+            self.screen.blit(
+                self.fsm_state_font.render(warn, True, self.FSM_CHANGED_HOT),
+                (x_label, y),
+            )
+            y += 16
+
+        legend = "B=boss subtree   E=enemy hitbox   A=knight hitbox"
+        self.screen.blit(
+            self.font.render(legend, True, self.PANEL_DIM),
+            (x_label, y),
+        )
+        y += 16
+        pygame.draw.line(
+            self.screen, self.PANEL_RULE,
+            (panel_x + 6, y), (panel_x + self.PANEL_W - 6, y), 1,
+        )
+        y += 6
+
+        section_titles = {
+            "B": "BOSS SUBTREE FSMs  (src=B)",
+            "E": "ENEMY HITBOX FSMs  (src=E)",
+            "A": "KNIGHT HITBOX FSMs (src=A)",
+        }
+        line_h = self.fsm_font.get_height() + 1
+        for src in ("B", "E", "A"):
+            rows = groups[src]
+            title_text = f"{section_titles[src]}   [{len(rows)}]"
+            self.screen.blit(
+                self.fsm_state_font.render(title_text, True, self.PANEL_SECTION),
+                (x_label, y),
+            )
+            y += line_h + 1
+            if not rows:
+                self.screen.blit(
+                    self.fsm_font.render("  (none)", True, self.PANEL_DIM),
+                    (x_label, y),
+                )
+                y += line_h + 4
+                continue
+            # Sort by owner then fsm so the panel reads stable frame-to-frame
+            # even if HK rebuilt the FSM list in a different order. Ties at
+            # the source level keep their group; we just sort within group.
+            rows.sort(key=lambda r: (r[0], r[1]))
+            for owner, fsm_name, state, key, state_is_junction in rows:
+                age = self.tracker._changed_age.get(key, self.tracker.FSM_WARM_FRAMES)
+                if age <= self.FSM_HOT_FRAMES:
+                    state_color = self.FSM_CHANGED_HOT
+                    marker = "▶"
+                elif age <= self.FSM_WARM_FRAMES:
+                    state_color = self.FSM_CHANGED_WARM
+                    marker = "·"
+                else:
+                    state_color = self.FSM_STATE
+                    marker = " "
+                if state_is_junction:
+                    # Junction states (observed out-deg ≥ 2) get a distinct
+                    # visual — they're not attacks, they're the boss picking
+                    # the next one. Overrides the transition pulse since the
+                    # pulse meaning ("attack started") doesn't apply at hubs.
+                    state_color = self.FSM_DISPATCHER
+                    marker = "◇"
+                prefix = f"  {marker} {owner} | {fsm_name} → "
+                state_text = state if state else "(none)"
+                prefix_surf = self.fsm_font.render(prefix, True, self.FSM_STATE)
+                state_surf = self.fsm_state_font.render(state_text, True, state_color)
+                # Truncate if the combined line is wider than the panel.
+                max_w = self.PANEL_W - 16
+                if prefix_surf.get_width() + state_surf.get_width() > max_w:
+                    # Drop the owner column first when space-constrained.
+                    short_prefix = f"  {marker} {fsm_name} → "
+                    prefix_surf = self.fsm_font.render(short_prefix, True, self.FSM_STATE)
+                self.screen.blit(prefix_surf, (x_label, y))
+                self.screen.blit(
+                    state_surf,
+                    (x_label + prefix_surf.get_width(), y),
+                )
+                y += line_h
+                # Attack inventory readout — every fingerprint discovered for
+                # this FSM gets its own row beneath the current-state line.
+                # Long sequences wrap across multiple display lines with a
+                # hanging indent. The currently-active ID (most recently
+                # finalized segment) is highlighted in FSM_ATTACK; others
+                # render in dim text. Iterates in mint order (a0, a1, ...).
+                fp_map = self.tracker._fingerprint_to_id.get(key, {})
+                active_set = self.tracker._active_ids.get(key, set())
+                if fp_map:
+                    items = sorted(fp_map.items(), key=lambda kv: int(kv[1][1:]))
+                    max_w = self.PANEL_W - 16
+                    for seq, atk_id in items:
+                        is_active = atk_id in active_set
+                        marker_a = "▶" if is_active else " "
+                        color = self.FSM_ATTACK if is_active else self.PANEL_DIM
+                        head = f"    {marker_a} {atk_id}: "
+                        y = self._render_wrapped_attack(
+                            x_label, y, head, seq, color, line_h, max_w,
+                        )
+                        if y > self.HEIGHT - line_h:
+                            return
+                if y > self.HEIGHT - line_h:
+                    # Out of vertical room — drop remaining lines silently.
+                    return
+            y += 4
+
+    def save_graph_state(self, filepath, epoch=None):
+        """Back-compat delegate — actual save lives on FsmTracker."""
+        self.tracker.save_graph_state(filepath, epoch=epoch)
 
     def close(self):
         if self._closed:

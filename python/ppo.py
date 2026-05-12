@@ -700,6 +700,14 @@ class PPO:
         # dims exceed the captured buckets — caller falls back to eager.
         self._ensure_train_graph_runner()
         train_runner = self._train_graph_runner
+        # [KL-DEBUG] Set FK_KL_DEBUG=1 to force the eager training path so the
+        # per-minibatch KL diagnostic block below can run. The captured-graph
+        # path skips the diagnostic (the print would break capture).
+        import os as _os
+        kl_debug = _os.environ.get("FK_KL_DEBUG") == "1"
+        kl_debug_thresh = float(_os.environ.get("FK_KL_DEBUG_THRESH", "100"))
+        if kl_debug:
+            train_runner = None
 
         for _ in range(cfg.train_iters):
             if stop_training:
@@ -777,6 +785,15 @@ class PPO:
                     iter_kl_sum += kl_val
                     iter_kl_n += 1
                     n_updates += 1
+
+                    if kl_val > 1.0:
+                        print(f"\n!!! KL SHATTER DETECTED (GRAPH PATH) !!!")
+                        print(f"  KL: {kl_val:.4f} | surrogate: {surrogate_val:.6f} | entropy: {entropy_val:.6f}")
+                        print(f"  Atk Var: {atk_var_eff:.6f} | Def Var: {def_var_eff:.6f}")
+                        print(f"  Atk Raw MSE: {value_atk_val:.6f} | Weighted: {(value_atk_val / atk_var_eff):.6f}")
+                        print(f"  Def Raw MSE: {value_def_val:.6f} | Weighted: {(value_def_val / def_var_eff):.6f}")
+                        print(f"  gru_norm: {gru_norm_val:.4f}")
+
                     passes_done += len(idx) * L
                     pbar.update(len(idx) * L)
                     pbar.set_postfix_str(f"surr={surrogate_val:+.3f} kl={kl_val:.3f}")
@@ -875,6 +892,39 @@ class PPO:
                     total_metrics["kl"] += kl_val
                     iter_kl_sum += kl_val
                     iter_kl_n += 1
+
+                    # [KL-DEBUG] Localize huge-KL minibatches. Prints the worst
+                    # K3 sample and its conditions (lp values, mask flags, action,
+                    # validity flags, committed) so we can see whether the spike
+                    # comes from validity-mask flips, post-reset obs, or
+                    # something else. Enabled via FK_KL_DEBUG=1.
+                    if kl_debug and kl_val > kl_debug_thresh:
+                        per_k3 = ((ratio - 1) - log_ratio) * valid_flat
+                        bad = int(per_k3.argmax().item())
+                        # Map flat index -> (chunk, t)
+                        bad_c, bad_t = divmod(bad, obs_mb.global_state.shape[1])
+                        gs_bad = obs_mb.global_state[bad_c, bad_t]
+                        # GS validity flags live at indices 13..21 (CAN_*).
+                        can_flags = gs_bad[13:22].tolist()
+                        a_m = int(act_mb["movement"][bad_c, bad_t].item())
+                        a_d = int(act_mb["direction"][bad_c, bad_t].item())
+                        a_a = int(act_mb["action"][bad_c, bad_t].item())
+                        a_j = int(act_mb["jump"][bad_c, bad_t].item())
+                        n_c = obs_mb.combat_hb.shape[2]
+                        n_t = obs_mb.terrain_hb.shape[2]
+                        n_valid_c = int(obs_mb.combat_mask[bad_c, bad_t].sum().item())
+                        n_valid_t = int(obs_mb.terrain_mask[bad_c, bad_t].sum().item())
+                        print(
+                            f"      [kl-debug] kl={kl_val:.1f} max|lr|={log_ratio.abs().max().item():.2f} "
+                            f"K3max={per_k3.max().item():.1f} @flat={bad} (c={bad_c},t={bad_t}) "
+                            f"new_lp={new_lp_eff[bad].item():.3f} old_lp={old_lp_eff[bad].item():.3f} "
+                            f"adv={adv_flat[bad].item():+.3f} valid={int(valid_flat[bad].item())} "
+                            f"commit={int(committed_flat[bad].item())} "
+                            f"act=[{a_m},{a_d},{a_a},{a_j}] "
+                            f"can=[J,DJ,WJ,Da,At,Ca,NC,DN,SD]={[int(x) for x in can_flags]} "
+                            f"hb(c/t)={n_valid_c}/{n_c},{n_valid_t}/{n_t}",
+                            flush=True,
+                        )
 
                 passes_done += len(idx) * L
                 pbar.update(len(idx) * L)

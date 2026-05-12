@@ -32,6 +32,13 @@ namespace FullKnight.Environment
 		// boss fights (Oro/Mato, God Tamer) have asymmetric HP pools and damage
 		// must be normalized against each boss's own maxHP.
 		private readonly Dictionary<HealthManager, int> _bossMaxHPs = new();
+		// OnDeath subscribers per HM, stored so we can unsubscribe on the next
+		// reset (or Dispose). False Knight and similar multi-phase bosses
+		// restore hp on stagger via some path that bypasses HM.OnDeath, so
+		// the event only fires on the truly-final death — same signal HK's
+		// BossSceneController uses to end the scene. Subscribing here means
+		// our _bossDied can't trip before HK itself decides the boss is gone.
+		private readonly Dictionary<HealthManager, HealthManager.DeathEvent> _bossDeathHandlers = new();
 
 		// Diagnostics: count resets so logs are correlatable across episodes
 		private int _resetCount;
@@ -107,6 +114,7 @@ namespace FullKnight.Environment
 		private On.GameManager.hook_FreezeMomentGC _killFreezeMomentGC;
 
 		private HitboxObserver _hitboxObserver = new();
+		private FsmObserver _fsmObserver = new();
 		private InputDeviceShim _inputShim = new();
 
 		// Shared-memory channel for the step hot path. Opened in Setup() when
@@ -162,6 +170,33 @@ namespace FullKnight.Environment
 		private IEnumerator Reset(MessageData data)
 		{
 			PhaseBegin();
+			Log($"[ResetEntry] reset#{_resetCount + 1} requestedLevel={data.level ?? "(null)"} "
+				+ $"eval={data.eval} fpw={data.frames_per_wait}");
+			// [ResetDiag] Capture entry state BEFORE any field mutations so we can
+			// see exactly what HK looked like when Python issued the reset — in
+			// particular whether scene was still PLAYING (premature reset from
+			// a false done=true) vs. legitimately EXITING_LEVEL.
+			{
+				var _gm = GameManager.instance;
+				string _entryScene = UnityEngine.SceneManagement.SceneManager
+					.GetActiveScene().name;
+				string _gmState = "?";
+				try { _gmState = _gm != null ? _gm.gameState.ToString() : "?"; }
+				catch { }
+				bool _inTrans = _gm != null && _gm.IsInSceneTransition;
+				int _hpNow = PlayerData.instance != null ? PlayerData.instance.health : -1;
+				var _bossHpStr = new System.Text.StringBuilder();
+				foreach (var hm in _bossHMs)
+				{
+					if (_bossHpStr.Length > 0) _bossHpStr.Append(",");
+					_bossHpStr.Append(hm == null ? "null" : hm.hp.ToString());
+				}
+				Log($"[ResetDiag] reset#{_resetCount + 1} entryScene={_entryScene} "
+					+ $"gmState={_gmState} inTransition={_inTrans} knightHp={_hpNow} "
+					+ $"prevResult={_episodeResult ?? "(none)"} bossHps=[{_bossHpStr}] "
+					+ $"stepCount={_stepCount} bossDied={_bossDied} "
+					+ $"episodeDone={_episodeDone} level={data.level ?? _level}");
+			}
 			// Fake-reset is only valid if the next episode targets the SAME
 			// boss arena we're already in. Python's boss_rotation_period
 			// keeps an env on the same boss for N episodes; on rotation it
@@ -202,7 +237,7 @@ namespace FullKnight.Environment
 				// previous Step()'s freeze; leave it there since obs build
 				// doesn't need ticks.
 				const float kBaselineGtime_fake = 0.0424f;
-				Time.captureDeltaTime = kBaselineGtime_fake / _frameSkipCount;
+				Time.captureDeltaTime = kBaselineGtime_fake;
 				_resetBranch = 2;
 				// Stub LogPhase calls to keep wire alignment with the 7-slot
 				// reset_phase_deltas_ms array Python expects (binary_protocol).
@@ -220,6 +255,7 @@ namespace FullKnight.Environment
 				data.terrain_hitboxes = fakeObs.TerrainHitboxes;
 				data.terrain_debug = fakeObs.TerrainDebug;
 				data.global_state = fakeGs;
+				data.fsm_snapshots = SnapshotFsms();
 				LogPhase("Reset", "obs+freeze (fake)");
 				float fakeResetMs = (Time.realtimeSinceStartup - _phaseStart) * 1000f;
 				Log($"[Reset-Timing] reset#{_resetCount} FAKE TOTAL {fakeResetMs:F1}ms (count={_fakeResetCount})");
@@ -237,7 +273,7 @@ namespace FullKnight.Environment
 			// runs the knight for the entire transition + intro-skip window.
 			// Also clear any hard-commit lock left over from a mid-charge death.
 			_inputShim.ResetCommit();
-			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 });
+			ActionDecoder.ApplyAction(_inputShim, new int[] { 2, 2, 7, 1 }, _frameSkipCount);
 
 			// Step() ends with Time.timeScale=0 to freeze for the Python obs
 			// handoff. Unfreeze here so HK's queued DoDreamReturn / hero-death
@@ -249,7 +285,7 @@ namespace FullKnight.Environment
 			// step pause uses Time.timeScale=0 instead, which gives deltaTime=0
 			// even with captureDeltaTime non-zero.
 			const float kBaselineGtime = 0.0424f;
-			Time.captureDeltaTime = kBaselineGtime / _frameSkipCount;
+			Time.captureDeltaTime = kBaselineGtime;
 
 			var preScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
 			if (preScene != "GG_Workshop")
@@ -276,6 +312,42 @@ namespace FullKnight.Environment
 			// expects (binary_protocol.py:RESET_PHASE_NAMES); without it the
 			// debug breakdown labels every phase one slot to the left.
 			LogPhase("Reset", "settle (skipped)");
+
+			// Diagnostic: dump the state of the TARGET statue's FSM after returning
+			// from a boss. The previous run found "any" statue (always Inert) which
+			// was misleading. Target the specific bossScene matching _level so we
+			// see the same FSM LoadBossScene will use.
+			if (_resetBranch == 1)
+			{
+				BossStatue target = null;
+				foreach (var s in UnityEngine.Object.FindObjectsOfType<BossStatue>())
+				{
+					var bs = s.bossScene;
+					if (bs == null) continue;
+					if (bs.Tier1Scene == _level || bs.Tier2Scene == _level || bs.Tier3Scene == _level)
+					{
+						target = s;
+						break;
+					}
+				}
+				if (target == null)
+				{
+					Log("[WakeDiag] target statue NOT FOUND for level=" + _level);
+				}
+				else
+				{
+					var pmFsm = target.bossUIControlFSM;
+					var fsm = pmFsm?.Fsm;
+					string goActive = target.gameObject.activeInHierarchy.ToString();
+					string compEnabled = (pmFsm != null) ? pmFsm.enabled.ToString() : "null";
+					string fsmActiveState = fsm?.ActiveStateName ?? "(null fsm)";
+					bool fsmFinished = fsm != null && fsm.Finished;
+					string startState = fsm?.StartState ?? "(none)";
+					Log($"[WakeDiag] target={target.gameObject.name} goActive={goActive} "
+						+ $"compEnabled={compEnabled} fsmActiveState='{fsmActiveState}' "
+						+ $"fsmFinished={fsmFinished} startState={startState}");
+				}
+			}
 
 			yield return SceneHooks.LoadBossScene(_level);
 			LogPhase("Reset", "LoadBossScene");
@@ -317,6 +389,7 @@ namespace FullKnight.Environment
 			data.terrain_hitboxes = obs.TerrainHitboxes;
 			data.terrain_debug = obs.TerrainDebug;
 			data.global_state = gs;
+			data.fsm_snapshots = SnapshotFsms();
 
 			Time.timeScale = 0;
 			LogPhase("Reset", "obs+freeze (final)");
@@ -333,6 +406,18 @@ namespace FullKnight.Environment
 		{
 			PhaseBegin();
 			_stepCount++;
+			// First few steps of each episode get an entry log so we can tell
+			// whether Step is firing at all when training appears frozen.
+			if (_stepCount <= 3)
+			{
+				int aLen = data.action_vec != null ? data.action_vec.Length : -1;
+				string aStr = aLen == 4
+					? $"[{data.action_vec[0]},{data.action_vec[1]},{data.action_vec[2]},{data.action_vec[3]}]"
+					: $"(len={aLen})";
+				Log($"[StepEntry] reset#{_resetCount} step#{_stepCount} "
+					+ $"action={aStr} episodeDone={_episodeDone} "
+					+ $"timeScale={Time.timeScale:F2}");
+			}
 			// If episode already ended, keep returning done
 			if (_episodeDone)
 			{
@@ -353,7 +438,7 @@ namespace FullKnight.Environment
 			Time.timeScale = 1f;
 
 			bool committedThisStep = ActionDecoder.ApplyAction(
-				_inputShim, data.action_vec);
+				_inputShim, data.action_vec, _frameSkipCount);
 			data.action_committed = committedThisStep;
 
 			// Track HP at step start for heal detection
@@ -424,11 +509,24 @@ namespace FullKnight.Environment
 					_fakeResetCount++;
 					_episodeDone = true;
 					_episodeResult = "fake_reset";
+					Log($"[EpisodeEnd] reset#{_resetCount} step#{_stepCount} result=fake_reset");
 				}
 				else if (_bossDied)
 				{
 					_episodeDone = true;
 					_episodeResult = "win";
+					// [EpisodeEnd] Log live boss HPs so we can tell whether the
+					// boss actually died (hp<=0) or our OnBossDamaged hook flipped
+					// _bossDied via a damageOverride / clamp false positive
+					// during stagger.
+					var _bossHpStr = new System.Text.StringBuilder();
+					foreach (var hm in _bossHMs)
+					{
+						if (_bossHpStr.Length > 0) _bossHpStr.Append(",");
+						_bossHpStr.Append(hm == null ? "null" : hm.hp.ToString());
+					}
+					Log($"[EpisodeEnd] reset#{_resetCount} step#{_stepCount} result=win "
+						+ $"knightHp={PlayerData.instance.health} bossHps=[{_bossHpStr}]");
 				}
 				else if (PlayerData.instance.health <= 0)
 				{
@@ -442,13 +540,18 @@ namespace FullKnight.Environment
 						_fakeResetCount++;
 						_episodeDone = true;
 						_episodeResult = "fake_reset";
+						Log($"[EpisodeEnd] reset#{_resetCount} step#{_stepCount} result=fake_reset (knight)");
 					}
 					else
 					{
 						_episodeDone = true;
 						_episodeResult = "loss";
+						Log($"[EpisodeEnd] reset#{_resetCount} step#{_stepCount} result=loss knightHp={PlayerData.instance.health}");
 					}
 				}
+				// Glitch detector disabled: it false-fires during legitimate
+				// knight-death sequences (scene/bosses flip before health hits 0).
+#if false
 				else
 				{
 					// Glitch detector: target the specific "knight + boss
@@ -538,6 +641,7 @@ namespace FullKnight.Environment
 							+ $"silentHpDelta={_silentHpDeltaInStep}");
 					}
 				}
+#endif
 			}
 
 			// Compute HP healed this step (positive delta = healing occurred)
@@ -603,13 +707,67 @@ namespace FullKnight.Environment
 			data.terrain_hitboxes = obs.TerrainHitboxes;
 			data.terrain_debug = obs.TerrainDebug;
 			data.global_state = gs;
+			data.fsm_snapshots = SnapshotFsms();
 			data.done = false;
 
 			EmitStepResponse(data);
 			yield break;
 		}
 
-		private void Log(string msg) => FullKnight.Instance.Log($"[TrainingEnv] {msg}");
+		// Snapshot every FSM relevant to the current fight: every PlayMakerFSM
+		// in the subtree of each tracked boss, plus every FSM on currently-
+		// active Enemy-class colliders (catches in-flight boss projectiles
+		// whose pool reparented them out of the boss subtree), plus every
+		// FSM on Attack-class colliders (the knight's nail / spell hitboxes,
+		// for cross-referencing the agent's action against attack windows).
+		// Routed to the Python visualizer only — never consumed by training.
+		private int _fsmDiagTicks;
+		private List<string> SnapshotFsms()
+		{
+			HashSet<Collider2D> enemies = null;
+			HashSet<Collider2D> attacks = null;
+			try
+			{
+				var hb = _hitboxObserver.GetHitboxes();
+				if (hb != null)
+				{
+					if (hb.ContainsKey(HitboxType.Enemy)) enemies = hb[HitboxType.Enemy];
+					if (hb.ContainsKey(HitboxType.Attack)) attacks = hb[HitboxType.Attack];
+				}
+			}
+			catch (System.Exception e) { Log($"[FsmDiag] GetHitboxes threw: {e.Message}"); }
+
+			List<string> result;
+			try
+			{
+				result = _fsmObserver.Snapshot(_bossHMs, enemies, attacks);
+			}
+			catch (System.Exception e)
+			{
+				Log($"[FsmDiag] Snapshot threw: {e.GetType().Name}: {e.Message}\n{e.StackTrace}");
+				result = new List<string>();
+			}
+
+			// Heartbeat log every 60 steps so we can see why the panel is empty
+			// without spamming the log. Always logs the first step.
+			_fsmDiagTicks++;
+			if (_fsmDiagTicks == 1 || _fsmDiagTicks % 60 == 0)
+			{
+				int eCount = enemies != null ? enemies.Count : -1;
+				int aCount = attacks != null ? attacks.Count : -1;
+				Log($"[FsmDiag] tick={_fsmDiagTicks} bossHMs={_bossHMs.Count} "
+					+ $"enemyColliders={eCount} attackColliders={aCount} "
+					+ $"snapshot={result.Count}");
+				if (result.Count > 0 && result.Count <= 3)
+				{
+					for (int i = 0; i < result.Count; i++)
+						Log($"[FsmDiag]   [{i}] {result[i]}");
+				}
+			}
+			return result;
+		}
+
+		private void Log(string msg) => FullKnight.LogS($"[TrainingEnv] {msg}");
 
 		// Phase timing helpers. PhaseBegin() resets the stopwatch at the start of
 		// Reset() / Step(); LogPhase() emits a "[Phase-Timing]" line with the
@@ -651,6 +809,12 @@ namespace FullKnight.Environment
 				yield return Setup();
 				yield break;
 			}
+			// Stamp the global SlotId so every Log call site (TrainingEnv,
+			// SceneHooks, FsmObserver, …) can prefix [s{slot}] and we can
+			// pick out a single instance's lines from the shared ModLog.
+			if (message.data.slot.HasValue)
+				FullKnight.SlotId = (int)message.data.slot.Value;
+			Log($"[Setup] received init slot={FullKnight.SlotId} useShm={message.data.use_shm}");
 
 			// Uncap Unity's frame loop. With -nographics there's no display to
 			// vsync against; the only thing throttling Update() is targetFrameRate
@@ -715,7 +879,7 @@ namespace FullKnight.Environment
 			SaveFileProxy.LoadCompletedSave();
 			GameManager.instance.ContinueGame();
 			yield return new SceneHooks.WaitForSceneLoad("GG_Workshop");
-			yield return new WaitForFinishedEnteringScene();
+			yield return new SceneHooks.WaitForEntryFinished();
 			yield return new WaitForSeconds(2f);
 
 			_hitboxObserver.Load();
@@ -754,17 +918,39 @@ namespace FullKnight.Environment
 		// action arrives we run Step() inline (yields through frame_skip
 		// frames just like the WebSocket dispatch did); EmitStepResponse
 		// writes the obs back via shm and signals Python.
+		//
+		// Heartbeat: every 600 polled frames (~10s at 60fps), log liveness
+		// + seconds-since-last-action so a stuck Python or stuck Step is
+		// distinguishable from a healthy idle loop in the HK mod log.
 		private IEnumerator _shmActionLoop()
 		{
+			long polls = 0;
+			int actionsSeen = 0;
+			float lastActionT = Time.realtimeSinceStartup;
+			float lastHeartbeatT = Time.realtimeSinceStartup;
+			Log("[ShmLoop] started");
 			while (!_terminate && _shm != null)
 			{
 				if (_shm.TryReadAction(out int[] action))
 				{
+					actionsSeen++;
+					lastActionT = Time.realtimeSinceStartup;
 					var data = new MessageData { action_vec = action };
 					yield return Step(data);
 				}
+				polls++;
+				if (Time.realtimeSinceStartup - lastHeartbeatT > 10f)
+				{
+					float idle = Time.realtimeSinceStartup - lastActionT;
+					Log($"[ShmLoop] alive polls={polls} actions={actionsSeen} "
+						+ $"idleSinceLastAction={idle:F1}s "
+						+ $"resetCount={_resetCount} stepCount={_stepCount} "
+						+ $"episodeDone={_episodeDone}");
+					lastHeartbeatT = Time.realtimeSinceStartup;
+				}
 				yield return null;
 			}
+			Log($"[ShmLoop] exiting (terminate={_terminate}, shmNull={_shm == null})");
 		}
 
 		// Emit a step response over whichever transport is active for this
@@ -787,6 +973,11 @@ namespace FullKnight.Environment
 		protected override IEnumerator Dispose()
 		{
 			UnhookDamage();
+			foreach (var kvp in _bossDeathHandlers)
+			{
+				if (kvp.Key != null) kvp.Key.OnDeath -= kvp.Value;
+			}
+			_bossDeathHandlers.Clear();
 			if (_killFreezeFloat != null) On.GameManager.FreezeMoment_float_float_float_float -= _killFreezeFloat;
 			if (_killFreezeBool != null) On.GameManager.FreezeMoment_float_float_float_bool -= _killFreezeBool;
 			if (_killFreezeMomentGC != null) On.GameManager.FreezeMomentGC -= _killFreezeMomentGC;
@@ -854,6 +1045,13 @@ namespace FullKnight.Environment
 
 			// Real damage in both modes — episode ends when all bosses are dead
 			bool wouldDie = self.hp - hitInstance.DamageDealt <= 0;
+			// [BossDmgDiag] Snapshot pre-state so we can compare against post-orig
+			// values and see whether HK actually applied the full damage or clamped
+			// via damageOverride / multiplier / invulnerability. False-positive
+			// _bossDied is the leading hypothesis for premature reset on stagger.
+			int _hpBefore = self.hp;
+			bool _damageOverride = self.damageOverride;
+			float _multiplier = hitInstance.Multiplier;
 
 			// Fake-reset: if this hit would kill the LAST live boss, with
 			// probability _fakeResetProb clamp it so the boss survives at 1 HP,
@@ -880,16 +1078,44 @@ namespace FullKnight.Environment
 			}
 
 			orig(self, hitInstance);
-			if (wouldDie)
+			int _hpAfter = self.hp;
+			// _bossDied is no longer set here. Death detection moved to
+			// OnBossActualDeath, subscribed to each tracked HM.OnDeath in
+			// InitBossRefs. False Knight stagger restores hp:26->260 via a path
+			// that bypasses OnDeath, so OnDeath is the only signal that aligns
+			// with HK's own "boss truly gone" judgment.
+			if (wouldDie || _hpBefore <= maxHP / 2)
 			{
-				bool allDead = true;
-				foreach (var hm in _bossHMs)
-				{
-					if (hm == null) continue;
-					if (hm == self) continue;
-					if (hm.hp > 0) { allDead = false; break; }
-				}
-				if (allDead) _bossDied = true;
+				Log($"[BossDmgDiag] reset#{_resetCount} step#{_stepCount} "
+					+ $"hm={self.gameObject.name} hp:{_hpBefore}->{_hpAfter} "
+					+ $"dmg={hitInstance.DamageDealt} mult={_multiplier:F2} "
+					+ $"override={_damageOverride} wouldDie={wouldDie} "
+					+ $"maxHP={maxHP} hmCount={_bossHMs.Count}");
+			}
+		}
+
+		// OnDeath handler — bound per HM via a closure in InitBossRefs. Fires
+		// when HK's Die() reaches SendDeathEvent (i.e., the phase-restore path
+		// did NOT intercept). Matches the signal HK's own BossSceneController
+		// uses to end the scene, so we can never trip _bossDied earlier than
+		// HK itself.
+		private void OnBossActualDeath(HealthManager hm)
+		{
+			Log($"[BossOnDeath] reset#{_resetCount} step#{_stepCount} "
+				+ $"hm={(hm != null ? hm.gameObject.name : "null")} "
+				+ $"hp={(hm != null ? hm.hp : -1)}");
+			bool allDead = true;
+			foreach (var other in _bossHMs)
+			{
+				if (other == null) continue;
+				if (other == hm) continue;
+				if (other.hp > 0) { allDead = false; break; }
+			}
+			if (allDead)
+			{
+				_bossDied = true;
+				Log($"[BossDied] reset#{_resetCount} step#{_stepCount} "
+					+ $"hm={(hm != null ? hm.gameObject.name : "null")} via=OnDeath");
 			}
 		}
 
@@ -1060,6 +1286,15 @@ namespace FullKnight.Environment
 
 		private void InitBossRefs()
 		{
+			// Unsubscribe any previous-episode OnDeath handlers before clearing.
+			// HMs from the prior fight may have been destroyed; skip nulls. The
+			// `-=` on a destroyed HM is a no-op anyway (the event holder is gone),
+			// but iterating cleanly keeps the dict in sync.
+			foreach (var kvp in _bossDeathHandlers)
+			{
+				if (kvp.Key != null) kvp.Key.OnDeath -= kvp.Value;
+			}
+			_bossDeathHandlers.Clear();
 			_bossHMs.Clear();
 			_bossMaxHPs.Clear();
 			try
@@ -1074,6 +1309,13 @@ namespace FullKnight.Environment
 						if (hm == null) continue;
 						_bossHMs.Add(hm);
 						_bossMaxHPs[hm] = hm.hp;
+						// Capture hm in a local so the closure binds the current
+						// HM, not the loop variable. Store the delegate so we can
+						// unsubscribe by reference on the next reset.
+						var capturedHm = hm;
+						HealthManager.DeathEvent handler = () => OnBossActualDeath(capturedHm);
+						_bossDeathHandlers[hm] = handler;
+						hm.OnDeath += handler;
 					}
 				}
 			}

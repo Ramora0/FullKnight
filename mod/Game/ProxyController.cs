@@ -41,6 +41,11 @@ namespace FullKnight.Game
 			LockedStepsLeft = 0;
 		}
 
+		// Static accessor so non-TrainingEnv callers (SceneHooks) can reach
+		// the active shim without plumbing a reference. There's only one
+		// shim in process — set on construction.
+		public static InputDeviceShim Attached { get; private set; }
+
 		public InputDeviceShim() :
 			base("FullKnightInputShimDevice")
 		{
@@ -55,6 +60,22 @@ namespace FullKnight.Game
 			AddControl(InputControlType.RightTrigger, "Dash");
 			AddControl(InputControlType.LeftTrigger, "SuperDash");
 			AddControl(InputControlType.RightBumper, "QuickCast");
+			Attached = this;
+		}
+
+		// Raw press/release of Jump + Attack only, bypassing Can* gates.
+		// Used by SceneHooks during the workshop dream-return wake-up.
+		// HC's 'Dream Return' FSM in 'Ready'/'Ready 2' has actions
+		// ListenForJump/Attack/Down/Up/Left/Right and fires GET UP on any
+		// of them. We tap Jump + Attack only — pressing Cast / Dash /
+		// DreamNail when HC is in an input-accepting state (after the
+		// wake-up has completed) triggers actual game actions (focus
+		// heal, dream-nail charge, dash) and leaves HC in a half-resolved
+		// state that subsequently breaks the boss-challenge animation.
+		public void WakeTap(bool pressed)
+		{
+			KeyJump = pressed;
+			KeyAttack = pressed;
 		}
 
 		public override void Update(ulong updateTick, float deltaTime)
@@ -131,6 +152,12 @@ namespace FullKnight.Game
 			KeyJump = true;
 			KeyDash = false;
 		}
+
+		// Force-press Jump bypassing the Can*Jump gate. Used only by the
+		// workshop dream-return wake-up tap, where the knight is in no_input
+		// state and CanJump returns false but HK's wake-up listener still
+		// needs to see a button press to advance the entry sequence.
+		public void RawJump(bool pressed) { KeyJump = pressed; }
 
 		private void FaceDirection()
 		{
@@ -248,16 +275,12 @@ namespace FullKnight.Game
 			{ 6, 1.0f },   // super_dash: ~0.85s charge
 		};
 
-		private static int LockedStepsFor(int actionIdx)
+		private static int LockedStepsFor(int actionIdx, int framesPerWait)
 		{
 			if (!HoldGameSeconds.TryGetValue(actionIdx, out float gs)) return 0;
-			// Per-step game-time. Mirrors TrainingEnv.Reset's captureDeltaTime
-			// pin: kBaselineGtime/fpw per Unity frame × fpw frames per step
-			// = 0.0424s per step, invariant to fpw. The previous baseline of
-			// 0.25s came from the old fpw=5/timeScale=3/60fps regime and made
-			// every commit window ~5.9× too short under the current regime
-			// (e.g. nail_charge locked for 0.25s of game-time vs ~1.4s charge).
-			const float kStepGameSeconds = 0.0424f;
+			// Per-step game-time: one Unity frame at kBaselineGtime seconds,
+			// fpw frames per agent decision.
+			float kStepGameSeconds = 0.0424f * framesPerWait;
 			int n = (int)System.Math.Ceiling(gs / kStepGameSeconds);
 			return n > 0 ? n : 1;
 		}
@@ -281,7 +304,7 @@ namespace FullKnight.Game
 		/// Apply order: movement -> direction -> jump -> action
 		/// so that dash overrides jump when both are requested.
 		/// </summary>
-		public static bool ApplyAction(InputDeviceShim shim, int[] action)
+		public static bool ApplyAction(InputDeviceShim shim, int[] action, int framesPerWait = 1)
 		{
 			bool committed = false;
 
@@ -309,7 +332,7 @@ namespace FullKnight.Game
 			else if (HoldGameSeconds.ContainsKey(action[2]))
 			{
 				// Idle + free hold pick: lock starting next step.
-				int totalLocked = LockedStepsFor(action[2]);
+				int totalLocked = LockedStepsFor(action[2], framesPerWait);
 				shim.LockedAction = action[2];
 				// This step counts toward the locked phase (the agent picked
 				// it freely, KeyAttack/etc gets set true now). Subsequent

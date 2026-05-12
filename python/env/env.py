@@ -4,7 +4,7 @@ import numpy as np
 from .binary_protocol import (
     pack_init, pack_reset, pack_action, pack_pause, pack_resume,
     unpack_reset, unpack_step, pop_last_terrain_debug, pop_last_diag,
-    pop_last_reset_phases, MSG_CLOSE,
+    pop_last_reset_phases, pop_last_fsm_snapshots, MSG_CLOSE,
 )
 import struct
 
@@ -36,6 +36,10 @@ class HKEnv:
         # Debug-only: last terrain_debug strings pulled off the wire.
         # Populated after each reset/step by reading the protocol side channel.
         self.last_terrain_debug: list = []
+        # Debug-only: last FSM snapshot list pulled off the wire. Each entry
+        # is "<src>|<owner>|<fsm>|<state>". Populated by reset/step; only
+        # consumed by the pygame visualizer.
+        self.last_fsm: list = []
         # Diag block (leak probes) from the most recent step — populated by
         # step(). vec_env reads this to aggregate per-epoch perf metrics.
         self.last_diag: dict = {
@@ -91,6 +95,7 @@ class HKEnv:
         result = unpack_reset(data)
         self.last_terrain_debug = pop_last_terrain_debug()
         self.last_reset_phases = pop_last_reset_phases()
+        self.last_fsm = pop_last_fsm_snapshots()
         # Summarize what came back so the user can tell whether the boss
         # scene is really loaded (knight bounds non-zero, hp populated,
         # combat hitboxes present). Stuck-in-godhome typically shows up as
@@ -150,6 +155,7 @@ class HKEnv:
          committed) = unpack_step(data)
         self.last_terrain_debug = pop_last_terrain_debug()
         self.last_diag = pop_last_diag()
+        self.last_fsm = pop_last_fsm_snapshots()
         if getattr(self.config, "debug_transitions", False):
             kn_w = float(gs[4]) if len(gs) > 4 else 0.0
             kn_h = float(gs[5]) if len(gs) > 5 else 0.0
@@ -196,18 +202,35 @@ class HKEnv:
         data = await self.ws.recv()
         result = unpack_step(data)
         self.last_terrain_debug = pop_last_terrain_debug()
+        self.last_fsm = pop_last_fsm_snapshots()
         return result
 
     async def pause(self):
         self._dbg("-> PAUSE")
+        t0 = time.perf_counter()
         await self.ws.send(pack_pause())
+        t1 = time.perf_counter()
         await self.ws.recv()
+        t2 = time.perf_counter()
+        if (t2 - t0) > _SLOW_OP_THRESHOLD_S:
+            print(f"    [pause-wire] env {self.idx} "
+                  f"send={(t1-t0)*1000:.0f}ms recv={(t2-t1)*1000:.0f}ms "
+                  f"total={(t2-t0)*1000:.0f}ms",
+                  flush=True)
         self._dbg("<- PAUSE ack")
 
     async def resume(self):
         self._dbg("-> RESUME")
+        t0 = time.perf_counter()
         await self.ws.send(pack_resume())
+        t1 = time.perf_counter()
         await self.ws.recv()
+        t2 = time.perf_counter()
+        if (t2 - t0) > _SLOW_OP_THRESHOLD_S:
+            print(f"    [resume-wire] env {self.idx} "
+                  f"send={(t1-t0)*1000:.0f}ms recv={(t2-t1)*1000:.0f}ms "
+                  f"total={(t2-t0)*1000:.0f}ms",
+                  flush=True)
         self._dbg("<- RESUME ack")
 
     async def close(self):

@@ -137,6 +137,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
                         kind_ids, parent_ids, config,
                     ),
                     terrain_debug=env.last_terrain_debug,
+                    fsm_snapshots=env.last_fsm,
                 )
 
             (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,

@@ -680,10 +680,20 @@ async def train(config: Config):
         seed_everything(config.seed)
         dprint(f"Seeded all RNGs with {config.seed}")
 
+    # FSM data tracker: owns the transition graph, fingerprint inventory,
+    # and state history. Runs whenever we want to either visualize OR
+    # persist the graph to disk — the visualizer is a pure renderer on
+    # top of this. Without this split, disabling --visualize also killed
+    # graph saving (the failure mode the user hit on the May-11 run).
+    fsm_tracker = None
+    if config.save_fsm_graph or config.visualize:
+        from visualizer import FsmTracker
+        fsm_tracker = FsmTracker()
+
     vis = None
     if config.visualize:
         from visualizer import Visualizer
-        vis = Visualizer()  # vocab attached after vec_env init
+        vis = Visualizer(tracker=fsm_tracker)  # vocab attached after vec_env init
     # Launch game instances. fps_cap is forwarded to the C# mod via
     # FK_FPS_CAP env var (read in TrainingEnv.Setup); 0 = uncapped, the
     # training default. Subprocesses inherit os.environ on Popen.
@@ -715,37 +725,35 @@ async def train(config: Config):
         if vis is not None:
             vis.vocab = vec_env.vocab
 
-        # Watchdog: in debug-transitions mode, periodically print which reset
-        # tasks have been pending for too long. Surfaces a stuck-in-godhome
-        # situation in the main log without requiring the user to tail the
-        # HK mod log file.
-        watchdog_task = None
-        if config.debug_transitions:
-            async def _reset_watchdog():
-                started = {}
-                while True:
-                    try:
-                        await asyncio.sleep(3.0)
-                    except asyncio.CancelledError:
-                        return
-                    now = time.perf_counter()
-                    pending = list(vec_env._reset_tasks.keys())
-                    for env_i in pending:
-                        started.setdefault(env_i, now)
-                        elapsed = now - started[env_i]
-                        if elapsed > 5.0:
-                            print(
-                                f"  [watchdog] env {env_i} reset still "
-                                f"pending after {elapsed:.0f}s — check HK "
-                                f"mod log for [WaitForSceneChange] / "
-                                f"[WaitForSceneLoad] / [LoadBossScene]",
-                                flush=True,
-                            )
-                    # GC entries for envs whose resets reaped.
-                    for k in list(started.keys()):
-                        if k not in pending:
-                            del started[k]
-            watchdog_task = asyncio.create_task(_reset_watchdog())
+        # Always-on watchdog: periodically print which reset tasks have been
+        # pending for too long, regardless of debug_transitions. Surfaces a
+        # stuck-in-godhome situation without requiring the user to tail the
+        # HK mod log. Cheap (one sleep + one print per 3s).
+        async def _reset_watchdog():
+            started = {}
+            while True:
+                try:
+                    await asyncio.sleep(3.0)
+                except asyncio.CancelledError:
+                    return
+                now = time.perf_counter()
+                pending = list(vec_env._reset_tasks.keys())
+                for env_i in pending:
+                    started.setdefault(env_i, now)
+                    elapsed = now - started[env_i]
+                    if elapsed > 5.0:
+                        print(
+                            f"  [watchdog] env {env_i} reset still "
+                            f"pending after {elapsed:.0f}s — check HK "
+                            f"mod log for [WaitForSceneChange] / "
+                            f"[WaitForSceneLoad] / [LoadBossScene]",
+                            flush=True,
+                        )
+                # GC entries for envs whose resets reaped.
+                for k in list(started.keys()):
+                    if k not in pending:
+                        del started[k]
+        watchdog_task = asyncio.create_task(_reset_watchdog())
 
         bosses = config.boss_levels_list
         assert len(bosses) > 0, "config.boss_levels must list at least one scene"
@@ -848,7 +856,13 @@ async def train(config: Config):
         glitch_done_count = 0
 
         # First epoch: full reset to load boss scenes
+        _t_initial_reset = time.perf_counter()
+        print(f"Initial reset_all: kicking off {config.n_envs} resets to {env_boss}",
+              flush=True)
         obs_full = await vec_env.reset_all(levels=env_boss)
+        print(f"Initial reset_all: done in "
+              f"{time.perf_counter() - _t_initial_reset:.1f}s",
+              flush=True)
         agent.reset_hidden(config.n_envs)
         active_envs = list(range(config.n_envs))
 
@@ -1118,23 +1132,19 @@ async def train(config: Config):
                 # taken) before mutating obs from the step result. Note that
                 # merge_obs_padded mutates obs's underlying numpy arrays in
                 # place when the per-step max_combat / max_terrain happens
-                # to match between consecutive steps. The training-time
-                # consumer (Observation.stack in train_on_rollout) tolerates
-                # this — but the glitch dumper needs the actual per-step
-                # contents, so we deep-copy when detection is enabled.
-                if config.detect_glitch:
-                    obs_for_buf = obs.replace(
-                        combat_hb=obs.combat_hb.copy(),
-                        combat_mask=obs.combat_mask.copy(),
-                        combat_kind_ids=obs.combat_kind_ids.copy(),
-                        combat_parent_ids=obs.combat_parent_ids.copy(),
-                        terrain_hb=obs.terrain_hb.copy(),
-                        terrain_mask=obs.terrain_mask.copy(),
-                        global_state=obs.global_state.copy(),
-                    )
-                    buf_obs.append(obs_for_buf)
-                else:
-                    buf_obs.append(obs)
+                # to match between consecutive steps. Without a copy, every
+                # buffer entry after the first would share the same array
+                # objects and get silently overwritten by subsequent steps —
+                # corrupt can_* flags → new_lp ≈ -10000 → KL explosion.
+                buf_obs.append(obs.replace(
+                    combat_hb=obs.combat_hb.copy(),
+                    combat_mask=obs.combat_mask.copy(),
+                    combat_kind_ids=obs.combat_kind_ids.copy(),
+                    combat_parent_ids=obs.combat_parent_ids.copy(),
+                    terrain_hb=obs.terrain_hb.copy(),
+                    terrain_mask=obs.terrain_mask.copy(),
+                    global_state=obs.global_state.copy(),
+                ))
                 buf_hx.append(buf_hx_full)
                 for k in buf_actions:
                     buf_actions[k].append(actions_np[k])
@@ -1160,22 +1170,50 @@ async def train(config: Config):
                 # envs keep their pre-death state — fine, PPO masks them.
                 obs = merge_obs_padded(obs, next_obs_sub, sub_local)
 
-                if vis is not None:
-                    vis.update(obs)
+                if vis is not None or fsm_tracker is not None:
+                    # Show env 0's FSM snapshots — the visualizer renders the
+                    # full padded `obs` batch but only env 0's hitboxes are
+                    # drawn (see Visualizer.update indexing). FSM data follows
+                    # the same convention. vec_env.envs[0].last_fsm is set by
+                    # the most recent step/reset that returned for that env.
+                    fsm0 = []
+                    try:
+                        fsm0 = vec_env.envs[0].last_fsm
+                    except (AttributeError, IndexError):
+                        pass
+                    if vis is not None:
+                        # vis.update forwards fsm_snapshots to its tracker —
+                        # since vis was constructed with fsm_tracker, this
+                        # updates the same instance the trainer would feed.
+                        vis.update(obs, fsm_snapshots=fsm0)
+                    else:
+                        # Save-only mode: no pygame render, just parse + record.
+                        fsm_tracker.update(fsm0)
 
                 # All rollout-active envs have died. Instead of truncating the
                 # rollout, block until at least one in-flight reset completes
                 # and splice the env back in. Keeps the rollout length fixed at
                 # config.rollout_len even when n_envs is small.
                 while not rollout_active:
-                    assert vec_env._reset_tasks, (
-                        "rollout stalled: no live envs and no pending resets"
+                    # Restrict the wait + reap to envs in this epoch's
+                    # active_envs. Stranded resets from prior epochs (envs
+                    # whose reset was in flight at top-of-epoch and so weren't
+                    # added to active_envs / n_active_local_for) have no slot
+                    # in this rollout's obs batch — they get reaped at the
+                    # next epoch's top-of-loop reap_completed_resets call.
+                    pending_active = [
+                        t for ei, t in vec_env._reset_tasks.items()
+                        if ei in active_set
+                    ]
+                    assert pending_active, (
+                        "rollout stalled: no live envs and no pending resets "
+                        "for envs in this rollout's active set"
                     )
                     await asyncio.wait(
-                        list(vec_env._reset_tasks.values()),
+                        pending_active,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    reaped = vec_env.reap_completed_resets()
+                    reaped = vec_env.reap_completed_resets(only=active_set)
                     epoch_reset_dts.extend(vec_env.pop_reset_dts())
                     if not reaped:
                         continue
@@ -1544,14 +1582,21 @@ async def train(config: Config):
             inf_timing = agent.report_timing()
 
             # Mask post-death filler from training. Once an env reports done
-            # mid-rollout, every subsequent step is a frozen all-zeros obs
-            # (TrainingEnv.cs:209-224) until the end-of-epoch reset. The death
-            # step itself is valid — it carries the real terminal transition.
-            prev_dones = np.concatenate(
-                [np.zeros((1, dones_arr.shape[1]), dtype=bool), dones_arr[:-1]],
+            # mid-rollout it stops being stepped and every subsequent row is
+            # a _scat zero-fill (dones=False, actions=0, log_probs=0, obs=
+            # death-state). We need a LATCH: valid=False from the step after
+            # the first done onward. The death step itself is valid — it
+            # carries the real terminal transition. Earlier code used
+            # `~prev_dones` which only masked the single step right after
+            # death; subsequent zero-fill rows came back as valid=True with
+            # old_lp=0 and new_lp≈-2e4 (attack/jump masked by all-zero
+            # validity flags), driving K3 KL through the roof.
+            done_so_far = np.maximum.accumulate(dones_arr, axis=0)
+            prev_done_latched = np.concatenate(
+                [np.zeros((1, done_so_far.shape[1]), dtype=bool), done_so_far[:-1]],
                 axis=0,
             )
-            valid_arr = ~prev_dones  # (T, N_active)
+            valid_arr = ~prev_done_latched  # (T, N_active)
 
             t0 = time.perf_counter()
             metrics = agent.train_on_rollout(
@@ -1624,6 +1669,19 @@ async def train(config: Config):
             dprint(tracker.epoch_line())
             if (epoch + 1) % TIMING_FULL_EVERY == 0 and not config.debug_transitions:
                 tracker.print_summary("cumulative")
+
+            # Persist the FSM transition graph for offline inspection via
+            # graph_viewer.py. Saves to a rolling "latest" file each epoch
+            # so a viewer process can mtime-poll and stay current. Best-
+            # effort — never let serialization issues crash training.
+            if fsm_tracker is not None and config.save_fsm_graph:
+                try:
+                    fsm_tracker.save_graph_state(
+                        os.path.join("state_graphs", "latest.json"),
+                        epoch=epoch,
+                    )
+                except Exception as exc:
+                    dprint(f"[graph-save] failed: {exc}")
 
             # Step-based linear LR annealing. Progress is measured in
             # env-steps collected (not epochs), so variable rollout sizes

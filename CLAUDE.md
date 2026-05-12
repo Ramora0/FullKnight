@@ -23,6 +23,8 @@ dotnet build mod/FullKnight.csproj -c Debug
 dotnet build mod/FullKnight.csproj -c Release
 ```
 
+**Always rebuild the mod after editing any `.cs` file under `mod/`.** The game loads the installed DLL, not the source — unbuilt changes are invisible at runtime (no new logs, no behavior change). Run `dotnet build mod/FullKnight.csproj -c Debug` before testing C# edits.
+
 ### Python Trainer
 
 ```bash

@@ -13,7 +13,7 @@ namespace FullKnight.Game
 				.GetManifestResourceStream("FullKnight.Resource.save_file.json");
 			if (saveResStream == null)
 			{
-				FullKnight.Instance.Log("Resource stream for save file is null");
+				FullKnight.LogS("Resource stream for save file is null");
 				return;
 			}
 
@@ -26,7 +26,7 @@ namespace FullKnight.Game
 			}
 			catch (Exception e)
 			{
-				FullKnight.Instance.Log($"Could not deserialize completed save file, {e.GetType()}, {e.Message}");
+				FullKnight.LogS($"Could not deserialize completed save file, {e.GetType()}, {e.Message}");
 				return;
 			}
 

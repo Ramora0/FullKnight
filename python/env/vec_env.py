@@ -102,13 +102,40 @@ class VecEnv:
 
         For loud ops (resets), also prints a "starting" line with a wall-clock
         timestamp so a long reset can be correlated against C#-side phase logs.
+
+        A background heartbeat task fires every 5s while the op is in flight
+        so the user can see WHICH env is hanging without enabling
+        --debug_transitions. The heartbeat is cheap (one asyncio.sleep, one
+        print) and self-cancels the moment the op completes.
         """
         boss = self.env_levels[idx] if idx < len(self.env_levels) else "?"
         t0 = time.perf_counter()
         if loud:
             ts = time.strftime("%H:%M:%S", time.localtime())
             print(f"  {label} env {idx} ({boss}): starting at {ts}", flush=True)
-        result = await coro
+
+        async def _heartbeat():
+            try:
+                while True:
+                    await asyncio.sleep(5.0)
+                    elapsed = time.perf_counter() - t0
+                    print(
+                        f"  [hang?] {label} env {idx} ({boss}) "
+                        f"still waiting after {elapsed:.0f}s",
+                        flush=True,
+                    )
+            except asyncio.CancelledError:
+                return
+
+        hb = asyncio.create_task(_heartbeat())
+        try:
+            result = await coro
+        finally:
+            hb.cancel()
+            try:
+                await hb
+            except (asyncio.CancelledError, Exception):
+                pass
         dt = time.perf_counter() - t0
         if loud or dt > 2.0:
             print(f"  {label} env {idx} ({boss}): done in {dt:.1f}s", flush=True)
@@ -233,7 +260,7 @@ class VecEnv:
                 for i in resume_indices
             ])
 
-    def reap_completed_resets(self):
+    def reap_completed_resets(self, only=None):
         """Collect any reset tasks that have finished. Returns a list of
         (env_i, raw_obs_tuple) where raw_obs_tuple is the per-env reset
         return value (combat_hb, terrain_hb, gs, combat_kinds, combat_parents).
@@ -241,9 +268,18 @@ class VecEnv:
         Completed tasks are removed from self._reset_tasks. Exceptions are
         re-raised loudly — a silently-failed reset should crash the run
         rather than leave an env stranded forever.
+
+        If `only` is provided (set/iterable of env indices), only reap tasks
+        for those envs; finished tasks for other envs are left in place to be
+        picked up by a later reap call. Used by the mid-rollout stall to skip
+        stranded resets from prior epochs that have no slot in the current
+        rollout's obs batch.
         """
+        only_set = None if only is None else set(only)
         completed = []
         for env_i in list(self._reset_tasks.keys()):
+            if only_set is not None and env_i not in only_set:
+                continue
             task = self._reset_tasks[env_i]
             if not task.done():
                 continue

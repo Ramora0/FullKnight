@@ -149,6 +149,25 @@ namespace FullKnight.Net
 					}
 					w.Write(d.reset_branch ?? (byte)0);
 				}
+
+				// FSM-snapshot block — appended at the very end of both step
+				// and reset payloads so older Python clients that stop reading
+				// before this point still parse cleanly. Layout: u16 entry
+				// count, then per-entry u16 length + UTF-8 bytes. Each entry
+				// is "<src>|<owner>|<fsm>|<state>" produced by FsmObserver.
+				// u16 length (not u8) because state names occasionally exceed
+				// 255 bytes once concatenated with owner + fsm name.
+				var fsms = d.fsm_snapshots ?? new List<string>();
+				int nFsm = fsms.Count > 65535 ? 65535 : fsms.Count;
+				w.Write((ushort)nFsm);
+				for (int i = 0; i < nFsm; i++)
+				{
+					string s = fsms[i] ?? "";
+					var bytes = System.Text.Encoding.UTF8.GetBytes(s);
+					int len = bytes.Length > 65535 ? 65535 : bytes.Length;
+					w.Write((ushort)len);
+					w.Write(bytes, 0, len);
+				}
 			}
 
 			return ms.ToArray();

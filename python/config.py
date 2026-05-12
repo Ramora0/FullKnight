@@ -13,7 +13,7 @@ _CLI_FIELDS = frozenset({
     "time_scale", "fps_cap",
     "hk_path", "ipc",
     "seed", "resume", "time_budget", "diag_epochs", "visualize",
-    "debug_transitions",
+    "save_fsm_graph", "debug_transitions",
     "wandb_project", "save_path", "save_every_steps",
     "total_env_steps", "total_steps_per_epoch",
     # PPO / training knobs that get ablated
@@ -27,6 +27,7 @@ _CLI_FIELDS = frozenset({
     # 02adzmax-vs-HEAD ablation knobs (see Config docstrings below)
     "hidden_dim", "attn_n_heads", "view_w", "view_h",
     "hold_action_init_bias", "d_first_epoch_jump",
+    "frames_per_wait",
 })
 
 
@@ -43,7 +44,7 @@ class Config:
     # Environment
     server_host: str = "localhost"
     server_port: int = 8765
-    n_envs: int = 16
+    n_envs: int = 8
     # Transport for the step() hot path. "shm" routes action/obs through a
     # named shared-memory + Win32 EventWaitHandle channel (see
     # python/shm_transport.py + Net/ShmChannel.cs); "websocket" keeps the
@@ -58,7 +59,7 @@ class Config:
     # where HK FSM/animator timing stays sane). Field kept for protocol
     # compat with eval/validate/test tools that still surface it as a knob;
     # train.py does not plumb it.
-    frames_per_wait: int = 1
+    frames_per_wait: int = 5
     # time_scale is currently ignored on the C# side (the timeScale mechanism
     # was ripped out so we can isolate captureDeltaTime as the only time knob).
     # Field kept for protocol compat; default 1 reflects current effective value.
@@ -173,14 +174,14 @@ class Config:
     # reset (with new boss assignment). 0 disables (re-roll every death,
     # the original behavior).
     boss_rotation_period: int = 0
-    lr: float = 3e-4
+    lr: float = 5e-4
     gamma: float = 0.95
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
     value_coeff: float = 0.5
     entropy_coeff: float = 0.02
     max_grad_norm: float = 0.5
-    target_kl: float = 0.0
+    target_kl: float = 0.02
 
     # Training
     # total_env_steps: total env-steps collected across the whole run.
@@ -189,7 +190,7 @@ class Config:
     total_env_steps: int = 18_000_000
     total_steps_per_epoch: int = 1024
     batch_size: int = 128
-    train_iters: int = 2
+    train_iters: int = 8
     save_every_steps: int = 51_200
     # How often to hard-kill and relaunch every HK instance during training.
     # Patches the long-running env-state exploitation observed across multi-hour
@@ -197,7 +198,7 @@ class Config:
     # that doesn't exist on fresh launches; D inflates and doesn't transfer).
     # All instances restart synchronously at the same epoch boundary; cost is
     # ~30s of training pause every cadence. 0 disables.
-    hard_restart_every_epochs: int = 1000
+    hard_restart_every_epochs: int = 0
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
 
@@ -242,7 +243,7 @@ class Config:
     # combat/terrain hitboxes, kinds, diag counts, step timings) into a .log
     # file. Bounded by glitch_max_dumps so a stuck-glitched run doesn't fill
     # the disk. Logs land under glitch_log_dir; training continues.
-    detect_glitch: bool = True
+    detect_glitch: bool = False
     glitch_log_dir: str = "glitch_logs"
     glitch_max_dumps: int = 5
 
@@ -254,6 +255,12 @@ class Config:
 
     # Debug
     visualize: bool = False
+    # Persist env 0's boss FSM transition graph + state-change history to
+    # state_graphs/latest.json each epoch so graph_viewer.py can render it
+    # offline. Independent of `visualize` — saving runs whenever this is
+    # True regardless of whether the pygame visualizer is open. Set False
+    # to skip the per-epoch JSON write entirely (no parsing, no I/O).
+    save_fsm_graph: bool = True
     # Strip all training-loop prints (timing/perf/leak/policy/slow/epoch
     # summary) and emit only scene-transition events: reset start/done
     # with per-phase breakdown + branch, episode-end (win/loss + level),
