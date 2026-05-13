@@ -687,7 +687,7 @@ async def train(config: Config):
     # graph saving (the failure mode the user hit on the May-11 run).
     fsm_tracker = None
     if config.save_fsm_graph or config.visualize:
-        from visualizer import FsmTracker
+        from fsm_tracker import FsmTracker
         fsm_tracker = FsmTracker()
 
     vis = None
