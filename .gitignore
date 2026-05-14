@@ -6,6 +6,8 @@ Output/
 *.pdb
 *.cache
 save/
+_preproc.xml
+*.binlog
 
 # Python
 __pycache__/
@@ -17,6 +19,9 @@ __pycache__/
 models/
 logs/
 wandb/
+python/glitch_logs/
+python/train_diag.log
+python/*_diag.log
 
 # Recordings
 *.mp4
