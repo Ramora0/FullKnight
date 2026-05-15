@@ -135,6 +135,18 @@ class Config:
     # Time budget (seconds, 0 = unlimited). Disables wandb when set.
     time_budget: int = 0
 
+    # CUDA Graphs for collect_action - captures the per-step forward (h2d +
+    # forward + d2h) into a replay-only graph, slashing CPU launch overhead
+    # which dominates per-step wallclock for our small model on a fast GPU.
+    # Requires that batch dim B equals n_envs (we pad inactive envs with
+    # zero-masked rows), and that combat/terrain dims fit the bucket caps
+    # below. Caps are ceiling-pad targets; pick them above your typical
+    # max observed values, but not so high that wasted compute exceeds the
+    # launch-overhead savings.
+    use_cuda_graphs: bool = True
+    graph_combat_buckets: str = "8,16,32,64"   # comma-separated
+    graph_terrain_buckets: str = "96"          # one bucket is plenty if terrain is camera-clipped
+
     # Debug
     visualize: bool = False
 

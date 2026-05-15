@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from model import FullKnightActorCritic
 from observation import Observation, CB, mirror_observation, mirror_movement
+from graph_runner import BucketedGraphRunner
 
 
 class RunningNormalizer:
@@ -89,6 +90,9 @@ class PPO:
         )
         # LR annealing is now step-based and driven from train.py via
         # set_lr(); no torch LR scheduler needed.
+
+        # Lazy-initialized on first collect_action() call once we know n_envs.
+        self._graph_runner = None
 
     def get_advantages(self, damage_landed, hits_taken, hp_healed, values_atk, values_def, D, heal_coef, dones=None):
         """GAE with decomposed value heads and curriculum scaling.
@@ -232,6 +236,24 @@ class PPO:
         self._tensor_prep_total = 0.0
         return result
 
+    def _ensure_graph_runner(self):
+        """Lazy-init the bucketed CUDA graph runner on first collect_action."""
+        if self._graph_runner is not None:
+            return
+        if not self.config.use_cuda_graphs or not torch.cuda.is_available():
+            return
+        n_envs = self.hx.shape[0]
+        combat_buckets = [int(x) for x in self.config.graph_combat_buckets.split(",") if x.strip()]
+        terrain_buckets = [int(x) for x in self.config.graph_terrain_buckets.split(",") if x.strip()]
+        print(f"  [cuda_graphs] capturing B={n_envs} "
+              f"combat={combat_buckets} terrain={terrain_buckets}...", flush=True)
+        self._graph_runner = BucketedGraphRunner(
+            self.policy, B=n_envs,
+            combat_buckets=combat_buckets,
+            terrain_buckets=terrain_buckets,
+            cfg=self.config, device=self.device,
+        )
+
     @torch.no_grad()
     def collect_action(self, obs: Observation, env_indices=None):
         """Get actions for a batch of observations during rollout collection.
@@ -244,6 +266,7 @@ class PPO:
         """
         import time as _time
         self._ensure_event_log()
+        self._ensure_graph_runner()
 
         t0 = _time.perf_counter()
         n_cont = self.config.global_state_dim - self.config.n_binary_flags
@@ -254,6 +277,12 @@ class PPO:
         thb_norm = self._normalize_hitboxes(obs.terrain_hb, obs.terrain_mask, self.terrain_normalizer)
         self._norm_total += _time.perf_counter() - t0
 
+        if self._graph_runner is not None:
+            return self._collect_via_graph(
+                obs, gs_norm, chb_norm, thb_norm, env_indices
+            )
+
+        # --- Eager path (unchanged) ---
         # CPU-side tensor prep (from_numpy + .float()) — async .to() is timed
         # separately via cuda events. We measure CPU prep with wall time and
         # bracket the .to() calls with cuda events for the actual transfer.
@@ -308,6 +337,77 @@ class PPO:
         d2h_end.record()
 
         self._event_log.append((h2d_start, h2d_end, fwd_start, fwd_end, d2h_start, d2h_end))
+        return result
+
+    def _collect_via_graph(self, obs, gs_norm, chb_norm, thb_norm, env_indices):
+        """CUDA-graph path: pad inputs to full n_envs, replay the captured
+        graph, slice outputs back to the active env_indices.
+
+        We always run the graph at the captured B (= n_envs); inactive slots
+        are zero-masked so masked attention ignores them. The wasted compute
+        on inactive rows is overshadowed by the per-call launch-overhead
+        savings (graph replay is ~0.5 ms vs ~6 ms eager).
+        """
+        runner = self._graph_runner
+        n_envs = runner.B
+        cfg = self.config
+        active = (
+            list(range(n_envs)) if env_indices is None else list(env_indices)
+        )
+        n_combat_in = obs.combat_hb.shape[1]
+        n_terrain_in = obs.terrain_hb.shape[1]
+
+        # Build full-B padded inputs. Inactive slots are zero (mask=0 makes
+        # them no-ops through masked attention).
+        full_obs = Observation(
+            combat_hb=np.zeros((n_envs, n_combat_in, cfg.combat_feature_dim), dtype=np.float32),
+            combat_mask=np.zeros((n_envs, n_combat_in), dtype=np.float32),
+            combat_kind_ids=np.zeros((n_envs, n_combat_in), dtype=np.int64),
+            combat_parent_ids=np.zeros((n_envs, n_combat_in), dtype=np.int64),
+            terrain_hb=np.zeros((n_envs, n_terrain_in, cfg.terrain_feature_dim), dtype=np.float32),
+            terrain_mask=np.zeros((n_envs, n_terrain_in), dtype=np.float32),
+            global_state=np.zeros((n_envs, cfg.global_state_dim), dtype=np.float32),
+        )
+        full_obs.combat_hb[active] = chb_norm
+        full_obs.combat_mask[active] = obs.combat_mask
+        full_obs.combat_kind_ids[active] = obs.combat_kind_ids
+        full_obs.combat_parent_ids[active] = obs.combat_parent_ids
+        full_obs.terrain_hb[active] = thb_norm
+        full_obs.terrain_mask[active] = obs.terrain_mask
+        full_obs.global_state[active] = gs_norm
+
+        # hx is already full-size; pass it through as-is. Active rows hold
+        # real state; inactive rows hold whatever was last written (doesn't
+        # matter — we only read back hx_new for active rows).
+        fwd_start = torch.cuda.Event(enable_timing=True)
+        fwd_end = torch.cuda.Event(enable_timing=True)
+        fwd_start.record()
+        out, _bucket = runner.run_numpy(full_obs, self.hx)
+        fwd_end.record()
+
+        # Update hx for active envs only.
+        self.hx[active] = out["hx_new"][active].copy()
+
+        actions_np = {
+            "movement": out["act_movement"][active].copy(),
+            "direction": out["act_direction"][active].copy(),
+            "action": out["act_action"][active].copy(),
+            "jump": out["act_jump"][active].copy(),
+        }
+        result = (
+            actions_np,
+            out["log_prob"][active].copy(),
+            out["log_prob_action"][active].copy(),
+            out["value_atk"][active].copy(),
+            out["value_def"][active].copy(),
+        )
+
+        # Log timing — bundle h2d+fwd+d2h into one "fwd" segment, h2d/d2h
+        # log to zero so report_timing's split still works syntactically.
+        zero_evt_a = torch.cuda.Event(enable_timing=True)
+        zero_evt_b = torch.cuda.Event(enable_timing=True)
+        zero_evt_a.record(); zero_evt_b.record()
+        self._event_log.append((zero_evt_a, zero_evt_b, fwd_start, fwd_end, zero_evt_a, zero_evt_b))
         return result
 
     def train_on_rollout(self, obs_buf, actions_arr, log_probs_arr,

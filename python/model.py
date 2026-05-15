@@ -43,8 +43,14 @@ class HitboxEncoder(nn.Module):
         """
         B = hitboxes.shape[0]
 
-        if hitboxes.shape[1] == 0 or mask.sum() == 0:
+        if hitboxes.shape[1] == 0:
             return torch.zeros(B, self.output_dim, device=hitboxes.device)
+        # Note: when mask is all-zero for some row, attn_logits get filled with
+        # -1e9 -> softmax is uniform -> output is the W_v-biased mean of zero-
+        # padded phi outputs (a small constant). The prior `mask.sum() == 0`
+        # short-circuit was removed because it syncs the device, which breaks
+        # CUDA graph capture. Inactive envs are sliced off the result so this
+        # constant never reaches the loss.
 
         if extra is not None:
             hitboxes = torch.cat([hitboxes, extra], dim=-1)
@@ -246,10 +252,13 @@ class FullKnightActorCritic(nn.Module):
         # Apply validity masking
         logits_a, logits_j = self._mask_logits(logits_a, logits_j, obs.global_state)
 
-        dist_m = Categorical(logits=logits_m)
-        dist_d = Categorical(logits=logits_d)
-        dist_a = Categorical(logits=logits_a)
-        dist_j = Categorical(logits=logits_j)
+        # validate_args=False: skip Distribution.__init__'s `valid.all()` check,
+        # which host-syncs and breaks CUDA graph capture. logits are produced by
+        # the model so we know they're finite.
+        dist_m = Categorical(logits=logits_m, validate_args=False)
+        dist_d = Categorical(logits=logits_d, validate_args=False)
+        dist_a = Categorical(logits=logits_a, validate_args=False)
+        dist_j = Categorical(logits=logits_j, validate_args=False)
 
         if actions is None:
             a_m = dist_m.sample()
@@ -335,10 +344,10 @@ class FullKnightActorCritic(nn.Module):
         logits_j = self.head_jump(flat_features).clone()
         logits_a, logits_j = self._mask_logits(logits_a, logits_j, flat_global)
 
-        dist_m = Categorical(logits=logits_m)
-        dist_d = Categorical(logits=logits_d)
-        dist_a = Categorical(logits=logits_a)
-        dist_j = Categorical(logits=logits_j)
+        dist_m = Categorical(logits=logits_m, validate_args=False)
+        dist_d = Categorical(logits=logits_d, validate_args=False)
+        dist_a = Categorical(logits=logits_a, validate_args=False)
+        dist_j = Categorical(logits=logits_j, validate_args=False)
 
         flat_a_m = actions["movement"].reshape(-1)
         flat_a_d = actions["direction"].reshape(-1)
