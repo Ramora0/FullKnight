@@ -61,6 +61,23 @@ namespace FullKnight.Environment
 		private InputDeviceShim _inputShim = new();
 		private Game.TimeScale _timeManager;
 
+		// Per-frame game-time pin (seconds). Calibration: trained regime had
+		// gtime_baseline = 0.0424s/step at frames_per_wait=5, time_scale=3
+		// → 0.0424 / (5 × 3) ≈ 0.00283. Set into Time.captureDeltaTime in
+		// Step() to put Unity into capture mode: Time.deltaTime becomes
+		// captureDeltaTime × timeScale (= 0.00849/frame) and Time.unscaledDeltaTime
+		// becomes captureDeltaTime (= 0.00283/frame), independent of real fps.
+		// Real frames run as fast as CPU allows; each represents exactly the
+		// pinned game-time. 8-env diag (2026-05-15): wall=4.83ms/step, sim=3.59ms,
+		// gtime=42.45ms pinned (p10-p99 = exact); effective dilation 11.6× (vs
+		// the 3× nominal timeScale), throughput ~3.75× the previous cap-based fix.
+		//
+		// Capture mode REQUIRES Unity's render pipeline initialized — i.e.,
+		// -batchmode is fine but -nographics breaks it (no renderer → capture
+		// is inert and dt tracks real wall time × timeScale). InstanceManager
+		// drops -nographics for this reason.
+		private const float kStepDeltaTime = 0.00283f;
+
 		public TrainingEnv(string url, params string[] protocols) : base(url, protocols) { }
 
 		protected override IEnumerator OnMessage(Message message)
@@ -260,24 +277,14 @@ namespace FullKnight.Environment
 			// Track HP at step start for heal detection
 			_knightHpAtStepStart = PlayerData.instance.health;
 
-			// Pin Time.deltaTime to a constant during the agent's frame-skip so
-			// per-step game-time is decoupled from Unity's wallclock framerate.
-			// Without this, faster wallclock fps = smaller deltaTime = the agent
-			// sees a different gtime regime than it was trained on, even when
-			// nothing about the simulation changed.
-			//
-			// EMPIRICAL: under capture, Time.deltaTime = captureDeltaTime ×
-			// Time.timeScale (NOT just captureDeltaTime as Unity docs imply).
-			// First attempt at 0.00848 produced gtime=0.126/step (3× baseline)
-			// because timeScale=3 multiplied through; quality cratered.
-			// Calibration: gtime_baseline / (frames × timeScale) = 0.0424 /
-			// (5 × 3) ≈ 0.00283, giving Time.deltaTime ≈ 0.00848/frame and
-			// gtime ≈ 0.0424/step — matches the trained regime.
-			//
-			// Restore captureDeltaTime=0 between steps because Unity ignores
-			// Time.timeScale=0 under capture (would break the inter-step pause
-			// and the intro-skip timeScale=20 fast-forward).
-			const float kStepDeltaTime = 0.00283f;
+			// Enter capture mode for this step's frame-skip. Unity pins both
+			// Time.deltaTime and Time.unscaledDeltaTime to kStepDeltaTime
+			// independent of real frame rate, so the agent sees a constant
+			// per-frame dt regardless of CPU speed. Restored to 0 between
+			// steps because Unity ignores Time.timeScale=0 under capture
+			// (would break the inter-step pause and the intro-skip
+			// timeScale=20 fast-forward). See the constants block for the
+			// capture-mode requirement that -nographics must NOT be passed.
 			Time.captureDeltaTime = kStepDeltaTime;
 
 			float frameSkipT0 = Time.realtimeSinceStartup;
@@ -594,16 +601,9 @@ namespace FullKnight.Environment
 				yield break;
 			}
 
-			// Uncap Unity's frame loop. With -nographics there's no display to
-			// vsync against; the only thing throttling Update() is targetFrameRate
-			// (default cap on Windows). Pairing this with captureDeltaTime in
-			// Step() decouples wallclock framerate from per-step game-time, so
-			// faster frames don't shrink dt out from under the agent. Uncap-alone
-			// (commit e094f23, reverted) gave +63% throughput but cratered
-			// quality via the regime shift; capture-alone (a2f7136) preserves
-			// regime but Unity stays at ~360fps cap and there's no speedup.
-			// Combined, the uncap delivers the wallclock win and capture holds
-			// the regime steady.
+			// Uncap fps; rely on Time.captureDeltaTime (set in Step) to pin
+			// dt independently of real frame rate. Capture mode is the
+			// canonical-dt facility Unity exposes — see the constants block.
 			QualitySettings.vSyncCount = 0;
 			Application.targetFrameRate = -1;
 

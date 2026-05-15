@@ -111,28 +111,27 @@ class InstanceManager:
             if graphical:
                 cmd = [self._instance_exe(name)]
             else:
-                # `-nographics` forces graphicsDeviceType=Null and skips the
-                # render thread entirely, on top of `-batchmode`'s windowless
-                # mode. A/B/C measurement on Moss Charger (autoresearch/sim
-                # results.tsv, sim/may8 branch) showed this combo wins on every
-                # metric vs `-batchmode` alone: +11.7% throughput, −15% RAM
-                # initial, identical CPU sat / rtime / GC heap, and quality CIs
-                # that overlap (and overlap graphical too). Set FK_KEEP_GFX=1
-                # to fall back to bare `-batchmode` if a future scene exercises
-                # an HK FSM that touches RenderTextures and breaks under null
-                # device.
+                # `-batchmode` alone (NOT `-nographics`). Time.captureDeltaTime
+                # is implemented in Unity's render pipeline — under `-nographics`
+                # there's no renderer to consult it and the dt pin is inert, so
+                # game dt tracks real wall time and the per-frame regime drifts
+                # with CPU load. Keeping the render pipeline initialized lets
+                # capture mode work as documented: dt is canonical and real fps
+                # runs unconstrained. 8-env diag 2026-05-15: dropping
+                # `-nographics` switched wall/step from 18.14ms → 4.83ms
+                # (3.75× throughput) with gtime/step pinned at exactly 42.45ms.
+                # The earlier A/B (commit 1b1163e) that showed `-nographics`
+                # +11.7% throughput was measured under broken-capture-uncap;
+                # with capture mode actually working, the trade flips heavily.
                 cmd = [
                     self._instance_exe(name),
                     "-batchmode",
-                    "-nographics",
                     "-screen-width", "64",
                     "-screen-height", "64",
                     "-screen-quality", "0",
                     "-screen-fullscreen", "0",
                     "-nolog",
                 ]
-                if os.environ.get("FK_KEEP_GFX"):
-                    cmd.remove("-nographics")
             proc = subprocess.Popen(cmd)
             self._procs.append(proc)
             return True
