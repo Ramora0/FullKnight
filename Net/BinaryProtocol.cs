@@ -118,6 +118,24 @@ namespace FullKnight.Net
 					w.Write(d.diag_kind_cache_size ?? 0);
 					w.Write(d.diag_gc_heap_mb ?? 0f);
 				}
+
+				// Reset phase trailer. Appended at the very end of reset
+				// messages so older Python clients that don't read it still
+				// parse the obs body correctly. Layout (43 bytes):
+				//   u8 branch (0=workshop, 1=natural_end, 2=unknown)
+				//   for i in 0..ResetPhase.Count: f32 ms, u16 frames
+				// Must match unpack order in python/binary_protocol.py:unpack_reset.
+				if (message.type == "reset")
+				{
+					w.Write(d.reset_branch ?? ResetPhase.BranchUnknown);
+					var phaseMs = d.reset_phase_ms ?? new float[ResetPhase.Count];
+					var phaseFr = d.reset_phase_frames ?? new ushort[ResetPhase.Count];
+					for (int i = 0; i < ResetPhase.Count; i++)
+					{
+						w.Write(i < phaseMs.Length ? phaseMs[i] : 0f);
+						w.Write(i < phaseFr.Length ? phaseFr[i] : (ushort)0);
+					}
+				}
 			}
 
 			return ms.ToArray();

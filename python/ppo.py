@@ -1,3 +1,4 @@
+import time as _time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -358,6 +359,13 @@ class PPO:
             flush=True,
         )
 
+        # Diagnostic phase wallclocks (seconds). Consumed by train.py's
+        # TimingTracker — train/* buckets get their fine-grained split from
+        # this. CPU phases use perf_counter; GPU phases (forward/backward)
+        # use cuda events recorded inline and read once at the end.
+        train_phase_t = {}
+        _t_phase = _time.perf_counter()
+
         # Compute decomposed GAE per-env
         all_advantages = np.empty((T, N), dtype=np.float32)
         all_atk_returns = np.empty((T, N), dtype=np.float32)
@@ -374,6 +382,9 @@ class PPO:
             all_advantages[:, env_i] = adv
             all_atk_returns[:, env_i] = atk_ret
             all_def_returns[:, env_i] = def_ret
+
+        train_phase_t["gae"] = _time.perf_counter() - _t_phase
+        _t_phase = _time.perf_counter()
 
         if valid_arr is None:
             valid_arr = np.ones((T, N), dtype=bool)
@@ -500,6 +511,9 @@ class PPO:
         atk_var_eff = atk_var + 1e-3
         def_var_eff = def_var + 1e-3
 
+        train_phase_t["normalize"] = _time.perf_counter() - _t_phase
+        _t_phase = _time.perf_counter()
+
         # Move to device — bundle into a single (total_chunks, L, ...) Observation
         # so the inner training loop can index obs_t[idx] in one shot.
         obs_t = Observation(
@@ -520,6 +534,18 @@ class PPO:
         hx_t = torch.from_numpy(hx_chunks).float().to(self.device)
         valid_t = torch.from_numpy(valid_chunks).float().to(self.device)
         committed_t = torch.from_numpy(committed_chunks).float().to(self.device)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        train_phase_t["h2d"] = _time.perf_counter() - _t_phase
+        _t_phase = _time.perf_counter()
+
+        # Accumulate inner-loop GPU phase timings via cuda events: pair (start,
+        # end) recorded around each forward_sequence and bwd/clip/step block,
+        # summed once after the loop. Read elapsed_time after a final sync at
+        # the end so the GPU has finished by the time we query.
+        _fwd_evt_pairs = []
+        _bwd_evt_pairs = []
+        _cuda_ok = torch.cuda.is_available()
 
         # --- Training loop: shuffle chunks, process in minibatches ---
         CPB = cfg.chunks_per_batch
@@ -566,10 +592,17 @@ class PPO:
                     obs_mb = mirror_observation(obs_mb)
                     act_mb["movement"] = mirror_movement(act_mb["movement"])
 
+                if _cuda_ok:
+                    _fwd_s = torch.cuda.Event(enable_timing=True)
+                    _fwd_e = torch.cuda.Event(enable_timing=True)
+                    _fwd_s.record()
                 (new_lp, entropy, v_atk, v_def, gru_info,
                  new_lp_a, ent_a) = self.policy.forward_sequence(
                     obs_mb, hx_mb, act_mb,
                 )
+                if _cuda_ok:
+                    _fwd_e.record()
+                    _fwd_evt_pairs.append((_fwd_s, _fwd_e))
 
                 # Flatten (B, L) -> (B*L,) for loss
                 new_lp_flat = new_lp.reshape(-1)
@@ -619,10 +652,17 @@ class PPO:
                     + cfg.entropy_coeff * entropy_loss
                 )
 
+                if _cuda_ok:
+                    _bwd_s = torch.cuda.Event(enable_timing=True)
+                    _bwd_e = torch.cuda.Event(enable_timing=True)
+                    _bwd_s.record()
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
                 self.optimizer.step()
+                if _cuda_ok:
+                    _bwd_e.record()
+                    _bwd_evt_pairs.append((_bwd_s, _bwd_e))
 
                 n_updates += 1
                 total_metrics["surrogate"] += surrogate.item()
@@ -654,6 +694,20 @@ class PPO:
                     break
 
         pbar.close()
+        train_phase_t["train_loop"] = _time.perf_counter() - _t_phase
+        # cuda.Event.elapsed_time returns ms and requires the recorded events
+        # to have completed — sync once here so the summation below is safe
+        # whether or not the caller syncs.
+        if _cuda_ok and (_fwd_evt_pairs or _bwd_evt_pairs):
+            torch.cuda.synchronize()
+            train_phase_t["forward_seq"] = sum(
+                s.elapsed_time(e) for s, e in _fwd_evt_pairs) / 1000.0
+            train_phase_t["backward_optim"] = sum(
+                s.elapsed_time(e) for s, e in _bwd_evt_pairs) / 1000.0
+        else:
+            train_phase_t["forward_seq"] = 0.0
+            train_phase_t["backward_optim"] = 0.0
+
         out = {k: v / max(n_updates, 1) for k, v in total_metrics.items()}
         out["ev_atk"] = ev_atk
         out["ev_def"] = ev_def
@@ -661,6 +715,7 @@ class PPO:
         out["adv_std_raw"] = adv_std_raw
         out["atk_return_var"] = atk_var
         out["def_return_var"] = def_var
+        out["train_phase_t"] = train_phase_t
         return out
 
     def set_lr(self, lr: float):

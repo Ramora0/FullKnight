@@ -63,5 +63,40 @@ namespace FullKnight.Net
 		// steps (the agent didn't make a free choice; movement/direction/jump
 		// stay free and get normal gradient).
 		public bool? action_committed;
+
+		// Reset-only phase telemetry. Populated by TrainingEnv.Reset and
+		// serialized as a fixed-order trailer on reset messages (see
+		// BinaryProtocol.Pack). reset_branch encodes which transition path
+		// the env took: 0=workshop (no wait), 1=natural_end, 2=unknown (suicide
+		// or anything else). reset_phase_ms / reset_phase_frames are sized 7 and
+		// indexed in PHASE_KEYS order: [pre_unload, transition_out, settle,
+		// load_boss_scene, recreate_reader, init_boss_refs, obs_final]. Python's
+		// TimingTracker aggregates these into the per-reset breakdown.
+		public byte? reset_branch;
+		public float[] reset_phase_ms;
+		public ushort[] reset_phase_frames;
+	}
+
+	public static class ResetPhase
+	{
+		// Canonical phase keys, in wire order. Must match Python's
+		// TimingTracker.RESET_PHASES tuple.
+		public static readonly string[] Keys = new[] {
+			"pre_unload", "transition_out", "settle",
+			"load_boss_scene", "recreate_reader",
+			"init_boss_refs", "obs_final",
+		};
+		public const int Count = 7;
+
+		public const byte BranchWorkshop    = 0;
+		public const byte BranchNaturalEnd  = 1;
+		public const byte BranchUnknown     = 2;
+
+		public static int IndexOf(string key)
+		{
+			for (int i = 0; i < Keys.Length; i++)
+				if (Keys[i] == key) return i;
+			return -1;
+		}
 	}
 }

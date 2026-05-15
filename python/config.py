@@ -122,7 +122,7 @@ class Config:
     # that doesn't exist on fresh launches; D inflates and doesn't transfer).
     # All instances restart synchronously at the same epoch boundary; cost is
     # ~30s of training pause every cadence. 0 disables.
-    hard_restart_every_epochs: int = 1200
+    hard_restart_every_epochs: int = 1000
     save_path: str = "models/fullknight"
     wandb_project: str = "fullknight"
 

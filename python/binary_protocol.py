@@ -129,6 +129,32 @@ def pop_last_terrain_debug():
 _DIAG_FMT = '<HHHif'  # enemy_cnt, attack_cnt, terrain_cnt, kind_cache_size, gc_heap_mb
 _DIAG_SIZE = struct.calcsize(_DIAG_FMT)  # 14 bytes
 
+# Reset-message phase trailer. Must match BinaryProtocol.cs:Pack and the
+# canonical key order in Net/Protocol.cs:ResetPhase.Keys.
+#   u8  branch (0=workshop, 1=natural_end, 2=unknown)
+#   for each of 7 phases: f32 ms, u16 frames
+RESET_PHASE_KEYS = (
+    "pre_unload", "transition_out", "settle",
+    "load_boss_scene", "recreate_reader",
+    "init_boss_refs", "obs_final",
+)
+_RESET_BRANCH_NAMES = {0: "workshop", 1: "natural_end", 2: "unknown"}
+_RESET_PHASE_TRAILER_FMT = '<B' + 'fH' * len(RESET_PHASE_KEYS)
+_RESET_PHASE_TRAILER_SIZE = struct.calcsize(_RESET_PHASE_TRAILER_FMT)
+
+# Side channel: last reset phase dict pulled off the wire. Populated by
+# unpack_reset, drained by env.HKEnv after each reset and stashed on
+# self.last_reset_phases for VecEnv to pull at reap time.
+_last_reset_phases: dict = {}
+
+def pop_last_reset_phases():
+    """Return (and clear) the most-recently-received reset phase dict."""
+    global _last_reset_phases
+    out = _last_reset_phases
+    _last_reset_phases = {}
+    return out
+
+
 # Side channel: last diag tuple pulled off the wire. Populated by unpack_step,
 # read by vec_env so we don't balloon the main return tuple on every caller.
 _last_diag = {
@@ -186,11 +212,26 @@ def unpack_step(data):
 
 def unpack_reset(data):
     """Unpack a reset response.
-    Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents)."""
-    global _last_terrain_debug
+    Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents).
+    Phase trailer (if present) is stashed in _last_reset_phases — read it
+    via pop_last_reset_phases()."""
+    global _last_terrain_debug, _last_reset_phases
     combat_hb, terrain_hb, gs, n_combat, offset = unpack_obs(data)
     n_terrain = terrain_hb.shape[0]
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
     combat_parents, offset = unpack_kinds(data, offset, n_combat)
-    _last_terrain_debug, _ = unpack_terrain_debug(data, offset, n_terrain)
+    _last_terrain_debug, offset = unpack_terrain_debug(data, offset, n_terrain)
+    # Reset phase trailer (43 bytes). Defensive: older C# mods don't send it.
+    if offset + _RESET_PHASE_TRAILER_SIZE <= len(data):
+        fields = struct.unpack_from(_RESET_PHASE_TRAILER_FMT, data, offset)
+        branch_id = fields[0]
+        phases = {"branch": _RESET_BRANCH_NAMES.get(branch_id, "unknown")}
+        frame_counts = {}
+        for i, key in enumerate(RESET_PHASE_KEYS):
+            phases[key] = float(fields[1 + i * 2])      # ms
+            frame_counts[key] = int(fields[1 + i * 2 + 1])  # frames
+        phases["frames"] = frame_counts
+        _last_reset_phases = phases
+    else:
+        _last_reset_phases = {}
     return combat_hb, terrain_hb, gs, combat_kinds, combat_parents

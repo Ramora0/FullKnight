@@ -26,6 +26,13 @@ class VecEnv:
         # In-flight background reset tasks: env_i -> asyncio.Task wrapping the
         # _timed_op reset coroutine. Caller polls with reap_completed_resets().
         self._reset_tasks: dict = {}
+        # Per-reset phase breakdowns awaiting train.py's next
+        # pop_reset_dts() drain. Each dict has:
+        #   wall_dt (s, Python wire time) + the C# phase ms keys
+        #   (pre_unload, transition_out, settle, load_boss_scene,
+        #    recreate_reader, init_boss_refs, obs_final) + branch name +
+        #   per-phase frame counts under "frames".
+        self._completed_reset_dts: list = []
 
     async def start_server(self):
         """Start WebSocket server and wait for all N connections."""
@@ -205,6 +212,10 @@ class VecEnv:
         Completed tasks are removed from self._reset_tasks. Exceptions are
         re-raised loudly — a silently-failed reset should crash the run
         rather than leave an env stranded forever.
+
+        Side effect: each reaped reset's phase breakdown (from C#) plus its
+        Python wire wallclock is appended to self._completed_reset_dts for
+        the next pop_reset_dts() drain.
         """
         completed = []
         for env_i in list(self._reset_tasks.keys()):
@@ -213,8 +224,21 @@ class VecEnv:
                 continue
             _env_i, _dt, result = task.result()  # raises if the task errored
             completed.append((env_i, result))
+            phases = dict(self.envs[env_i].last_reset_phases)
+            phases["wall_dt"] = float(_dt)
+            self._completed_reset_dts.append(phases)
             del self._reset_tasks[env_i]
         return completed
+
+    def pop_reset_dts(self):
+        """Drain and return the list of per-reset phase dicts accumulated since
+        the last call. Each entry: {"wall_dt": s, "branch": str,
+        "pre_unload": ms, ..., "obs_final": ms, "frames": {phase: int}}. Used
+        by train.py's TimingTracker to break the average reset wallclock into
+        its constituent C# phases."""
+        out = self._completed_reset_dts
+        self._completed_reset_dts = []
+        return out
 
     async def await_all_resets(self):
         """Block until every in-flight reset task is done. Returns the same

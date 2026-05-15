@@ -1,0 +1,82 @@
+Spawning 8 HK instances...
+WebSocket server started on ws://localhost:8765
+Waiting for 8 game instances to connect...
+Instance 0 connected.
+Instance 1 connected.
+Instance 2 connected.
+Instance 3 connected.
+Instance 4 connected.
+Instance 5 connected.
+Instance 6 connected.
+Instance 7 connected.
+All 8 instances connected.
+Env bosses: ['GG_Hornet_1', 'GG_Gruz_Mother', 'GG_Gruz_Mother', 'GG_Mega_Moss_Charger', 'GG_Mega_Moss_Charger', 'GG_False_Knight', 'GG_False_Knight', 'GG_False_Knight']
+frames_per_wait=5  time_scale=3
+Expected gtime/step ~ 5 frames * 0.00283s * 3x = 42.45ms
+reset_all: 8 envs in 1.2s
+Collecting over 400 steps (first 5 skipped: includes intro-skip)...
+    [step-wire] action=[2, 2, 7, 1] send=0ms recv=3275ms total=3276ms
+  step env 1 (GG_Gruz_Mother): done in 3.3s
+    [step-wire] action=[2, 2, 7, 1] send=0ms recv=3397ms total=3397ms
+  step env 0 (GG_Hornet_1): done in 3.4s
+    [step-wire] action=[2, 2, 7, 1] send=0ms recv=3601ms total=3601ms
+  step env 2 (GG_Gruz_Mother): done in 3.6s
+    [step-wire] action=[2, 2, 7, 1] send=0ms recv=4032ms total=4032ms
+  step env 3 (GG_Mega_Moss_Charger): done in 4.0s
+[vocab] new kind #2: 'Mega Moss Charger'
+[vocab] new kind #3: 'False Knight New'
+  step 50/400  samples=360  alive=8/8  deaths=0
+  step 100/400  samples=760  alive=8/8  deaths=0
+[vocab] new kind #4: 'Crouch Hit'
+[vocab] new kind #5: 'Charge Hit'
+[vocab] new kind #6: 'Burrow Hit'
+  step 150/400  samples=1160  alive=8/8  deaths=0
+[vocab] new kind #7: 'Hitter'
+  step 200/400  samples=1560  alive=8/8  deaths=0
+  step 250/400  samples=1960  alive=8/8  deaths=0
+  step 300/400  samples=2360  alive=8/8  deaths=0
+  step 350/400  samples=2760  alive=8/8  deaths=0
+  step 400/400  samples=3160  alive=8/8  deaths=0
+
+=== step_game_time distribution (n=3160, post-warmup, alive-only) ===
+  mean= 41.73ms  std= 3.90ms  min=  9.61ms  max=  59.43ms
+  p1=17.39ms  p5=42.45ms  p10=42.45ms  p25=42.45ms  p50=42.45ms  p75=42.45ms  p90=42.45ms  p95=42.45ms  p99=42.45ms  p99.9=42.45ms
+
+Histogram (2ms buckets):
+  [  8.0- 10.0ms]      1  #
+  [ 10.0- 12.0ms]      8  #
+  [ 12.0- 14.0ms]      9  #
+  [ 14.0- 16.0ms]     11  #
+  [ 16.0- 18.0ms]      4  #
+  [ 18.0- 20.0ms]     11  #
+  [ 20.0- 22.0ms]      5  #
+  [ 22.0- 24.0ms]     10  #
+  [ 24.0- 26.0ms]     12  #
+  [ 26.0- 28.0ms]      6  #
+  [ 28.0- 30.0ms]      9  #
+  [ 30.0- 32.0ms]      7  #
+  [ 32.0- 34.0ms]     17  #
+  [ 34.0- 36.0ms]      7  #
+  [ 36.0- 38.0ms]      9  #
+  [ 38.0- 40.0ms]      6  #
+  [ 40.0- 42.0ms]      9  #
+  [ 42.0- 44.0ms]   3017  ############################################################
+  [ 50.0- 52.0ms]      1  #
+  [ 58.0- 60.0ms]      1  #
+
+  step_real_time (unscaled): mean=3.68ms  p50=3.40ms  p99=8.47ms
+  step_wall_time (Python):   mean=4.93ms  p50=4.70ms  p99=10.80ms
+  effective time_scale (sum_game/sum_real): 11.354  (configured: 3)
+
+Per-env summary (mean gtime ms / std / samples):
+  env0 (Hornet_1            ): mean=40.98  std=5.60  n=395  deaths=0
+  env1 (Gruz_Mother         ): mean=42.14  std=2.55  n=395  deaths=0
+  env2 (Gruz_Mother         ): mean=42.15  std=2.43  n=395  deaths=0
+  env3 (Mega_Moss_Charger   ): mean=41.12  std=5.18  n=395  deaths=0
+  env4 (Mega_Moss_Charger   ): mean=41.89  std=3.49  n=395  deaths=0
+  env5 (False_Knight        ): mean=42.20  std=2.27  n=395  deaths=0
+  env6 (False_Knight        ): mean=41.38  std=4.73  n=395  deaths=0
+  env7 (False_Knight        ): mean=42.00  std=3.13  n=395  deaths=0
+
+Total wall: 7.0s  deaths=0
+Stopping instances...

@@ -56,6 +56,15 @@ namespace FullKnight.Environment
 		// LogPhase call so each line shows both delta and total.
 		private float _phaseStart;
 		private float _phaseLast;
+		// Per-phase ms / frame counts for the current Reset, indexed by
+		// ResetPhase.Keys order. Filled by LogResetPhase and shipped on the
+		// reset message so Python's TimingTracker can break down resets.
+		private readonly float[] _resetPhaseMs = new float[Net.ResetPhase.Count];
+		private readonly ushort[] _resetPhaseFrames = new ushort[Net.ResetPhase.Count];
+		private byte _resetBranch;
+		// Frame at the last LogResetPhase call — delta is folded into the
+		// phase frame count. Wall-clock complement to _phaseLast.
+		private int _phaseLastFrame;
 
 		private HitboxObserver _hitboxObserver = new();
 		private InputDeviceShim _inputShim = new();
@@ -121,6 +130,14 @@ namespace FullKnight.Environment
 		private IEnumerator Reset(MessageData data)
 		{
 			PhaseBegin();
+			// Clear per-reset phase telemetry. Filled by LogResetPhase below
+			// and shipped on the outgoing reset message.
+			for (int i = 0; i < Net.ResetPhase.Count; i++)
+			{
+				_resetPhaseMs[i] = 0f;
+				_resetPhaseFrames[i] = 0;
+			}
+			_resetBranch = Net.ResetPhase.BranchUnknown;
 			_level = data.level ?? _level;
 			_frameSkipCount = data.frames_per_wait ?? _frameSkipCount;
 			_timeScaleValue = data.time_scale ?? _timeScaleValue;
@@ -143,7 +160,7 @@ namespace FullKnight.Environment
 			_resetCount++;
 
 			LogBossDiag($"reset#{_resetCount} PRE-UNLOAD (still in old scene)");
-			LogPhase("Reset", "PRE-UNLOAD");
+			LogResetPhase("pre_unload", "PRE-UNLOAD");
 
 			// Release any inputs held over from the previous episode before the
 			// scene transition unfreezes time — otherwise a stuck "left" or "jump"
@@ -178,7 +195,8 @@ namespace FullKnight.Environment
 			{
 				// Cleanup already landed; nothing to wait for.
 				LogBossDiag($"reset#{_resetCount} ALREADY-IN-WORKSHOP");
-				LogPhase("Reset", "ALREADY-IN-WORKSHOP");
+				_resetBranch = Net.ResetPhase.BranchWorkshop;
+				LogResetPhase("transition_out", "ALREADY-IN-WORKSHOP");
 			}
 			else if (naturalEnd)
 			{
@@ -186,24 +204,26 @@ namespace FullKnight.Environment
 				yield return WaitForSceneChange(preScene);
 				var afterScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
 				LogBossDiag($"reset#{_resetCount} NATURAL-END DONE (now in {afterScene})");
-				LogPhase("Reset", $"NATURAL-END (pre={preScene} post={afterScene})");
+				_resetBranch = Net.ResetPhase.BranchNaturalEnd;
+				LogResetPhase("transition_out", $"NATURAL-END (pre={preScene} post={afterScene})");
 			}
 			else
 			{
 				LogBossDiag($"reset#{_resetCount} PRE-SUICIDE (alive in {preScene})");
 				yield return KillKnight();
 				LogBossDiag($"reset#{_resetCount} POST-SUICIDE");
-				LogPhase("Reset", $"SUICIDE (pre={preScene})");
+				_resetBranch = Net.ResetPhase.BranchUnknown;
+				LogResetPhase("transition_out", $"SUICIDE (pre={preScene})");
 			}
 
 			// Let any in-flight transition (the one that just left the arena, or
 			// any post-load scene wiring) settle before LoadBossScene kicks off
 			// our own. LoadBossScene then bounces through GG_Workshop if needed.
 			yield return new WaitForFinishedEnteringScene();
-			LogPhase("Reset", "WaitForFinishedEnteringScene (settle)");
+			LogResetPhase("settle", "WaitForFinishedEnteringScene (settle)");
 
 			yield return SceneHooks.LoadBossScene(_level);
-			LogPhase("Reset", "LoadBossScene");
+			LogResetPhase("load_boss_scene", "LoadBossScene");
 
 			LogBossDiag($"reset#{_resetCount} POST-SCENELOAD (before reader recreate)");
 
@@ -212,11 +232,11 @@ namespace FullKnight.Environment
 			// we explicitly rebuild the reader here and yield a frame for Start() to scan.
 			_hitboxObserver.RecreateReader();
 			yield return null;
-			LogPhase("Reset", "RecreateReader+frame");
+			LogResetPhase("recreate_reader", "RecreateReader+frame");
 
 			InitBossRefs();
 			LogBossDiag($"reset#{_resetCount} POST-INITBOSSREFS");
-			LogPhase("Reset", "InitBossRefs");
+			LogResetPhase("init_boss_refs", "InitBossRefs");
 			// One-line pass/fail signal for the same-scene-reload bug. Grep for
 			// "[BounceCheck]" to audit every reset at a glance.
 			bool bossAwake = HasActiveCombatHitboxes();
@@ -240,9 +260,15 @@ namespace FullKnight.Environment
 			data.global_state = gs;
 
 			Time.timeScale = 0;
-			LogPhase("Reset", "obs+freeze (final)");
+			LogResetPhase("obs_final", "obs+freeze (final)");
 			float resetTotalMs = (Time.realtimeSinceStartup - _phaseStart) * 1000f;
 			Log($"[Reset-Timing] reset#{_resetCount} TOTAL {resetTotalMs:F0}ms level={_level}");
+			// Ship per-phase telemetry alongside the obs. Python's TimingTracker
+			// drains these via VecEnv.pop_reset_dts() and prints the per-phase
+			// breakdown in the wallclock summary.
+			data.reset_branch = _resetBranch;
+			data.reset_phase_ms = (float[])_resetPhaseMs.Clone();
+			data.reset_phase_frames = (ushort[])_resetPhaseFrames.Clone();
 			SendMessage(new Message { type = "reset", data = data });
 			yield break;
 		}
@@ -453,6 +479,7 @@ namespace FullKnight.Environment
 		{
 			_phaseStart = Time.realtimeSinceStartup;
 			_phaseLast = _phaseStart;
+			_phaseLastFrame = Time.frameCount;
 		}
 
 		private void LogPhase(string scope, string label)
@@ -461,7 +488,33 @@ namespace FullKnight.Environment
 			float deltaMs = (now - _phaseLast) * 1000f;
 			float totalMs = (now - _phaseStart) * 1000f;
 			_phaseLast = now;
+			_phaseLastFrame = Time.frameCount;
 			Log($"[Phase-Timing] {scope}#{_resetCount} {label}: +{deltaMs:F0}ms (total {totalMs:F0}ms)");
+		}
+
+		// LogPhase variant that also accumulates the elapsed wall + frame count
+		// into the per-reset phase telemetry shipped on the reset message.
+		// `phaseKey` must match one of Net.ResetPhase.Keys. The human-readable
+		// `label` is kept distinct so the on-disk log can still carry the
+		// original branch-specific suffix (e.g. "NATURAL-END (pre=X post=Y)")
+		// while the wire format uses the canonical bucket key.
+		private void LogResetPhase(string phaseKey, string label)
+		{
+			float now = Time.realtimeSinceStartup;
+			int frameNow = Time.frameCount;
+			float deltaMs = (now - _phaseLast) * 1000f;
+			int deltaFrames = frameNow - _phaseLastFrame;
+			float totalMs = (now - _phaseStart) * 1000f;
+			_phaseLast = now;
+			_phaseLastFrame = frameNow;
+			int idx = Net.ResetPhase.IndexOf(phaseKey);
+			if (idx >= 0)
+			{
+				_resetPhaseMs[idx] += deltaMs;
+				int frames = _resetPhaseFrames[idx] + deltaFrames;
+				_resetPhaseFrames[idx] = (ushort)(frames > ushort.MaxValue ? ushort.MaxValue : frames);
+			}
+			Log($"[Phase-Timing] Reset#{_resetCount} {label}: +{deltaMs:F0}ms (total {totalMs:F0}ms)");
 		}
 
 		/// <summary>

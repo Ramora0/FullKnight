@@ -70,6 +70,316 @@ def seed_everything(seed: int):
         torch.backends.cudnn.benchmark = False
 
 
+class TimingTracker:
+    """Single global wallclock breakdown for the train loop.
+
+    Buckets partition the entire run wall time so percentages sum to 100.
+    Reset cost is tracked separately as informational because background
+    resets overlap rollout/train. A separate informational line attributes
+    the throughput cost of NOT having mid-rollout env reactivation:
+    after an env dies mid-rollout it sits idle for the rest of the rollout,
+    producing zero-fill rows that get masked out at training time. The
+    `dead_env_step_cells` count reflects exactly that — the data-yield
+    that would be recovered by reactivating the slot mid-epoch.
+
+    Hierarchy:
+        rollout                          (= t_rollout)
+          sim/combat                     (real C# sim, boss awake)
+          sim/intro                      (real C# sim, boss asleep — wasted)
+          sim/overhead                   (step_all wall - real sim:
+                                          IPC, idle on slowest env)
+          inference                      (norm + tensor_prep + h2d + fwd + d2h)
+          misc                           (numpy bookkeeping in rollout body)
+        train                            (= t_train)
+          forward_gpu                    (cuda-event time of forward_sequence)
+          backward_optim_gpu             (cuda-event time of bwd+clip+step)
+          gae_cpu                        (per-env GAE compute)
+          normalize_cpu                  (obs normalize + chunk reshape)
+          h2d                            (host->device transfer + sync)
+          misc                           (train_loop CPU overhead minus GPU
+                                          phases, plus train wall outside
+                                          named phases)
+        reset_blocking                   (await_all_resets when no envs
+                                          were active)
+        between_epochs                   (logging, wandb, save, control flow)
+
+    Sim wall is bounded by the slowest env per step (asyncio.gather), so
+    sum_t(buf_step_all_wall) gives total step_all wall and sum_t(max_e
+    real_time) approximates the productive-sim portion. The combat/intro
+    split inside sim_real uses an env-second weighted ratio (real_time
+    weighted by combat mask, summed) — unbiased over many epochs.
+
+    Dead-env metric:
+        dead_env_step_cells     (T*N cells where env had already died)
+        dead_env_idle_ms        (rollout_wall * dead_fraction)
+    Informational, not inside the 100%. The wall is real work (alive
+    envs were stepping); what's wasted is the slot's data-yield. With
+    mid-rollout reactivation those dead cells would carry valid samples.
+    """
+
+    BUCKETS = [
+        # (key, group, indent_label)
+        ("rollout/sim/combat",        "rollout", "sim/combat"),
+        ("rollout/sim/intro",         "rollout", "sim/intro"),
+        ("rollout/sim/overhead",      "rollout", "sim/overhead"),
+        ("rollout/inference",         "rollout", "inference"),
+        ("rollout/misc",              "rollout", "misc"),
+        ("train/forward_gpu",         "train",   "forward_gpu"),
+        ("train/backward_optim_gpu",  "train",   "backward_optim_gpu"),
+        ("train/gae_cpu",             "train",   "gae_cpu"),
+        ("train/normalize_cpu",       "train",   "normalize_cpu"),
+        ("train/h2d",                 "train",   "h2d"),
+        ("train/misc",                "train",   "misc"),
+        ("reset_blocking",            "other",   "reset_blocking"),
+        ("between_epochs",            "other",   "between_epochs"),
+    ]
+
+    RESET_PHASES = (
+        "pre_unload", "transition_out", "settle",
+        "load_boss_scene", "recreate_reader",
+        "init_boss_refs", "obs_final",
+    )
+
+    def __init__(self):
+        self.totals = {k: 0.0 for k, _, _ in self.BUCKETS}
+        self.last = dict(self.totals)
+        self.n_epochs = 0
+        self.active_env_steps = 0    # cells with combat events
+        self.total_env_steps = 0     # T*N cells total
+        # Dead-env-cell tracking: cells where the env had already died.
+        # With mid-rollout reactivation they would carry valid samples.
+        self.dead_env_step_cells = 0
+        self.cum_dead_wall_s = 0.0   # rollout_wall * dead_fraction, summed
+        self.last_dead_cells = 0
+        self.last_dead_fraction = 0.0
+        self.last_dead_wall_s = 0.0
+        self.reset_count = 0
+        self.reset_wall_total_s = 0.0
+        self.reset_phase_sums_ms = {p: 0.0 for p in self.RESET_PHASES}
+        self.reset_phase_frames = {p: 0.0 for p in self.RESET_PHASES}
+        self.reset_branch_counts = {"workshop": 0, "natural_end": 0, "unknown": 0}
+
+    def record_epoch(self, *, t_rollout, t_train, t_reset_blocking, t_between,
+                     sim_wall_per_step, real_time_arr,
+                     combat_per_step, valid_arr, dones_arr,
+                     inference_timing, train_phase_t, reset_dts,
+                     active_env_steps, total_env_steps):
+        """Pin one epoch's measurements into the cumulative totals."""
+        # ---- Sim wall + real ----------------------------------------
+        sim_wall_s = float(np.asarray(sim_wall_per_step).sum())
+        if real_time_arr.size:
+            sim_real_s = float(real_time_arr.max(axis=1).sum())
+        else:
+            sim_real_s = 0.0
+        sim_real_s = min(sim_real_s, sim_wall_s)
+        sim_overhead_s = max(sim_wall_s - sim_real_s, 0.0)
+
+        # Combat vs intro split inside sim_real: env-second weighted ratio.
+        valid_f = np.asarray(valid_arr, dtype=np.float32)
+        combat_f = np.asarray(combat_per_step, dtype=np.float32) * valid_f
+        intro_f = (1.0 - np.asarray(combat_per_step, dtype=np.float32)) * valid_f
+        combat_es = float((real_time_arr * combat_f).sum())
+        intro_es = float((real_time_arr * intro_f).sum())
+        denom_es = combat_es + intro_es
+        combat_frac = (combat_es / denom_es) if denom_es > 0 else 0.0
+        sim_combat_s = sim_real_s * combat_frac
+        sim_intro_s = sim_real_s * (1.0 - combat_frac)
+
+        # ---- Inference (action selection per rollout step) ----------
+        inf = inference_timing or {}
+        inference_s = (
+            inf.get("normalize_s", 0.0)
+            + inf.get("tensor_prep_s", 0.0)
+            + inf.get("h2d_s", 0.0)
+            + inf.get("forward_s", 0.0)
+            + inf.get("d2h_s", 0.0)
+        )
+        rollout_misc_s = max(t_rollout - sim_wall_s - inference_s, 0.0)
+
+        # ---- Train breakdown ----------------------------------------
+        tp = train_phase_t or {}
+        gae_s = tp.get("gae", 0.0)
+        norm_train_s = tp.get("normalize", 0.0)
+        train_h2d_s = tp.get("h2d", 0.0)
+        train_loop_s = tp.get("train_loop", 0.0)
+        fwd_gpu_s = tp.get("forward_seq", 0.0)
+        bwd_gpu_s = tp.get("backward_optim", 0.0)
+        train_loop_cpu_s = max(train_loop_s - fwd_gpu_s - bwd_gpu_s, 0.0)
+        train_named_s = gae_s + norm_train_s + train_h2d_s + train_loop_s
+        train_outer_s = max(t_train - train_named_s, 0.0)
+        train_misc_s = train_loop_cpu_s + train_outer_s
+
+        # ---- Dead-env-cell metric (informational) -------------------
+        # dones_arr[t, e] is True at the step where each env died (that
+        # step itself produced the final valid sample, so we shift by
+        # one and cumulative-OR to mark every step strictly AFTER the
+        # first death). With mid-rollout reactivation those cells would
+        # carry valid samples — so the count below is exactly the
+        # data-yield reactivation would recover.
+        dead_cells = 0
+        dead_fraction = 0.0
+        dead_wall_s = 0.0
+        if dones_arr is not None:
+            d = np.asarray(dones_arr, dtype=bool)
+            if d.size:
+                ever_done_before = np.zeros_like(d)
+                if d.shape[0] > 1:
+                    ever_done_before[1:] = np.cumsum(
+                        d[:-1].astype(np.uint8), axis=0,
+                    ) > 0
+                dead_cells = int(ever_done_before.sum())
+                dead_fraction = dead_cells / float(d.size)
+                # Wall-equivalent throughput cost. Intuition: rollout
+                # spent t_rollout producing data, but dead_fraction of
+                # the (T*N) cells got zero-fill. With reactivation those
+                # would carry samples, giving that fraction of rollout
+                # back as productive throughput.
+                dead_wall_s = float(t_rollout) * dead_fraction
+
+        # ---- Commit deltas ------------------------------------------
+        deltas = {
+            "rollout/sim/combat":        sim_combat_s,
+            "rollout/sim/intro":         sim_intro_s,
+            "rollout/sim/overhead":      sim_overhead_s,
+            "rollout/inference":         inference_s,
+            "rollout/misc":              rollout_misc_s,
+            "train/forward_gpu":         fwd_gpu_s,
+            "train/backward_optim_gpu": bwd_gpu_s,
+            "train/gae_cpu":             gae_s,
+            "train/normalize_cpu":       norm_train_s,
+            "train/h2d":                 train_h2d_s,
+            "train/misc":                train_misc_s,
+            "reset_blocking":            float(t_reset_blocking),
+            "between_epochs":            max(float(t_between), 0.0),
+        }
+        for k, v in deltas.items():
+            self.totals[k] += v
+        self.last = deltas
+        self.n_epochs += 1
+        self.active_env_steps += int(active_env_steps)
+        self.total_env_steps += int(total_env_steps)
+        self.dead_env_step_cells += dead_cells
+        self.cum_dead_wall_s += dead_wall_s
+        self.last_dead_cells = dead_cells
+        self.last_dead_fraction = dead_fraction
+        self.last_dead_wall_s = dead_wall_s
+
+        # ---- Resets (background, overlapped) ------------------------
+        for entry in reset_dts:
+            self.reset_count += 1
+            self.reset_wall_total_s += float(entry.get("wall_dt", 0.0))
+            for p in self.RESET_PHASES:
+                self.reset_phase_sums_ms[p] += float(entry.get(p, 0.0))
+            frames = entry.get("frames", {}) or {}
+            for p in self.RESET_PHASES:
+                self.reset_phase_frames[p] += float(frames.get(p, 0))
+            br = entry.get("branch", "unknown")
+            if br not in self.reset_branch_counts:
+                br = "unknown"
+            self.reset_branch_counts[br] += 1
+
+    def epoch_line(self):
+        """One-line summary of the most recent epoch's wallclock split."""
+        d = self.last
+        ep_total = sum(d.values())
+        ro = (d["rollout/sim/combat"] + d["rollout/sim/intro"]
+              + d["rollout/sim/overhead"] + d["rollout/inference"]
+              + d["rollout/misc"])
+        sim_real = d["rollout/sim/combat"] + d["rollout/sim/intro"]
+        cmb_pct = 100 * d["rollout/sim/combat"] / sim_real if sim_real > 0 else 0
+        tr = (d["train/forward_gpu"] + d["train/backward_optim_gpu"]
+              + d["train/gae_cpu"] + d["train/normalize_cpu"]
+              + d["train/h2d"] + d["train/misc"])
+        gpu = d["train/forward_gpu"] + d["train/backward_optim_gpu"]
+        gpu_pct = 100 * gpu / tr if tr > 0 else 0
+        return (
+            f"  time | wall {ep_total:.2f}s | rollout {ro:.2f}s "
+            f"[sim {sim_real:.2f}s (cmb {cmb_pct:.0f}%) "
+            f"oh {d['rollout/sim/overhead']*1000:.0f}ms "
+            f"inf {d['rollout/inference']*1000:.0f}ms "
+            f"py {d['rollout/misc']*1000:.0f}ms] "
+            f"| train {tr:.2f}s [gpu {gpu_pct:.0f}%] "
+            f"| reset_block {d['reset_blocking']*1000:.0f}ms "
+            f"| dead_envs {self.last_dead_fraction*100:.0f}% "
+            f"({self.last_dead_wall_s*1000:.0f}ms idle)"
+        )
+
+    def print_summary(self, label="cumulative"):
+        n = max(self.n_epochs, 1)
+        total = sum(self.totals.values())
+        if total <= 0:
+            return
+        ms = lambda v: 1000.0 * v / n
+        pct = lambda v: 100.0 * v / total
+        bar = "=" * 74
+        print()
+        print(bar)
+        print(f"  TIMING BREAKDOWN ({label}, {self.n_epochs} epochs, "
+              f"{total:.1f}s wall, {total/n:.2f}s/epoch avg)")
+        if self.total_env_steps:
+            util = 100 * self.active_env_steps / self.total_env_steps
+            print(f"  utilization: {self.active_env_steps}/{self.total_env_steps} "
+                  f"env-step cells with combat events ({util:.1f}%)")
+        print(bar)
+        print(f"  {'bucket':<32s} {'ms/epoch':>11s} {'%':>7s}")
+        print(f"  {'-'*32} {'-'*11} {'-'*7}")
+        label_for = {b[0]: b[2] for b in self.BUCKETS}
+        for group in ("rollout", "train", "other"):
+            keys = [k for k, g, _ in self.BUCKETS if g == group]
+            if group != "other":
+                gtotal = sum(self.totals[k] for k in keys)
+                print(f"  {group:<32s} {ms(gtotal):>9.1f} ms {pct(gtotal):>6.1f}%")
+                for k in keys:
+                    print(f"  {'  ' + label_for[k]:<32s} {ms(self.totals[k]):>9.1f} ms "
+                          f"{pct(self.totals[k]):>6.1f}%")
+            else:
+                for k in keys:
+                    print(f"  {label_for[k]:<32s} {ms(self.totals[k]):>9.1f} ms "
+                          f"{pct(self.totals[k]):>6.1f}%")
+        print(f"  {'-'*32} {'-'*11} {'-'*7}")
+        print(f"  {'TOTAL':<32s} {ms(total):>9.1f} ms {100.0:>6.1f}%")
+        # ---- Dead-env-cell informational ----------------------------
+        # Quantifies the throughput cost of NOT reactivating env slots
+        # mid-rollout. The wall is real work (alive envs were stepping);
+        # what's wasted is the slot's data-yield. Express as both raw
+        # cells and wallclock-equivalent so it's directly comparable to
+        # the buckets above.
+        if self.total_env_steps:
+            dead_pct = 100.0 * self.dead_env_step_cells / self.total_env_steps
+            avg_dead_wall_ms = 1000.0 * self.cum_dead_wall_s / n
+            print()
+            print(f"  dead-env idle (cost of no mid-rollout reactivation):")
+            print(f"    {self.dead_env_step_cells}/{self.total_env_steps} cells "
+                  f"({dead_pct:.1f}% of T*N) sat idle post-death")
+            print(f"    {avg_dead_wall_ms:.0f} ms/epoch wallclock-equivalent "
+                  f"({pct(self.cum_dead_wall_s):.1f}% of total wall)")
+        # ---- Resets (overlapped, NOT in the 100%) -------------------
+        if self.reset_count > 0:
+            avg_ms = 1000.0 * self.reset_wall_total_s / self.reset_count
+            sum_per_epoch_ms = 1000.0 * self.reset_wall_total_s / n
+            sum_pct = pct(self.reset_wall_total_s)
+            bc = self.reset_branch_counts
+            print()
+            print(f"  resets (background, overlapped — NOT in 100% above):")
+            print(f"    {self.reset_count} resets ({self.reset_count/n:.2f}/epoch), "
+                  f"avg {avg_ms:.0f}ms each, sum {sum_per_epoch_ms:.0f}ms/epoch "
+                  f"({sum_pct:.1f}% of total wall if serial)")
+            print(f"    branches    workshop={bc['workshop']} "
+                  f"natural_end={bc['natural_end']} unknown={bc['unknown']}")
+            phase_total = sum(self.reset_phase_sums_ms.values())
+            if phase_total > 0:
+                print(f"    phases (avg ms/reset, % of avg, frames, ms/f):")
+                phase_total_avg = phase_total / self.reset_count
+                for p in self.RESET_PHASES:
+                    ms_v = self.reset_phase_sums_ms[p] / self.reset_count
+                    f_v = self.reset_phase_frames[p] / self.reset_count
+                    ms_per_f = ms_v / f_v if f_v > 0 else 0.0
+                    p_pct = 100.0 * ms_v / phase_total_avg if phase_total_avg > 0 else 0.0
+                    print(f"      {p:<18s} {ms_v:7.1f} ms  ({p_pct:5.1f}%)  "
+                          f"{f_v:6.1f}f  {ms_per_f:5.1f}ms/f")
+        print(bar, flush=True)
+
+
 async def hard_restart_all(vec_env, mgr, env_boss, agent, graphical=False):
     """Synchronously kill and relaunch every HK instance, then reset to bosses.
 
@@ -200,6 +510,14 @@ async def train(config: Config):
         t_start = time.perf_counter()
         recent = deque(maxlen=20)
 
+        # Single global wallclock breakdown. One source of truth for
+        # "where does time go" — replaces the old timing|/collect|
+        # log lines. Always on.
+        tracker = TimingTracker()
+        # Cadence for printing the full breakdown table during a run.
+        # Per-epoch one-liner is always printed via tracker.epoch_line().
+        TIMING_FULL_EVERY = 25
+
         # Slow-step bookkeeping: any per-env step whose wall time exceeds
         # `slow_step_threshold_s` is counted against the (env, boss) pair it
         # happened on. Lets us tell if slowness tracks a specific boss, a
@@ -227,8 +545,14 @@ async def train(config: Config):
         env_steps_collected = start_env_steps
         last_save_step = start_env_steps
         epoch = -1  # local counter purely for logging
+        # Wallclock-anchor for between_epochs bucket: the time spent on
+        # logging/saving/resume/control-flow that lives outside t_rollout
+        # and t_train. Updated at the end of each epoch (right after
+        # tracker.record_epoch).
+        t_prev_epoch_end = time.perf_counter()
         while env_steps_collected < config.total_env_steps:
             epoch += 1
+            t_epoch_top = time.perf_counter()
 
             # Reap any background resets that have completed since we kicked
             # them off at the end of the prior epoch. Splice new obs into
@@ -237,9 +561,13 @@ async def train(config: Config):
             # If nothing is active but resets are in flight (common with small
             # n_envs after a death-triggered reset), block until at least one
             # reset finishes — otherwise the rollout loop crashes on an empty
-            # batch.
+            # batch. Time the block separately: reset cost that COULDN'T
+            # overlap with rollout/train.
+            t_reset_block = 0.0
             if not reaped and not active_envs and vec_env._reset_tasks:
+                _t_rb = time.perf_counter()
                 reaped = await vec_env.await_all_resets()
+                t_reset_block = time.perf_counter() - _t_rb
             if reaped:
                 reaped_indices = [env_i for env_i, _ in reaped]
                 reaped_obs_batch = vec_env._batch_observations(
@@ -272,6 +600,12 @@ async def train(config: Config):
             buf_step_game_times = []
             buf_step_real_times = []
             buf_step_wall_times = []
+            # step_all wallclock per step — bounds sim_wall in the
+            # TimingTracker. step_wall_per_env (above) is per-env from C#'s
+            # _timed_op; this is the perf_counter wrap around the whole
+            # asyncio.gather(step_all). Sum_t(buf_step_all_wall) ≈ total
+            # time the rollout spent inside step_all.
+            buf_step_all_wall = []
             # Leak probes from C#. Each is (T, N_active).
             buf_diag_enemy = []
             buf_diag_attack = []
@@ -309,6 +643,7 @@ async def train(config: Config):
                     action_vecs, active_indices=active_envs
                 )
                 wall_dt = time.perf_counter() - t_step
+                buf_step_all_wall.append(wall_dt)
 
                 buf_obs.append(obs)
                 for k in buf_actions:
@@ -618,25 +953,68 @@ async def train(config: Config):
             torch.cuda.synchronize()
             t_train = time.perf_counter() - t0
 
-            t_total = t_rollout + t_train
-            pct = lambda t: 100 * t / t_total if t_total > 0 else 0
+            # Inference-timing locals — still consumed by wandb below.
+            # The console "timing|" / "collect|" lines are gone; the
+            # TimingTracker owns wallclock display now.
             inf = inf_timing or {}
             t_fwd = inf.get('forward_s', 0)
             t_norm = inf.get('normalize_s', 0)
             t_prep = inf.get('tensor_prep_s', 0)
             t_h2d = inf.get('h2d_s', 0)
             t_d2h = inf.get('d2h_s', 0)
-            t_collect = t_norm + t_prep + t_h2d + t_fwd + t_d2h
-            t_hk = t_rollout - t_collect
-            print(
-                f"  timing | rollout {t_rollout:.2f}s | "
-                f"hk {t_hk:.2f}s | collect {t_collect:.2f}s | "
-                f"train {t_train:.2f}s | total {t_total:.2f}s"
+
+            # Combat / intro per-step mask. The boss FSM keeps its colliders
+            # disabled through the GG transition + intro animation, so
+            # HitboxObserver emits nothing combat until the FSM flips them
+            # on. We detect "boss awake" per env as the first step with an
+            # enemy-flagged combat hitbox (combat feature col GIVES_DAMAGE
+            # — set only for HitboxType.Enemy at HitboxObserver.cs:691, so
+            # the knight's own attack swing doesn't falsely declare the
+            # boss awake). The mask drives sim/combat vs sim/intro inside
+            # TimingTracker.
+            IDX_GIVES_DAMAGE = 5
+            if real_time_arr.shape[0] > 0:
+                has_hb_arr = np.stack([
+                    ((o.combat_mask > 0) &
+                     (o.combat_hb[..., IDX_GIVES_DAMAGE] > 0.5)).any(axis=-1)
+                    for o in buf_obs
+                ])
+                T_hb = has_hb_arr.shape[0]
+                first_awake = np.where(
+                    has_hb_arr.any(axis=0),
+                    has_hb_arr.argmax(axis=0),
+                    T_hb,
+                )
+                step_idx = np.arange(T_hb)[:, None]
+                combat_per_step = (step_idx >= first_awake[None, :])
+            else:
+                combat_per_step = np.zeros_like(real_time_arr, dtype=bool)
+
+            # Single global timing record. Replaces the old
+            # timing|/collect| bookkeeping. Buckets sum to 100% of epoch
+            # wallclock; the dead-env-cell informational line measures
+            # the throughput cost of NOT reactivating env slots
+            # mid-rollout. Resets are tracked separately because they
+            # overlap with rollout/train.
+            t_now = time.perf_counter()
+            t_between = max(t_epoch_top - t_prev_epoch_end, 0.0)
+            tracker.record_epoch(
+                t_rollout=t_rollout, t_train=t_train,
+                t_reset_blocking=t_reset_block, t_between=t_between,
+                sim_wall_per_step=np.array(buf_step_all_wall, dtype=np.float32),
+                real_time_arr=real_time_arr,
+                combat_per_step=combat_per_step, valid_arr=valid_arr,
+                dones_arr=dones_arr,
+                inference_timing=inf_timing,
+                train_phase_t=metrics.get("train_phase_t", {}),
+                reset_dts=vec_env.pop_reset_dts(),
+                active_env_steps=active_steps,
+                total_env_steps=int(config.rollout_len * config.n_envs),
             )
-            print(
-                f"  collect | norm {t_norm*1000:.0f}ms | prep {t_prep*1000:.0f}ms | "
-                f"h2d {t_h2d*1000:.0f}ms | fwd {t_fwd*1000:.0f}ms | d2h {t_d2h*1000:.0f}ms"
-            )
+            t_prev_epoch_end = t_now
+            print(tracker.epoch_line(), flush=True)
+            if (epoch + 1) % TIMING_FULL_EVERY == 0:
+                tracker.print_summary("cumulative")
 
             # Step-based linear LR annealing. Progress is measured in
             # env-steps collected (not epochs), so variable rollout sizes
@@ -828,6 +1206,7 @@ async def train(config: Config):
             print(f"pct_samples_trained: {100 * avg['pass_frac']:.1f}")
             print(f"epochs_completed:    {epoch + 1}")
             print(f"training_seconds:    {elapsed:.1f}")
+            tracker.print_summary("final")
 
         agent.save_checkpoint(
             f"{config.save_path}_final.pth", vocab=vec_env.vocab,
