@@ -104,7 +104,10 @@ class InstanceManager:
             print(f"Failed to delete instance {name}: {e}")
             return False
 
-    def start_instance(self, name, graphical=False):
+    def start_instance(self, name, graphical=False, env=None):
+        """Launch an HK instance. `env` is an optional dict of env vars to
+        merge into the subprocess environment — used by train.py to pass
+        FK_FAKE_RESET_PROB through to the C# mod's Setup() reader."""
         if not self._instance_exists(name):
             return False
         try:
@@ -132,7 +135,12 @@ class InstanceManager:
                     "-screen-fullscreen", "0",
                     "-nolog",
                 ]
-            proc = subprocess.Popen(cmd)
+            popen_env = None
+            if env:
+                import os
+                popen_env = os.environ.copy()
+                popen_env.update({k: str(v) for k, v in env.items()})
+            proc = subprocess.Popen(cmd, env=popen_env)
             self._procs.append(proc)
             return True
         except Exception as e:
@@ -166,10 +174,10 @@ class InstanceManager:
         if os.path.exists(self._steam_api_bak):
             os.rename(self._steam_api_bak, self._steam_api)
 
-    def start_all(self, graphical=False):
+    def start_all(self, graphical=False, env=None):
         self._disable_steam_api()
         for name in self.instances:
-            self.start_instance(name, graphical=graphical)
+            self.start_instance(name, graphical=graphical, env=env)
 
     def stop_all(self):
         # Kill via Popen handles first — authoritative and avoids the slow

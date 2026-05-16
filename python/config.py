@@ -95,6 +95,24 @@ class Config:
     # the penalty for having taken that damage. Creates dodge > heal > tank ordering.
     heal_coef: float = 0.65
 
+    # Fake-reset (boss-rotation throttling). With this enabled, the C# damage
+    # hooks intercept lethal hits with probability fake_reset_prob, clamp them
+    # to leave 1 HP, then restore both knight and boss HPs to max. The
+    # resulting "fake death" is reported to Python with info="fake_reset"; the
+    # next reset takes a fast-path (no scene load) as long as Python sends the
+    # same level back. boss_rotation_period controls cluster length: stays on
+    # the same boss for N episodes (N-1 fake resets + 1 real on rotation).
+    # Set fake_reset_prob=0 to disable entirely; set boss_rotation_period=1 to
+    # re-roll the boss every death (forces real resets when prob>0 since the
+    # scene mismatch in C# Reset() falls through to the full-load path).
+    # FK_FAKE_RESET_PROB env var is set by train.py from this value.
+    # Disabled by default; opt in by setting fake_reset_prob > 0 AND
+    # boss_rotation_period > 1. period=1 re-rolls every death (matches
+    # pre-fake-reset behavior even when prob>0, since the C# scene-match
+    # guard falls through to a full reset on rotation).
+    fake_reset_prob: float = 0.0
+    boss_rotation_period: int = 1
+
 
     # PPO
     lr: float = 3e-4
@@ -149,6 +167,14 @@ class Config:
 
     # Debug
     visualize: bool = False
+    # Persist env 0's boss FSM transition graph + state-change history to
+    # state_graphs/latest.json each epoch so graph_viewer.py can render it
+    # offline. Observation-only — never enters the model input. Set False
+    # to skip the per-epoch JSON write entirely (no parsing, no I/O).
+    save_fsm_graph: bool = True
+    # When True, fsm_tracker logs every state transition it ingests. Verbose;
+    # leave False unless debugging the tracker itself.
+    debug_transitions: bool = False
 
     @classmethod
     def from_cli(cls) -> "Config":

@@ -417,8 +417,12 @@ async def hard_restart_all(vec_env, mgr, env_boss, agent, graphical=False):
         ev.clear()
 
     # Relaunch processes; _disable_steam_api is idempotent (no-op second time).
+    # Re-pass FK_FAKE_RESET_PROB so the new C# processes pick it up too.
     print(f"  hard-restart | relaunching {n} HK instances...")
-    mgr.start_all(graphical=graphical)
+    hk_env_vars = {
+        "FK_FAKE_RESET_PROB": f"{float(vec_env.config.fake_reset_prob):.6f}",
+    }
+    mgr.start_all(graphical=graphical, env=hk_env_vars)
 
     # Wait for all to reconnect via the existing _on_connect handler.
     await asyncio.gather(*[ev.wait() for ev in vec_env.connected])
@@ -442,13 +446,28 @@ async def train(config: Config):
     if config.visualize:
         from visualizer import Visualizer
         vis = Visualizer()  # vocab attached after vec_env init
-    # Launch game instances
+
+    # FSM tracker: pure-data, observation-only. Ingests env 0's FSM snapshot
+    # list each rollout step and dumps state_graphs/latest.json each epoch
+    # for offline inspection via graph_viewer.py. Never feeds the model.
+    fsm_tracker = None
+    if config.save_fsm_graph:
+        from fsm_tracker import FsmTracker
+        fsm_tracker = FsmTracker()
+    # Launch game instances. FK_FAKE_RESET_PROB is read by C# Setup() and
+    # gates the damage-hook clamping that produces fake_reset episode ends.
+    # boss_rotation_period is purely Python-side (this file).
+    hk_env_vars = {
+        "FK_FAKE_RESET_PROB": f"{float(config.fake_reset_prob):.6f}",
+    }
     mgr = None
     if config.hk_path and os.path.exists(config.hk_path):
-        print(f"Spawning {config.n_envs} HK instance(s)...")
+        print(f"Spawning {config.n_envs} HK instance(s)... "
+              f"(fake_reset_prob={config.fake_reset_prob}, "
+              f"boss_rotation_period={config.boss_rotation_period})")
         mgr = InstanceManager(config.hk_path, config.hk_data_dir)
         mgr.spawn_n(config.n_envs)
-        mgr.start_all(graphical=(config.n_envs == 1))
+        mgr.start_all(graphical=(config.n_envs == 1), env=hk_env_vars)
     else:
         print(f"hk_path not found ({config.hk_path}) — launch Hollow Knight manually.")
 
@@ -486,6 +505,11 @@ async def train(config: Config):
         } for b in bosses}
         rng = np.random.default_rng(config.seed or None)
         env_boss = [bosses[int(rng.integers(len(bosses)))] for _ in range(config.n_envs)]
+        # Per-env episode counter for boss-rotation throttling. Increments on
+        # every death; rolls over to 0 (and re-rolls env_boss[i]) when it hits
+        # config.boss_rotation_period. With period=10 and fake_reset_prob=1.0,
+        # each env runs ~9 fake resets per real reset against the same boss.
+        env_episode_count = [0] * config.n_envs
         print(f"Boss pool: {bosses}")
         print(f"Initial env_boss: {env_boss}")
 
@@ -531,13 +555,14 @@ async def train(config: Config):
         agent.reset_hidden(config.n_envs)
         active_envs = list(range(config.n_envs))
 
-        # Staggered reset: every `steps_per_reset` accumulated env-steps,
-        # schedule a reset for `envs_per_reset` envs round-robin. Resets run
-        # as background tasks overlapping the next rollout; scheduled envs sit
-        # out of the active set until their reset completes.
+        # Staggered rotation: every `steps_per_reset` accumulated env-steps,
+        # round-robin-mark `envs_per_reset` envs for boss rotation. Marked envs
+        # keep fighting until they die naturally; the death-triggered reset
+        # then force-rolls them onto a new boss. No mid-fight scene-load.
         envs_per_reset = max(1, config.n_envs // config.envs_per_reset_div)
         steps_since_last_reset = 0
-        next_reset_env = 0  # round-robin cursor, advances only when scheduling
+        next_reset_env = 0  # round-robin cursor, advances only when marking
+        pending_rotation: set = set()  # envs marked for cadence rotation on next death
 
         # Step-driven training: total_env_steps bounds the run, save cadence
         # and LR annealing are both keyed on env_steps_collected (not epoch
@@ -618,34 +643,131 @@ async def train(config: Config):
             # Slice the active-env view out of obs_full for the first step.
             obs = slice_obs(obs_full, active_envs)
 
+            # Per-step active subset: starts as `active_envs`, shrinks as each
+            # env dies. Once we kick off a reset for env i mid-rollout, that
+            # env's WebSocket is busy with the reset coroutine — calling
+            # step_all on it would race the in-flight recv. So we drop dying
+            # envs from rollout_active and step only the survivors. Buffer
+            # rows for already-dead envs are zero-filled by `_scat` below;
+            # PPO's valid_arr latch masks them out at training time.
+            rollout_active = list(active_envs)
+            n_active_local_for = {env_i: li for li, env_i in enumerate(active_envs)}
+            done_in_rollout = set()
+            mid_rollout_reset_indices = set()  # envs whose resets we kicked off mid-loop
+
             for t in range(config.rollout_len):
-                buf_hx.append(agent.get_hx_snapshot(env_indices=active_envs))
-                (actions_np, log_probs, log_probs_action,
-                 values_atk, values_def) = agent.collect_action(
-                    obs, env_indices=active_envs
+                sub_local = [n_active_local_for[ei] for ei in rollout_active]
+                N_sub = len(rollout_active)
+
+                buf_hx_sub = agent.get_hx_snapshot(env_indices=rollout_active)
+                obs_sub = slice_obs(obs, sub_local) if N_sub < N_active else obs
+                (actions_np_sub, log_probs_sub, log_probs_action_sub,
+                 values_atk_sub, values_def_sub) = agent.collect_action(
+                    obs_sub, env_indices=rollout_active
                 )
 
                 action_vecs = [
                     [
-                        int(actions_np["movement"][i]),
-                        int(actions_np["direction"][i]),
-                        int(actions_np["action"][i]),
-                        int(actions_np["jump"][i]),
+                        int(actions_np_sub["movement"][i]),
+                        int(actions_np_sub["direction"][i]),
+                        int(actions_np_sub["action"][i]),
+                        int(actions_np_sub["jump"][i]),
                     ]
-                    for i in range(N_active)
+                    for i in range(N_sub)
                 ]
 
                 t_step = time.perf_counter()
-                (next_obs, damage_landed, hits_taken, hp_healed, done_flags,
-                 committed_flags,
-                 step_game_times, step_real_times,
-                 step_wall_per_env, diag) = await vec_env.step_all(
-                    action_vecs, active_indices=active_envs
+                (next_obs_sub, damage_landed_sub, hits_taken_sub, hp_healed_sub,
+                 done_flags_sub, committed_flags_sub,
+                 step_game_times_sub, step_real_times_sub,
+                 step_wall_per_env_sub, diag_sub) = await vec_env.step_all(
+                    action_vecs, active_indices=rollout_active
                 )
                 wall_dt = time.perf_counter() - t_step
                 buf_step_all_wall.append(wall_dt)
 
-                buf_obs.append(obs)
+                # Scatter sub-arrays back to N_active width so buffers stack
+                # cleanly later. Already-dead envs get zeros.
+                def _scat(sub, dtype):
+                    full = np.zeros(N_active, dtype=dtype)
+                    if N_sub:
+                        full[sub_local] = sub
+                    return full
+
+                actions_np = {k: _scat(actions_np_sub[k], np.int64)
+                              for k in actions_np_sub}
+                log_probs = _scat(log_probs_sub, np.float32)
+                log_probs_action = _scat(log_probs_action_sub, np.float32)
+                values_atk = _scat(values_atk_sub, np.float32)
+                values_def = _scat(values_def_sub, np.float32)
+                damage_landed = _scat(damage_landed_sub, np.float32)
+                hits_taken = _scat(hits_taken_sub, np.float32)
+                hp_healed = _scat(hp_healed_sub, np.float32)
+                done_flags = _scat(done_flags_sub, bool)
+                committed_flags = _scat(committed_flags_sub, bool)
+                step_game_times = _scat(step_game_times_sub, np.float32)
+                step_real_times = _scat(step_real_times_sub, np.float32)
+                step_wall_per_env = _scat(step_wall_per_env_sub, np.float32)
+                diag = {k: _scat(diag_sub[k], np.float32) for k in diag_sub}
+                buf_hx_full = np.zeros((N_active,) + buf_hx_sub.shape[1:],
+                                       dtype=buf_hx_sub.dtype)
+                if N_sub:
+                    buf_hx_full[sub_local] = buf_hx_sub
+
+                # Episode-end + mid-rollout reset kickoff. Firing the reset
+                # here (instead of after the rollout) lets its wallclock
+                # overlap with continued stepping of other live envs and the
+                # train block.
+                just_died = []
+                for sub_li, was_done in enumerate(done_flags_sub):
+                    if not was_done:
+                        continue
+                    env_i = rollout_active[sub_li]
+                    if env_i in done_in_rollout:
+                        continue
+                    done_in_rollout.add(env_i)
+                    just_died.append(env_i)
+
+                if just_died:
+                    # Boss-rotation throttling: each env stays on its current
+                    # boss for boss_rotation_period episodes, then rotates to
+                    # a new randomly-chosen boss. Within a cluster the same
+                    # level is sent back so C# Reset() takes the fake-reset
+                    # fast-path (no scene load) when fake_reset_prob>0.
+                    # Cadence-marked envs (pending_rotation) force-rotate now
+                    # regardless of period — this is the deferred half of the
+                    # step-budget rotation policy.
+                    rot = max(1, int(config.boss_rotation_period))
+                    new_levels = []
+                    for env_i in just_died:
+                        env_episode_count[env_i] += 1
+                        force_rotate = env_i in pending_rotation
+                        if force_rotate:
+                            pending_rotation.discard(env_i)
+                        if force_rotate or env_episode_count[env_i] >= rot:
+                            env_episode_count[env_i] = 0
+                            env_boss[env_i] = bosses[int(rng.integers(len(bosses)))]
+                        new_levels.append(env_boss[env_i])
+                    await vec_env.start_resets(
+                        just_died, levels=new_levels, resume_indices=[]
+                    )
+                    mid_rollout_reset_indices.update(just_died)
+                    rollout_active = [ei for ei in rollout_active
+                                      if ei not in done_in_rollout]
+
+                # Append PRE-step obs / hx (matches the action that was
+                # taken) before mutating obs from the step result. Copy to
+                # defend against merge_obs_padded mutating shared arrays.
+                buf_obs.append(obs.replace(
+                    combat_hb=obs.combat_hb.copy(),
+                    combat_mask=obs.combat_mask.copy(),
+                    combat_kind_ids=obs.combat_kind_ids.copy(),
+                    combat_parent_ids=obs.combat_parent_ids.copy(),
+                    terrain_hb=obs.terrain_hb.copy(),
+                    terrain_mask=obs.terrain_mask.copy(),
+                    global_state=obs.global_state.copy(),
+                ))
+                buf_hx.append(buf_hx_full)
                 for k in buf_actions:
                     buf_actions[k].append(actions_np[k])
                 buf_log_probs.append(log_probs)
@@ -666,15 +788,78 @@ async def train(config: Config):
                 buf_diag_kind_cache.append(diag["kind_cache_size"])
                 buf_diag_gc_heap.append(diag["gc_heap_mb"])
 
-                obs = next_obs
+                # Update full obs from sub-result. Rows for already-dead
+                # envs keep their pre-death state — fine, the valid_arr
+                # latch masks them out of training.
+                obs = merge_obs_padded(obs, next_obs_sub, sub_local) if N_sub else obs
 
                 if vis is not None:
                     vis.update(obs)
 
+                # Feed every env's FSM snapshot into the shared tracker.
+                # Per-env episode state is namespaced by env_id inside
+                # FsmTracker; the transition graph / junctions /
+                # fingerprints accumulate across all envs for N× faster
+                # network discovery. Pure side-effect: never touches
+                # obs / actions / rewards / model.
+                if fsm_tracker is not None:
+                    for env_i, env in enumerate(vec_env.envs):
+                        if env is None:
+                            continue
+                        fsm_tracker.update(env.last_fsm, env_id=env_i)
+
+                # All rollout-active envs have died. Instead of leaving the
+                # remaining rollout steps blank, block until at least one
+                # in-flight reset completes and splice the env back in. Keeps
+                # collection running for the full config.rollout_len even
+                # when n_envs is small and deaths cluster.
+                while not rollout_active and t < config.rollout_len - 1:
+                    pending_active = [
+                        task for ei, task in vec_env._reset_tasks.items()
+                        if ei in active_set
+                    ]
+                    if not pending_active:
+                        # Shouldn't happen — every dead env had a reset queued.
+                        break
+                    await asyncio.wait(
+                        pending_active,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    reaped = vec_env.reap_completed_resets(only=active_set)
+                    epoch_reset_dts_inflight = vec_env.pop_reset_dts()
+                    if not reaped:
+                        continue
+                    rj_indices = [ei for ei, _ in reaped]
+                    rj_obs_batch = vec_env._batch_observations(
+                        [raw for _, raw in reaped]
+                    )
+                    rj_sub_local = [n_active_local_for[ei] for ei in rj_indices]
+                    obs = merge_obs_padded(obs, rj_obs_batch, rj_sub_local)
+                    agent.reset_hidden_for(rj_indices)
+                    for ei in rj_indices:
+                        done_in_rollout.discard(ei)
+                        mid_rollout_reset_indices.discard(ei)
+                    rollout_active = sorted(set(rollout_active) | set(rj_indices))
+
             # Bootstrap final values
-            _, _, _, final_vatk, final_vdef = agent.collect_action(
-                obs, env_indices=active_envs
-            )
+            final_indices = rollout_active if rollout_active else active_envs
+            if rollout_active:
+                final_sub_local = [n_active_local_for[ei] for ei in rollout_active]
+                final_obs_sub = slice_obs(obs, final_sub_local) if len(rollout_active) < N_active else obs
+                _, _, _, final_vatk_sub, final_vdef_sub = agent.collect_action(
+                    final_obs_sub, env_indices=rollout_active
+                )
+                def _scat_final(sub):
+                    full = np.zeros(N_active, dtype=np.float32)
+                    full[final_sub_local] = sub
+                    return full
+                final_vatk = _scat_final(final_vatk_sub)
+                final_vdef = _scat_final(final_vdef_sub)
+            else:
+                # Edge case: every env died and stall couldn't recover.
+                # Bootstrap to zero — GAE treats this as terminal everywhere.
+                final_vatk = np.zeros(N_active, dtype=np.float32)
+                final_vdef = np.zeros(N_active, dtype=np.float32)
             buf_values_atk.append(final_vatk)
             buf_values_def.append(final_vdef)
 
@@ -810,27 +995,33 @@ async def train(config: Config):
                         f"env{env_i}({boss.replace('GG_', '')}):{cnt}×max{per_env_max[local_i]:.1f}s"
                     )
             slow_str = " ".join(slow_events_epoch) if slow_events_epoch else "none"
-            # Step-driven reset scheduling: accumulate env-steps collected this
-            # epoch, fire a reset batch each time we cross `steps_per_reset`.
-            # Cadence is independent of rollout wall time, so the offline pool
-            # stays bounded even when rollout << reset.
+            # Step-driven rotation scheduling: accumulate env-steps collected
+            # this epoch, mark `envs_per_reset` envs for rotation each time we
+            # cross `steps_per_reset`. Marked envs keep fighting until they die
+            # naturally; the death-triggered reset then force-rolls a new boss
+            # (see the pending_rotation check in the just_died handler above).
+            # No mid-fight scene-load — the cadence drives WHICH envs rotate,
+            # not WHEN they reset.
             steps_since_last_reset += total_steps_epoch
-            reset_indices = []
+            newly_marked = []
             while steps_since_last_reset >= config.steps_per_reset:
                 steps_since_last_reset -= config.steps_per_reset
+                # Advance the round-robin cursor until we find an env that
+                # isn't already marked. Bound the search so a fully-marked
+                # pool doesn't loop forever.
                 for _ in range(envs_per_reset):
-                    reset_indices.append(next_reset_env)
+                    tries = 0
+                    while next_reset_env in pending_rotation:
+                        next_reset_env = (next_reset_env + 1) % config.n_envs
+                        tries += 1
+                        if tries >= config.n_envs:
+                            break
+                    if next_reset_env in pending_rotation:
+                        break  # every env is already pending; nothing to mark
+                    pending_rotation.add(next_reset_env)
+                    newly_marked.append(next_reset_env)
                     next_reset_env = (next_reset_env + 1) % config.n_envs
-
-            # Death-triggered resets: any env that emitted done=true during
-            # this rollout needs to be reset now, not when the step-budget
-            # counter gets around to it. HK has already started transitioning
-            # back to GG_Workshop; Reset() waits for that before dreaming in.
-            done_local = np.where(dones_arr.any(axis=0))[0]
-            for local_i in done_local:
-                env_i = active_envs[int(local_i)]
-                if env_i not in reset_indices:
-                    reset_indices.append(env_i)
+            died_in_rollout = sorted(list(mid_rollout_reset_indices))
             print(
                 f"  diag | active_envs {N_active}/{config.n_envs} | "
                 f"active_steps {active_steps}/{total_steps_epoch} "
@@ -838,7 +1029,8 @@ async def train(config: Config):
                 f"first_event {first_event_steps} | "
                 f"step0 {step0_ms:.0f}ms | avg_step {avg_wall_ms:.1f}ms | "
                 f"reset_budget {steps_since_last_reset}/{config.steps_per_reset} | "
-                f"reset_envs {reset_indices}"
+                f"died {died_in_rollout} marked {newly_marked} "
+                f"pending {sorted(pending_rotation)}"
             )
             print(
                 f"  perf | spread P50/P90/P99/max "
@@ -922,10 +1114,14 @@ async def train(config: Config):
 
             D_per_env = np.array([boss_state[b]["D"] for b in active_boss], dtype=np.float32)
 
-            # Pause game during training. Only pause active envs — resetting
-            # envs are mid-scene-load and must not be paused.
+            # Pause game during training. Only pause active envs whose
+            # websocket isn't currently parked in a mid-rollout reset's
+            # recv() — pausing them would race the reset coroutine and
+            # trigger websockets.ConcurrencyError. Mirrors the resume
+            # filter below.
             await asyncio.gather(*[
                 vec_env.envs[i].pause() for i in active_envs
+                if i not in mid_rollout_reset_indices
             ])
 
             t_rollout = time.perf_counter() - t_rollout_start
@@ -934,14 +1130,23 @@ async def train(config: Config):
             inf_timing = agent.report_timing()
 
             # Mask post-death filler from training. Once an env reports done
-            # mid-rollout, every subsequent step is a frozen all-zeros obs
-            # (TrainingEnv.cs:209-224) until the end-of-epoch reset. The death
-            # step itself is valid — it carries the real terminal transition.
-            prev_dones = np.concatenate(
-                [np.zeros((1, dones_arr.shape[1]), dtype=bool), dones_arr[:-1]],
+            # mid-rollout it stops being stepped and every subsequent row is
+            # a _scat zero-fill (dones=False, actions=0, log_probs=0, obs=
+            # pre-death state). We need a LATCH: valid=False from the step
+            # after the first done onward. The death step itself is valid
+            # — it carries the real terminal transition. (A plain ~prev_dones
+            # would only mask the single step right after death; subsequent
+            # zero-fill rows would come back as valid=True with old_lp=0 and
+            # new_lp≈-2e4, driving K3 KL through the roof.) Reactivated rows
+            # after a mid-rollout reset are also masked — by design; the
+            # reactivation is for next-epoch readiness, not within-rollout
+            # training data.
+            done_so_far = np.maximum.accumulate(dones_arr, axis=0)
+            prev_done_latched = np.concatenate(
+                [np.zeros((1, done_so_far.shape[1]), dtype=bool), done_so_far[:-1]],
                 axis=0,
             )
-            valid_arr = ~prev_dones  # (T, N_active)
+            valid_arr = ~prev_done_latched  # (T, N_active)
 
             t0 = time.perf_counter()
             metrics = agent.train_on_rollout(
@@ -1016,6 +1221,18 @@ async def train(config: Config):
             if (epoch + 1) % TIMING_FULL_EVERY == 0:
                 tracker.print_summary("cumulative")
 
+            # Persist the FSM transition graph for offline inspection via
+            # graph_viewer.py. Best-effort — serialization issues must never
+            # crash training (observation-only feature).
+            if fsm_tracker is not None and config.save_fsm_graph:
+                try:
+                    fsm_tracker.save_graph_state(
+                        os.path.join("state_graphs", "latest.json"),
+                        epoch=epoch,
+                    )
+                except Exception as exc:
+                    print(f"[graph-save] failed: {exc}", flush=True)
+
             # Step-based linear LR annealing. Progress is measured in
             # env-steps collected (not epochs), so variable rollout sizes
             # and dropped-env epochs decay LR at the same rate per unit work.
@@ -1024,20 +1241,17 @@ async def train(config: Config):
                 progress = min(1.0, env_steps_collected / config.total_env_steps)
                 agent.set_lr(config.lr * (1.0 - progress))
 
-            # Staggered reset: kick off resets for a subset of envs as
-            # background tasks, resume everyone else synchronously, and drop
-            # the reset envs from active_envs so the next rollout skips them.
-            # Only schedule envs that are actually currently active — an env
-            # still mid-reset from a prior epoch cannot be reset again.
-            reset_indices = [i for i in reset_indices if i in active_set]
-            new_bosses = [bosses[int(rng.integers(len(bosses)))] for _ in reset_indices]
-            for env_i, b in zip(reset_indices, new_bosses):
-                env_boss[env_i] = b
-            resume_indices = [i for i in active_envs if i not in set(reset_indices)]
+            # Cadence rotation is deferred to the next natural death (see
+            # the pending_rotation handoff in the just_died block); no envs
+            # are reset here. Mid-rollout dead envs already had their resets
+            # kicked off inside the rollout loop. We just resume all still-
+            # alive active envs so they can run the next rollout.
+            drop_from_active = set(mid_rollout_reset_indices)
+            resume_indices = [i for i in active_envs if i not in drop_from_active]
             await vec_env.start_resets(
-                reset_indices, levels=new_bosses, resume_indices=resume_indices
+                [], levels=[], resume_indices=resume_indices
             )
-            active_envs = [i for i in active_envs if i not in set(reset_indices)]
+            active_envs = [i for i in active_envs if i not in drop_from_active]
 
             # Logging — per-env curriculum reward uses per-env D.
             heal_coef = config.heal_coef

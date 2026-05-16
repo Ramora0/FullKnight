@@ -155,6 +155,42 @@ def pop_last_reset_phases():
     return out
 
 
+# Side channel: last FSM-snapshot list pulled off the wire. Populated by
+# unpack_step / unpack_reset, drained by HKEnv into self.last_fsm so the
+# fsm_tracker / visualizer can consume it without inflating the main return
+# tuple. Each entry is "<src>|<owner>|<fsm>|<state>" — see C# FsmObserver.
+_last_fsm_snapshots: list = []
+
+def pop_last_fsm_snapshots():
+    """Return (and clear) the most-recently-received FSM snapshot list."""
+    global _last_fsm_snapshots
+    out = _last_fsm_snapshots
+    _last_fsm_snapshots = []
+    return out
+
+
+def _unpack_fsm_snapshots(data, offset):
+    """Read the FSM-snapshot trailer: u16 count, then per-entry u16 length +
+    UTF-8 bytes. Returns (list, new_offset). Defensive: if the buffer ends
+    before the trailer (older C# mod), returns empty list and unchanged offset.
+    """
+    out = []
+    if offset + 2 > len(data):
+        return out, offset
+    n = struct.unpack_from('<H', data, offset)[0]
+    offset += 2
+    for _ in range(n):
+        if offset + 2 > len(data):
+            return out, offset
+        ln = struct.unpack_from('<H', data, offset)[0]
+        offset += 2
+        if offset + ln > len(data):
+            return out, offset
+        out.append(bytes(data[offset:offset + ln]).decode('utf-8', errors='replace'))
+        offset += ln
+    return out, offset
+
+
 # Side channel: last diag tuple pulled off the wire. Populated by unpack_step,
 # read by vec_env so we don't balloon the main return tuple on every caller.
 _last_diag = {
@@ -191,6 +227,7 @@ def unpack_step(data):
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
     combat_parents, offset = unpack_kinds(data, offset, n_combat)
     _last_terrain_debug, offset = unpack_terrain_debug(data, offset, n_terrain)
+    global _last_fsm_snapshots
     # Diag trailer (14 bytes). Defensive: older C# mods don't send it.
     if offset + _DIAG_SIZE <= len(data):
         e, a, t, kc, heap_mb = struct.unpack_from(_DIAG_FMT, data, offset)
@@ -201,11 +238,15 @@ def unpack_step(data):
             "kind_cache_size": int(kc),
             "gc_heap_mb": float(heap_mb),
         }
+        offset += _DIAG_SIZE
     else:
         _last_diag = {
             "enemy_count": 0, "attack_count": 0, "terrain_count": 0,
             "kind_cache_size": 0, "gc_heap_mb": 0.0,
         }
+    # FSM-snapshot trailer (variable length). Defensive: older C# mods don't
+    # send it — returns empty list. Drained via pop_last_fsm_snapshots().
+    _last_fsm_snapshots, offset = _unpack_fsm_snapshots(data, offset)
     return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
             damage_landed, hits_taken, hp_healed, game_time, real_time, done,
             committed)
@@ -214,8 +255,9 @@ def unpack_reset(data):
     """Unpack a reset response.
     Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents).
     Phase trailer (if present) is stashed in _last_reset_phases — read it
-    via pop_last_reset_phases()."""
-    global _last_terrain_debug, _last_reset_phases
+    via pop_last_reset_phases(). FSM snapshots (if present) are stashed in
+    _last_fsm_snapshots — read via pop_last_fsm_snapshots()."""
+    global _last_terrain_debug, _last_reset_phases, _last_fsm_snapshots
     combat_hb, terrain_hb, gs, n_combat, offset = unpack_obs(data)
     n_terrain = terrain_hb.shape[0]
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
@@ -232,6 +274,10 @@ def unpack_reset(data):
             frame_counts[key] = int(fields[1 + i * 2 + 1])  # frames
         phases["frames"] = frame_counts
         _last_reset_phases = phases
+        offset += _RESET_PHASE_TRAILER_SIZE
     else:
         _last_reset_phases = {}
+    # FSM-snapshot trailer (variable length). Defensive: older C# mods don't
+    # send it — returns empty list.
+    _last_fsm_snapshots, offset = _unpack_fsm_snapshots(data, offset)
     return combat_hb, terrain_hb, gs, combat_kinds, combat_parents

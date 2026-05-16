@@ -25,6 +25,14 @@ namespace FullKnight.Net
 		// the underlying Collider2D so the Python viewer can explain ghost terrain
 		// boxes (disabled colliders, tilemap/composite interactions, etc.).
 		public List<string> terrain_debug;
+		// Debug-only: per-step snapshot of every PlayMakerFSM relevant to the
+		// fight. Each entry is "<src>|<owner>|<fsm_name>|<state_name>" where
+		// src is "B" (FSM in the boss subtree), "E" (FSM on a currently-
+		// active Enemy-class collider — catches in-flight projectiles whose
+		// pool reparented them out of the boss subtree), or "A" (FSM on a
+		// currently-active Attack-class collider — the knight's nail/spells).
+		// Populated by FsmObserver; routed to the Python visualizer / fsm_tracker.
+		public List<string> fsm_snapshots;
 		public float[] global_state;
 
 		// Reward / done

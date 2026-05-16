@@ -3,7 +3,7 @@ import numpy as np
 from binary_protocol import (
     pack_init, pack_reset, pack_action, pack_pause, pack_resume,
     unpack_reset, unpack_step, pop_last_terrain_debug, pop_last_diag,
-    pop_last_reset_phases, MSG_CLOSE,
+    pop_last_reset_phases, pop_last_fsm_snapshots, MSG_CLOSE,
 )
 import struct
 
@@ -36,6 +36,10 @@ class HKEnv:
         # Last-reset phase breakdown from the C# mod. Populated by reset()
         # and drained by VecEnv at reap time into the TimingTracker.
         self.last_reset_phases: dict = {}
+        # FSM-snapshot list from the most recent step/reset. List of
+        # "<src>|<owner>|<fsm>|<state>" strings produced by C# FsmObserver.
+        # Consumed by the visualizer / fsm_tracker, never by training.
+        self.last_fsm: list = []
 
     async def init(self):
         """Send init handshake and wait for ack."""
@@ -61,6 +65,7 @@ class HKEnv:
         result = unpack_reset(data)
         self.last_terrain_debug = pop_last_terrain_debug()
         self.last_reset_phases = pop_last_reset_phases()
+        self.last_fsm = pop_last_fsm_snapshots()
         return result
 
     async def step(self, action_vec):
@@ -83,6 +88,7 @@ class HKEnv:
          committed) = unpack_step(data)
         self.last_terrain_debug = pop_last_terrain_debug()
         self.last_diag = pop_last_diag()
+        self.last_fsm = pop_last_fsm_snapshots()
         return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
                 damage_landed, hits_taken, hp_healed, game_time, real_time, done,
                 committed)

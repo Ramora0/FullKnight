@@ -204,7 +204,7 @@ class VecEnv:
                 for i in resume_indices
             ])
 
-    def reap_completed_resets(self):
+    def reap_completed_resets(self, only=None):
         """Collect any reset tasks that have finished. Returns a list of
         (env_i, raw_obs_tuple) where raw_obs_tuple is the per-env reset
         return value (combat_hb, terrain_hb, gs, combat_kinds, combat_parents).
@@ -213,12 +213,21 @@ class VecEnv:
         re-raised loudly — a silently-failed reset should crash the run
         rather than leave an env stranded forever.
 
+        If `only` is provided (set/iterable of env indices), only reap tasks
+        for those envs; finished tasks for other envs are left in place to be
+        picked up by a later reap call. Used by the mid-rollout stall to skip
+        stranded resets from prior epochs that have no slot in the current
+        rollout's obs batch.
+
         Side effect: each reaped reset's phase breakdown (from C#) plus its
         Python wire wallclock is appended to self._completed_reset_dts for
         the next pop_reset_dts() drain.
         """
+        only_set = None if only is None else set(only)
         completed = []
         for env_i in list(self._reset_tasks.keys()):
+            if only_set is not None and env_i not in only_set:
+                continue
             task = self._reset_tasks[env_i]
             if not task.done():
                 continue

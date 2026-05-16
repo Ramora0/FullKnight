@@ -41,6 +41,11 @@ namespace FullKnight.Game
 			LockedStepsLeft = 0;
 		}
 
+		// Static accessor so non-TrainingEnv callers (SceneHooks) can reach
+		// the active shim without plumbing a reference. There's only one
+		// shim in process — set on construction.
+		public static InputDeviceShim Attached { get; private set; }
+
 		public InputDeviceShim() :
 			base("FullKnightInputShimDevice")
 		{
@@ -55,6 +60,22 @@ namespace FullKnight.Game
 			AddControl(InputControlType.RightTrigger, "Dash");
 			AddControl(InputControlType.LeftTrigger, "SuperDash");
 			AddControl(InputControlType.RightBumper, "QuickCast");
+			Attached = this;
+		}
+
+		// Raw press/release of Jump + Attack only, bypassing Can* gates.
+		// Used by SceneHooks during the workshop dream-return wake-up and
+		// bench-leave coroutines. HC's 'Dream Return' FSM in 'Ready'/'Ready 2'
+		// has actions ListenForJump/Attack/Down/Up/Left/Right and fires
+		// GET UP on any of them. We tap Jump + Attack only — pressing Cast /
+		// Dash / DreamNail when HC is in an input-accepting state (after the
+		// wake-up has completed) triggers actual game actions (focus heal,
+		// dream-nail charge, dash) and leaves HC in a half-resolved state
+		// that subsequently breaks the boss-challenge animation.
+		public void WakeTap(bool pressed)
+		{
+			KeyJump = pressed;
+			KeyAttack = pressed;
 		}
 
 		public override void Update(ulong updateTick, float deltaTime)
@@ -250,10 +271,14 @@ namespace FullKnight.Game
 			{ 6, 1.0f },   // super_dash: ~0.85s charge
 		};
 
-		private static int LockedStepsFor(int actionIdx, int framesPerWait, int timeScale)
+		private static int LockedStepsFor(int actionIdx, int framesPerWait)
 		{
 			if (!HoldGameSeconds.TryGetValue(actionIdx, out float gs)) return 0;
-			float stepGameSeconds = framesPerWait * timeScale / 60f;
+			// Per-Unity-frame game-time is pinned in TrainingEnv.Reset() via
+			// Time.captureDeltaTime (kStepDeltaTime = 0.00848s at fpw=5).
+			// Per agent step game-time = framesPerWait × kStepDeltaTime.
+			const float kCaptureDeltaTime = 0.00848f;
+			float stepGameSeconds = framesPerWait * kCaptureDeltaTime;
 			if (stepGameSeconds <= 0f) return 0;
 			int n = (int)System.Math.Ceiling(gs / stepGameSeconds);
 			return n > 0 ? n : 1;
@@ -279,7 +304,7 @@ namespace FullKnight.Game
 		/// so that dash overrides jump when both are requested.
 		/// </summary>
 		public static bool ApplyAction(InputDeviceShim shim, int[] action,
-			int framesPerWait, int timeScale)
+			int framesPerWait = 1)
 		{
 			bool committed = false;
 
@@ -307,7 +332,7 @@ namespace FullKnight.Game
 			else if (HoldGameSeconds.ContainsKey(action[2]))
 			{
 				// Idle + free hold pick: lock starting next step.
-				int totalLocked = LockedStepsFor(action[2], framesPerWait, timeScale);
+				int totalLocked = LockedStepsFor(action[2], framesPerWait);
 				shim.LockedAction = action[2];
 				// This step counts toward the locked phase (the agent picked
 				// it freely, KeyAttack/etc gets set true now). Subsequent

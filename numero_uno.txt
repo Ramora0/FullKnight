@@ -1,0 +1,107 @@
+==========================================================================
+  TIMING BREAKDOWN (cumulative, 1775 epochs, 6247.2s wall, 3.52s/epoch avg)
+  utilization: 44607/1817600 env-step cells with combat events (2.5%)
+==========================================================================
+  bucket                              ms/epoch       %
+  -------------------------------- ----------- -------
+  rollout                             3050.5 ms   86.7%
+    sim/combat                         700.8 ms   19.9%
+    sim/intro                           61.6 ms    1.8%
+    sim/overhead                       441.1 ms   12.5%
+    inference                         1800.0 ms   51.1%
+    misc                                47.0 ms    1.3%
+  train                                445.0 ms   12.6%
+    forward_gpu                        127.1 ms    3.6%
+    backward_optim_gpu                 202.6 ms    5.8%
+    gae_cpu                              1.9 ms    0.1%
+    normalize_cpu                       24.4 ms    0.7%
+    h2d                                  2.5 ms    0.1%
+    misc                                86.4 ms    2.5%
+  reset_blocking                         3.4 ms    0.1%
+  between_epochs                        20.6 ms    0.6%
+  -------------------------------- ----------- -------
+  TOTAL                               3519.5 ms  100.0%
+
+  dead-env idle (cost of no mid-rollout reactivation):
+    150575/1817600 cells (8.3% of T*N) sat idle post-death
+    394 ms/epoch wallclock-equivalent (11.2% of total wall)
+
+  resets (background, overlapped — NOT in 100% above):
+    2475 resets (1.39/epoch), avg 4890ms each, sum 6818ms/epoch (193.7% of total wall if serial)
+    branches    workshop=0 natural_end=0 unknown=2475
+==========================================================================
+
+Training cuda graphs:
+==========================================================================
+  TIMING BREAKDOWN (cumulative, 50 epochs, 105.8s wall, 2.12s/epoch avg)
+  utilization: 486/51200 env-step cells with combat events (0.9%)
+==========================================================================
+  bucket                              ms/epoch       %
+  -------------------------------- ----------- -------
+  rollout                             1502.0 ms   71.0%
+    sim/combat                         634.1 ms   30.0%
+    sim/intro                           89.0 ms    4.2%
+    sim/overhead                       481.9 ms   22.8%
+    inference                          198.7 ms    9.4%
+    misc                                98.3 ms    4.6%
+  train                                608.6 ms   28.8%
+    forward_gpu                        182.2 ms    8.6%
+    backward_optim_gpu                 230.7 ms   10.9%
+    gae_cpu                              2.1 ms    0.1%
+    normalize_cpu                       35.2 ms    1.7%
+    h2d                                  3.8 ms    0.2%
+    misc                               154.6 ms    7.3%
+  reset_blocking                         0.0 ms    0.0%
+  between_epochs                         4.8 ms    0.2%
+  -------------------------------- ----------- -------
+  TOTAL                               2115.4 ms  100.0%
+
+  dead-env idle (cost of no mid-rollout reactivation):
+    1754/51200 cells (3.4% of T*N) sat idle post-death
+    70 ms/epoch wallclock-equivalent (3.3% of total wall)
+
+  resets (background, overlapped — NOT in 100% above):
+    34 resets (0.68/epoch), avg 4929ms each, sum 3352ms/epoch (158.4% of total wall if serial)
+    branches    workshop=0 natural_end=0 unknown=34
+==========================================================================
+
+==========================================================================
+  TIMING BREAKDOWN (cumulative, 11150 epochs, 31554.6s wall, 2.83s/epoch avg)
+  utilization: 378258/11417600 env-step cells with combat events (3.3%)
+==========================================================================
+  bucket                              ms/epoch       %
+  -------------------------------- ----------- -------
+  rollout                             2308.6 ms   81.6%
+    sim/combat                         662.2 ms   23.4%
+    sim/intro                           49.4 ms    1.7%
+    sim/overhead                       298.3 ms   10.5%
+    inference                          178.7 ms    6.3%
+    misc                              1119.9 ms   39.6%
+  train                                481.0 ms   17.0%
+    forward_gpu                        135.3 ms    4.8%
+    backward_optim_gpu                 197.6 ms    7.0%
+    gae_cpu                              1.9 ms    0.1%
+    normalize_cpu                       23.4 ms    0.8%
+    h2d                                  3.0 ms    0.1%
+    misc                               119.8 ms    4.2%
+  reset_blocking                         2.5 ms    0.1%
+  between_epochs                        37.9 ms    1.3%
+  -------------------------------- ----------- -------
+  TOTAL                               2830.0 ms  100.0%
+
+  dead-env idle (cost of no mid-rollout reactivation):
+    1487984/11417600 cells (13.0% of T*N) sat idle post-death
+    910 ms/epoch wallclock-equivalent (32.2% of total wall)
+
+  resets (background, overlapped — NOT in 100% above):
+    20160 resets (1.81/epoch), avg 5668ms each, sum 10248ms/epoch (362.1% of total wall if serial)
+    branches    workshop=0 natural_end=20160 unknown=0
+    phases (avg ms/reset, % of avg, frames, ms/f):
+      pre_unload             0.1 ms  (  0.0%)     0.0f    0.0ms/f
+      transition_out      3905.1 ms  ( 69.1%)  4263.9f    0.9ms/f
+      settle                 0.1 ms  (  0.0%)     0.0f    0.0ms/f
+      load_boss_scene     1270.2 ms  ( 22.5%)  1109.2f    1.1ms/f
+      recreate_reader        4.5 ms  (  0.1%)     1.0f    4.5ms/f
+      init_boss_refs       429.5 ms  (  7.6%)   511.0f    0.8ms/f
+      obs_final             38.8 ms  (  0.7%)     0.0f    0.0ms/f
+==========================================================================
