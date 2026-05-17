@@ -37,8 +37,57 @@ import time
 import pygame
 
 
-def collect_graph(fsm_dict):
-    transitions = fsm_dict.get("transitions", {})
+# Display-only filter: states to hide from the rendered graph and from
+# replay. The tracker still records these — we just don't show them
+# because they're hit-reaction interrupts (every airborne attack can
+# fall into Stun Air, so it inflates in-degree to ~10 and turns most
+# of its predecessors into spurious junctions). Pure visualization;
+# drop or extend without touching the saved JSON.
+STUN_STATES = {"Stun Air", "Stun Land"}
+
+
+def filtered_transitions(fsm_dict, edge_pct=0.0):
+    """Transitions with STUN_STATES stripped and rare edges pruned.
+
+    Returns a dict of the same shape as fsm_dict['transitions'] but
+    with stun nodes elided, edges to/from them removed, and any edge
+    whose per-source probability count(src→dst)/sum(count(src→*)) is
+    below ``edge_pct`` dropped.
+
+    edge_pct == 0 disables the probability filter entirely (every
+    observed edge passes through). Backwards compatible with JSONs
+    written before edge_counts existed — in that case the probability
+    threshold is treated as inactive and only the stun filter applies.
+    """
+    trans = fsm_dict.get("transitions", {})
+    edge_counts = fsm_dict.get("edge_counts", {})
+    out = {}
+    for s, dsts in trans.items():
+        if s in STUN_STATES:
+            continue
+        # If we have counts, compute per-source total from the
+        # post-stun-filter destinations so the probability isn't
+        # diluted by stun outflow.
+        src_counts = edge_counts.get(s, {})
+        non_stun_total = sum(
+            n for d, n in src_counts.items() if d not in STUN_STATES
+        )
+        kept = []
+        for d in dsts:
+            if d in STUN_STATES:
+                continue
+            if edge_pct > 0.0 and non_stun_total > 0:
+                n = src_counts.get(d, 0)
+                if n / non_stun_total < edge_pct:
+                    continue
+            kept.append(d)
+        if kept:
+            out[s] = kept
+    return out
+
+
+def collect_graph(fsm_dict, edge_pct=0.0):
+    transitions = filtered_transitions(fsm_dict, edge_pct=edge_pct)
     nodes = set(transitions.keys())
     edges = []
     for s, dsts in transitions.items():
@@ -183,14 +232,25 @@ class Viewer:
     EDGE = (170, 170, 185)
     EDGE_FROM_CURRENT = (210, 60, 60)
     EDGE_TO_CURRENT = (50, 130, 210)
-    NODE_FILL = (220, 230, 245)
-    NODE_BORDER = (60, 100, 160)
-    JUNCTION_FILL = (255, 200, 200)
-    JUNCTION_BORDER = (200, 40, 40)
     CURRENT_FILL = (190, 240, 190)
     CURRENT_BORDER = (30, 140, 40)
     IN_PROGRESS_FILL = (245, 235, 170)
     IN_PROGRESS_BORDER = (180, 140, 30)
+
+    # Out-degree gradient. Replaces the old binary node / junction
+    # colors so the branchiness of each state is visible at a glance.
+    # Out-degree counted on the FILTERED transitions (i.e. after stun
+    # edges drop) so the colors track what's actually on screen.
+    OUTDEG_FILL_0     = (215, 215, 220)  # sink (rare — kept for completeness)
+    OUTDEG_BORDER_0   = (130, 130, 140)
+    OUTDEG_FILL_1     = (220, 230, 245)  # linear pass-through
+    OUTDEG_BORDER_1   = (60, 100, 160)
+    OUTDEG_FILL_2     = (245, 220, 240)  # binary choice
+    OUTDEG_BORDER_2   = (160, 80, 160)
+    OUTDEG_FILL_3_4   = (255, 210, 175)  # moderate branching
+    OUTDEG_BORDER_3_4 = (210, 120, 30)
+    OUTDEG_FILL_5     = (255, 165, 165)  # heavy branching (real decision)
+    OUTDEG_BORDER_5   = (200, 40, 40)
 
     NODE_RADIUS = 9
     PANEL_W = 340
@@ -238,6 +298,22 @@ class Viewer:
         self.replay_speed = 1.0
         self._replay_accum = 0.0
         self._scrubbing = False
+        # Filter thresholds. Both are scale-independent fractions so
+        # they stay meaningful regardless of how long training has
+        # run — a longer run grows numerator and denominator in
+        # lockstep.
+        #
+        # attack_pct_threshold: minimum fraction of total fingerprint
+        # observations for an attack to appear in the side panel.
+        # +/- step 0.5%. Default 0 = show everything.
+        #
+        # edge_pct_threshold: minimum per-source probability
+        # count(src→dst) / sum(count(src→*)) for an edge to render
+        # in the graph (and contribute to node out-degree coloring
+        # and junction count). [/] step 1% when not in replay mode.
+        # Default 0 = show every observed edge.
+        self.attack_pct_threshold = 0.0
+        self.edge_pct_threshold = 0.0
         self.load()
 
     @property
@@ -291,7 +367,9 @@ class Viewer:
         if key not in self.graphs:
             self.graphs[key] = PhysicsGraph(self.rng)
         g = self.graphs[key]
-        nodes, edges = collect_graph(self.fsms[key])
+        nodes, edges = collect_graph(
+            self.fsms[key], edge_pct=self.edge_pct_threshold,
+        )
         g.sync(list(nodes), edges)
         return g
 
@@ -320,7 +398,12 @@ class Viewer:
         return self.fsms.get(key, {}).get("total_ticks", 0)
 
     def replay_state_at(self, tick, key=None):
-        """State for replay tick T. Returns None before the first change."""
+        """State for replay tick T. Returns None before the first change.
+
+        Stun states are skipped — the replay cursor passes over them and
+        the displayed "current" stays on the most recent non-stun state,
+        so scrubbing always lights up a node visible in the graph.
+        """
         history = self.replay_history(key)
         if not history or tick < history[0][0]:
             return None
@@ -328,10 +411,11 @@ class Viewer:
         # is fine. Could swap to bisect for hot paths if it ever matters.
         state = None
         for t, s in history:
-            if t <= tick:
-                state = s
-            else:
+            if t > tick:
                 break
+            if s in STUN_STATES:
+                continue
+            state = s
         return state
 
     def replay_history_index(self, key=None):
@@ -348,7 +432,13 @@ class Viewer:
         if not history:
             return
         i = self.replay_history_index()
-        new_i = max(0, min(len(history) - 1, i + direction))
+        # Walk past stun-state entries so each ./, press lands on the
+        # next real state-change visible in the graph. If we run off
+        # the end while skipping, clamp to the boundary entry.
+        new_i = i + direction
+        while 0 <= new_i < len(history) and history[new_i][1] in STUN_STATES:
+            new_i += direction
+        new_i = max(0, min(len(history) - 1, new_i))
         self.replay_tick = history[new_i][0]
         self.replay_playing = False
         self._replay_accum = 0.0
@@ -534,6 +624,18 @@ class Viewer:
                         self.replay_speed = max(0.0625, self.replay_speed * 0.5)
                     elif self.replay_mode and ev.key == pygame.K_RIGHTBRACKET:
                         self.replay_speed = min(64.0, self.replay_speed * 2.0)
+                    elif not self.replay_mode and ev.key == pygame.K_LEFTBRACKET:
+                        self.edge_pct_threshold = max(0.0, self.edge_pct_threshold - 0.01)
+                        if self.keys:
+                            self.ensure_graph(self.keys[self.idx])
+                    elif not self.replay_mode and ev.key == pygame.K_RIGHTBRACKET:
+                        self.edge_pct_threshold = min(1.0, self.edge_pct_threshold + 0.01)
+                        if self.keys:
+                            self.ensure_graph(self.keys[self.idx])
+                    elif ev.key in (pygame.K_EQUALS, pygame.K_PLUS):
+                        self.attack_pct_threshold = min(1.0, self.attack_pct_threshold + 0.005)
+                    elif ev.key in (pygame.K_MINUS, pygame.K_UNDERSCORE):
+                        self.attack_pct_threshold = max(0.0, self.attack_pct_threshold - 0.005)
                 elif ev.type == pygame.MOUSEBUTTONDOWN:
                     self.handle_mouse_down(ev)
                 elif ev.type == pygame.MOUSEBUTTONUP:
@@ -587,6 +689,17 @@ class Viewer:
                 (cx, r.y - 4), (cx, r.y + r.h + 4), 3,
             )
 
+    def _outdeg_color(self, out_deg):
+        if out_deg <= 0:
+            return self.OUTDEG_FILL_0, self.OUTDEG_BORDER_0
+        if out_deg == 1:
+            return self.OUTDEG_FILL_1, self.OUTDEG_BORDER_1
+        if out_deg == 2:
+            return self.OUTDEG_FILL_2, self.OUTDEG_BORDER_2
+        if out_deg <= 4:
+            return self.OUTDEG_FILL_3_4, self.OUTDEG_BORDER_3_4
+        return self.OUTDEG_FILL_5, self.OUTDEG_BORDER_5
+
     def render(self):
         self.screen.fill(self.BG)
         if not self.keys:
@@ -598,10 +711,21 @@ class Viewer:
             return
         key = self.keys[self.idx]
         fsm = self.fsms[key]
-        transitions = fsm.get("transitions", {})
-        junctions = set(fsm.get("junctions", []))
+        # All display paths use the filtered view (stun stripped +
+        # rare-edge pruned). Junctions are recomputed from filtered
+        # out-degree so count and visible coloring agree; the saved
+        # "junctions" field reflects the unfiltered graph and would
+        # over-count by both the stun edges and the rare interrupts.
+        transitions = filtered_transitions(
+            fsm, edge_pct=self.edge_pct_threshold,
+        )
         current = fsm.get("current_state")
-        in_progress = fsm.get("in_progress_sequence", [])
+        if current in STUN_STATES:
+            current = None
+        in_progress = [
+            s for s in fsm.get("in_progress_sequence", [])
+            if s not in STUN_STATES
+        ]
         in_progress_set = set(in_progress)
         # In replay mode the displayed "current" is the state recorded at
         # the replay cursor — overrides the live current_state from the
@@ -657,10 +781,8 @@ class Viewer:
                 fill, border = self.CURRENT_FILL, self.CURRENT_BORDER
             elif n in in_progress_set:
                 fill, border = self.IN_PROGRESS_FILL, self.IN_PROGRESS_BORDER
-            elif n in junctions:
-                fill, border = self.JUNCTION_FILL, self.JUNCTION_BORDER
             else:
-                fill, border = self.NODE_FILL, self.NODE_BORDER
+                fill, border = self._outdeg_color(len(transitions.get(n, [])))
             pygame.draw.circle(self.screen, fill, (int(sx), int(sy)), node_r)
             pygame.draw.circle(self.screen, border, (int(sx), int(sy)), node_r, 2)
             if show_labels:
@@ -699,13 +821,21 @@ class Viewer:
         )
         hint = (
             "LMB drag/pan  wheel zoom  ←/→ FSM  R reset  L reload  "
-            "T replay  Space play  ,/. step  [/] speed  Home/End  Q quit"
+            "T replay  Space play  ,/. step  [/] " +
+            ("speed" if self.replay_mode else "edge filter") +
+            "  +/- attack filter  Q quit"
         )
         self.screen.blit(self.font.render(hint, True, self.DIM), (20, 30))
+        # Recount junctions from filtered transitions so the stat
+        # matches what's on screen (the saved "junctions" field counts
+        # against the unfiltered graph and over-reports by the stun
+        # edges we just hid).
+        n_junctions = sum(1 for dsts in transitions.values() if len(dsts) >= 2)
         sub = (
             f"nodes={len(g.positions)}  "
             f"edges={sum(len(d) for d in transitions.values())}  "
-            f"junctions={len(junctions)}  "
+            f"junctions={n_junctions}  "
+            f"edge_filter=≥{self.edge_pct_threshold*100:.0f}%  "
             f"attacks={len(fsm.get('fingerprints', []))}  "
             f"zoom={self.zoom:.2f}"
         )
@@ -729,26 +859,57 @@ class Viewer:
         for fill, border, txt in [
             (self.CURRENT_FILL, self.CURRENT_BORDER, "current state"),
             (self.IN_PROGRESS_FILL, self.IN_PROGRESS_BORDER, "in-progress sequence"),
-            (self.JUNCTION_FILL, self.JUNCTION_BORDER, "junction (≥2 successors)"),
-            (self.NODE_FILL, self.NODE_BORDER, "regular state"),
+            (self.OUTDEG_FILL_1, self.OUTDEG_BORDER_1, "1 successor (linear)"),
+            (self.OUTDEG_FILL_2, self.OUTDEG_BORDER_2, "2 successors"),
+            (self.OUTDEG_FILL_3_4, self.OUTDEG_BORDER_3_4, "3-4 successors"),
+            (self.OUTDEG_FILL_5, self.OUTDEG_BORDER_5, "5+ successors"),
         ]:
             pygame.draw.circle(self.screen, fill, (px + 10, y + 6), 8)
             pygame.draw.circle(self.screen, border, (px + 10, y + 6), 8, 2)
             self.screen.blit(self.font.render(txt, True, self.TEXT), (px + 28, y))
             y += 18
         y += 6
+        thr = self.attack_pct_threshold
+        all_fps = fsm.get("fingerprints", [])
+        total_obs = sum(fp.get("count", 0) for fp in all_fps)
+        # Scale-independent filter: an attack passes if its share of
+        # total observations is at least `thr`. total_obs == 0 means
+        # we're looking at a pre-count JSON; in that case the filter
+        # is a no-op and everything renders.
+        def passes(fp):
+            if all(s in STUN_STATES for s in fp.get("sequence", [])):
+                return False
+            if total_obs <= 0:
+                return True
+            return fp.get("count", 0) / total_obs >= thr
+
+        kept_n = sum(1 for fp in all_fps if passes(fp))
+        title = f"ATTACKS  ≥{thr*100:.1f}%  ({kept_n}/{len(all_fps)})"
         self.screen.blit(
-            self.title_font.render("ATTACKS", True, self.TEXT), (px, y),
+            self.title_font.render(title, True, self.TEXT), (px, y),
         )
         y += 22
         active_ids = set(fsm.get("active_ids", []))
-        for fp in fsm.get("fingerprints", []):
+        # Sort attacks by observation count desc so canonical attacks
+        # surface to the top and the long tail of one-off interruption
+        # variants sinks. Stable secondary sort on attack id keeps
+        # equal-count entries in catalog order.
+        ranked = sorted(
+            (fp for fp in all_fps if passes(fp)),
+            key=lambda fp: (-fp.get("count", 0),
+                            int(fp.get("id", "a0")[1:])),
+        )
+        max_count = max((fp.get("count", 0) for fp in ranked), default=0)
+        count_w = max(1, len(str(max_count)))
+        for fp in ranked:
             atk_id = fp.get("id", "?")
-            seq = fp.get("sequence", [])
+            seq = [s for s in fp.get("sequence", []) if s not in STUN_STATES]
+            count = fp.get("count", 0)
+            pct = (count / total_obs * 100) if total_obs > 0 else 0.0
             active = atk_id in active_ids
             color = self.CURRENT_BORDER if active else self.TEXT
             marker = "▶" if active else " "
-            text = f"{marker} {atk_id}: {' → '.join(seq)}"
+            text = f"{marker} {pct:4.1f}%  {atk_id}: {' → '.join(seq)}"
             max_w = self.PANEL_W - 10
             line_h = self.font.get_height() + 1
             line = text

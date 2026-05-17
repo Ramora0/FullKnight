@@ -17,21 +17,50 @@ namespace FullKnight.Game
 	//        the knight's nail / spells). Useful for cross-referencing agent
 	//        action against attack-window FSM state.
 	//
-	// Only FSMs whose name is in NameWhitelist are emitted. HK's convention is
-	// that the boss's main attack-picking FSM is named "Control" — sibling FSMs
-	// on the same GameObject (e.g. "Constrain Y" with a "Fluctuate" state,
-	// "Audio", "Health", "FSM") are positional/auxiliary and pollute the
-	// attack-segmentation graph. Extend NameWhitelist if a boss is encountered
-	// whose controller uses a different name.
+	// Selection is blacklist-based, not whitelist: every active FSM in the boss
+	// subtree (or on a relevant collider) is emitted except those whose name is
+	// in NameBlacklist. HK's main attack-picking FSM is conventionally named
+	// "Control" on most bosses, but several use specialized names (e.g.
+	// "FalseyControl", "Mossy Charger", "Gruz Mother Top"). A whitelist of just
+	// "Control" silently dropped those, so multi-boss runs only ever produced
+	// data for Hornet. The blacklist instead enumerates the known auxiliary
+	// FSMs (audio/health/stun/positional/etc.) that pollute the segmentation
+	// graph and lets the boss controller through regardless of its name.
 	//
 	// Output is a flat list of "<src>|<owner>|<fsm>|<state>" strings. Attack
 	// segmentation happens entirely Python-side from the observed state-
 	// transition graph — no structural action introspection here.
 	public class FsmObserver
 	{
-		public static readonly HashSet<string> NameWhitelist = new HashSet<string>
+		// FSM names known to be auxiliary noise rather than attack pickers.
+		// Drawn from decomp grep + HK-modder convention. Any FSM whose name
+		// matches is dropped before reaching the segmenter. Boss controller
+		// FSMs (whatever they're called) pass through.
+		public static readonly HashSet<string> NameBlacklist = new HashSet<string>
 		{
-			"Control",
+			// Damage / health plumbing
+			"damages_enemy", "damages_hero",
+			"health_manager_enemy", "health_manager", "Health",
+			"Set HP",
+			// Stun / hit reaction (a boss's stun FSM is its own state machine
+			// with hit-react states; useful for debugging but inflates the
+			// segmenter with interrupt edges — same reason the viewer hides
+			// Stun Air / Stun Land)
+			"Stun Control", "Stun", "Stun Damage",
+			// Audio / FX
+			"Audio", "Sounds", "Music Region",
+			"Death", "Death Effects", "Crash Effect", "Shake", "shudder",
+			"CameraShake",
+			// Positional constraints
+			"Constrain X", "Constrain Y", "Bobble",
+			// Camera / hero locks (block hero input during boss intros etc.)
+			"Camera Lock", "Roar Lock", "Hero Lock",
+			// Generic catch-all name HK uses for unnamed FSMs on auxiliary GOs
+			"FSM",
+			// Range / detection
+			"Detect Range",
+			// Recoil
+			"Recoil",
 		};
 
 
@@ -59,7 +88,7 @@ namespace FullKnight.Game
 						// Skip FSMs on inactive children — they're not driving
 						// anything right now and only add noise to the panel.
 						if (!fsm.isActiveAndEnabled) continue;
-						if (!NameWhitelist.Contains(fsm.FsmName)) continue;
+						if (NameBlacklist.Contains(fsm.FsmName)) continue;
 						AppendEntry(entries, "B", owner, fsm);
 					}
 				}
@@ -88,7 +117,7 @@ namespace FullKnight.Game
 					var fsm = fsms[i];
 					if (fsm == null) continue;
 					if (!fsm.isActiveAndEnabled) continue;
-					if (!NameWhitelist.Contains(fsm.FsmName)) continue;
+					if (NameBlacklist.Contains(fsm.FsmName)) continue;
 					AppendEntry(entries, src, owner, fsm);
 				}
 			}

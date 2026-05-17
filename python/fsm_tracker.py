@@ -23,9 +23,13 @@ class FsmTracker:
       - ``_fingerprint_to_id`` / ``_next_attack_idx`` — attack-sequence
         catalogue. Same sequence observed by different envs reuses the
         same ``aN`` id.
-      - ``_state_history`` / ``_fsm_tick`` — interleaved change log
-        across all envs. Tick is a global counter per FSM (incremented
-        once per observation from any env).
+      - ``_state_history`` / ``_fsm_tick`` — env-0-only change log.
+        Recorded from env 0 alone (not interleaved across envs) so the
+        graph_viewer replay timeline is a coherent chain where every
+        ``.`` step is a real state change along an actual edge. If we
+        merged here, adjacent entries could come from different envs
+        in different states and the replay would appear to jump
+        between unrelated nodes.
 
     Per-env, keyed by ``(env_id, src, owner, fsm)``:
       - ``_prev_states``, ``_changed_age``, ``_absence_count``
@@ -68,6 +72,18 @@ class FsmTracker:
         self._next_attack_idx: dict = {}
         self._state_history: dict = {}
         self._fsm_tick: dict = {}
+        # Per-FSM observation count for each fingerprint sequence.
+        # gkey -> {seq_tuple: count}. Incremented every time the
+        # segmenter finalizes that sequence from any env. Used by the
+        # viewer to sort attacks by frequency and threshold out the
+        # long tail of interruption-driven one-off variants.
+        self._fingerprint_counts: dict = {}
+        # Per-edge transition counts. gkey -> {prev: {next: count}}.
+        # Mirrors _transition_graph but with counts so the viewer can
+        # compute per-source edge probability (scale-independent
+        # alternative to absolute count) and prune low-probability
+        # interrupt edges that inflate junction count.
+        self._edge_counts: dict = {}
 
         self._segment_runaway_cap = 30
 
@@ -120,16 +136,23 @@ class FsmTracker:
 
             state_is_junction = False
             if src == "B":
-                self._fsm_tick[gkey] = self._fsm_tick.get(gkey, 0) + 1
-                if state_changed:
-                    hist = self._state_history.setdefault(gkey, [])
-                    hist.append([self._fsm_tick[gkey], state])
-                    if len(hist) > self.MAX_HISTORY_PER_FSM:
-                        del hist[: len(hist) // 2]
+                # Tick + state_history record env 0's timeline only so
+                # the offline replay scrubs a coherent chain (each
+                # entry is a transition along a real edge). Other envs
+                # still contribute to the transition graph below.
+                if env_id == 0:
+                    self._fsm_tick[gkey] = self._fsm_tick.get(gkey, 0) + 1
+                    if state_changed:
+                        hist = self._state_history.setdefault(gkey, [])
+                        hist.append([self._fsm_tick[gkey], state])
+                        if len(hist) > self.MAX_HISTORY_PER_FSM:
+                            del hist[: len(hist) // 2]
 
                 if state_changed and prev is not None:
                     g = self._transition_graph.setdefault(gkey, {})
                     g.setdefault(prev, set()).add(state)
+                    ec = self._edge_counts.setdefault(gkey, {}).setdefault(prev, {})
+                    ec[state] = ec.get(state, 0) + 1
                     if len(g[prev]) >= 2:
                         junctions_set = self._known_junctions.setdefault(gkey, set())
                         if prev not in junctions_set:
@@ -198,6 +221,8 @@ class FsmTracker:
             idx = self._next_attack_idx.get(gkey, 0)
             fp_map[seq] = f"a{idx}"
             self._next_attack_idx[gkey] = idx + 1
+        counts = self._fingerprint_counts.setdefault(gkey, {})
+        counts[seq] = counts.get(seq, 0) + 1
         new_id = fp_map[seq]
         if self._current_attack_id.get(ekey) != new_id:
             self._current_attack_id[ekey] = new_id
@@ -254,17 +279,26 @@ class FsmTracker:
             current = self._prev_states.get(ekey0)
             active = self._active_ids.get(ekey0, set())
             in_progress = list(self._current_sequence.get(ekey0, []))
+            edge_counts = self._edge_counts.get(gkey, {})
             data["fsms"][key_str] = {
                 "src": src,
                 "owner": owner,
                 "fsm": fsm_name,
                 "transitions": {s: sorted(dsts) for s, dsts in graph.items()},
+                # Per-edge observation counts: {src: {dst: n}}. Lets the
+                # viewer compute per-source edge probability and prune
+                # rare-interrupt edges in a scale-independent way.
+                "edge_counts": {s: dict(dsts) for s, dsts in edge_counts.items()},
                 "junctions": sorted(junctions),
                 "current_state": current,
                 "in_progress_sequence": in_progress,
                 "active_ids": sorted(active),
                 "fingerprints": [
-                    {"id": atk_id, "sequence": list(fp)}
+                    {
+                        "id": atk_id,
+                        "sequence": list(fp),
+                        "count": self._fingerprint_counts.get(gkey, {}).get(fp, 0),
+                    }
                     for fp, atk_id in sorted(
                         fp_map.items(), key=lambda kv: int(kv[1][1:])
                     )

@@ -110,8 +110,8 @@ class Config:
     # boss_rotation_period > 1. period=1 re-rolls every death (matches
     # pre-fake-reset behavior even when prob>0, since the C# scene-match
     # guard falls through to a full reset on rotation).
-    fake_reset_prob: float = 0.0
-    boss_rotation_period: int = 1
+    fake_reset_prob: float = 1.0
+    boss_rotation_period: int = 10
 
 
     # PPO

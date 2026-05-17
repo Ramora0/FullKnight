@@ -631,6 +631,12 @@ async def train(config: Config):
             # asyncio.gather(step_all). Sum_t(buf_step_all_wall) ≈ total
             # time the rollout spent inside step_all.
             buf_step_all_wall = []
+            # Per-step alive mask: stepped_arr[t, n] = True iff env n was in
+            # rollout_active when iteration t ran (i.e. it produced a real
+            # sample at that step). Drives valid_arr post-loop — replaces the
+            # cumulative-dones latch so that envs spliced back into the rollout
+            # continue producing valid samples after reactivation.
+            buf_stepped = []
             # Leak probes from C#. Each is (T, N_active).
             buf_diag_enemy = []
             buf_diag_attack = []
@@ -644,18 +650,83 @@ async def train(config: Config):
             obs = slice_obs(obs_full, active_envs)
 
             # Per-step active subset: starts as `active_envs`, shrinks as each
-            # env dies. Once we kick off a reset for env i mid-rollout, that
-            # env's WebSocket is busy with the reset coroutine — calling
-            # step_all on it would race the in-flight recv. So we drop dying
-            # envs from rollout_active and step only the survivors. Buffer
-            # rows for already-dead envs are zero-filled by `_scat` below;
-            # PPO's valid_arr latch masks them out at training time.
+            # env dies, grows as completed resets get spliced back in. Once
+            # we kick off a reset for env i mid-rollout, that env's WebSocket
+            # is busy with the reset coroutine — calling step_all on it would
+            # race the in-flight recv. So we drop dying envs from rollout_active
+            # and step only the survivors. Buffer rows for already-dead envs
+            # are zero-filled by `_scat` below; the stepped_arr/valid_arr mask
+            # those out at training time.
             rollout_active = list(active_envs)
             n_active_local_for = {env_i: li for li, env_i in enumerate(active_envs)}
             done_in_rollout = set()
             mid_rollout_reset_indices = set()  # envs whose resets we kicked off mid-loop
 
-            for t in range(config.rollout_len):
+            # Sample-target loop: collect real stepped cells until we've hit
+            # `total_steps_per_epoch`, then stop on the next seq_len boundary
+            # so PPO's chunked BPTT doesn't truncate the last few. Mid-rollout
+            # deaths trigger a background reset; completed resets are spliced
+            # back into rollout_active opportunistically at the top of each
+            # iteration. If every env is dead, the loop blocks waiting for
+            # the next reset to complete — no time cap, since the only way
+            # out is collecting our target or running out of pending resets.
+            target_valid = config.total_steps_per_epoch
+            L = config.seq_len
+            valid_so_far = 0
+            t = 0
+
+            def _splice_reaped(reaped_list):
+                """Splice a list of (env_i, raw_obs) back into rollout_active.
+                Updates obs (via nonlocal), zeroes GRU hidden, and clears
+                done/reset bookkeeping for the reactivated envs."""
+                nonlocal obs
+                if not reaped_list:
+                    return
+                rj_indices = [ei for ei, _ in reaped_list]
+                rj_obs_batch = vec_env._batch_observations(
+                    [raw for _, raw in reaped_list]
+                )
+                rj_sub_local = [n_active_local_for[ei] for ei in rj_indices]
+                obs = merge_obs_padded(obs, rj_obs_batch, rj_sub_local)
+                agent.reset_hidden_for(rj_indices)
+                for ei in rj_indices:
+                    done_in_rollout.discard(ei)
+                    mid_rollout_reset_indices.discard(ei)
+                rollout_active[:] = sorted(set(rollout_active) | set(rj_indices))
+
+            # Loop: keep going while we still need samples OR the next stop
+            # wouldn't be chunk-aligned. The chunk-alignment clause is what
+            # makes us run a few extra iterations past the target so PPO's
+            # T_used = T // L * L doesn't drop them.
+            while valid_so_far < target_valid or t % L != 0:
+                # Opportunistic splice: pick up any completed resets and put
+                # their slots back in service. Non-blocking — if nothing is
+                # ready, fall through and step whatever's currently alive.
+                _splice_reaped(vec_env.reap_completed_resets(only=active_set))
+
+                # If no envs are alive, block until at least one reset
+                # completes. Without this we'd step an empty batch and crash.
+                # Same logic as the old end-of-rollout stall recovery, now
+                # applied every iteration so it covers the all-dead-mid-rollout
+                # case too.
+                if not rollout_active:
+                    pending_active = [
+                        task for ei, task in vec_env._reset_tasks.items()
+                        if ei in active_set
+                    ]
+                    if not pending_active:
+                        # Every reactivation source is gone. Bail.
+                        break
+                    await asyncio.wait(
+                        pending_active,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    _splice_reaped(vec_env.reap_completed_resets(only=active_set))
+                    if not rollout_active:
+                        # Task finished but didn't yield a usable reap.
+                        # Loop and try again rather than spin forever.
+                        continue
+
                 sub_local = [n_active_local_for[ei] for ei in rollout_active]
                 N_sub = len(rollout_active)
 
@@ -714,6 +785,12 @@ async def train(config: Config):
                 if N_sub:
                     buf_hx_full[sub_local] = buf_hx_sub
 
+                # Per-step stepped mask: True iff env contributed a real
+                # sample at this iteration. Drives valid_arr post-loop.
+                stepped_full = np.zeros(N_active, dtype=bool)
+                if N_sub:
+                    stepped_full[sub_local] = True
+
                 # Episode-end + mid-rollout reset kickoff. Firing the reset
                 # here (instead of after the rollout) lets its wallclock
                 # overlap with continued stepping of other live envs and the
@@ -752,8 +829,8 @@ async def train(config: Config):
                         just_died, levels=new_levels, resume_indices=[]
                     )
                     mid_rollout_reset_indices.update(just_died)
-                    rollout_active = [ei for ei in rollout_active
-                                      if ei not in done_in_rollout]
+                    rollout_active[:] = [ei for ei in rollout_active
+                                         if ei not in done_in_rollout]
 
                 # Append PRE-step obs / hx (matches the action that was
                 # taken) before mutating obs from the step result. Copy to
@@ -782,6 +859,7 @@ async def train(config: Config):
                 buf_step_game_times.append(step_game_times)
                 buf_step_real_times.append(step_real_times)
                 buf_step_wall_times.append(step_wall_per_env)
+                buf_stepped.append(stepped_full)
                 buf_diag_enemy.append(diag["enemy_count"])
                 buf_diag_attack.append(diag["attack_count"])
                 buf_diag_terrain.append(diag["terrain_count"])
@@ -808,38 +886,11 @@ async def train(config: Config):
                             continue
                         fsm_tracker.update(env.last_fsm, env_id=env_i)
 
-                # All rollout-active envs have died. Instead of leaving the
-                # remaining rollout steps blank, block until at least one
-                # in-flight reset completes and splice the env back in. Keeps
-                # collection running for the full config.rollout_len even
-                # when n_envs is small and deaths cluster.
-                while not rollout_active and t < config.rollout_len - 1:
-                    pending_active = [
-                        task for ei, task in vec_env._reset_tasks.items()
-                        if ei in active_set
-                    ]
-                    if not pending_active:
-                        # Shouldn't happen — every dead env had a reset queued.
-                        break
-                    await asyncio.wait(
-                        pending_active,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    reaped = vec_env.reap_completed_resets(only=active_set)
-                    epoch_reset_dts_inflight = vec_env.pop_reset_dts()
-                    if not reaped:
-                        continue
-                    rj_indices = [ei for ei, _ in reaped]
-                    rj_obs_batch = vec_env._batch_observations(
-                        [raw for _, raw in reaped]
-                    )
-                    rj_sub_local = [n_active_local_for[ei] for ei in rj_indices]
-                    obs = merge_obs_padded(obs, rj_obs_batch, rj_sub_local)
-                    agent.reset_hidden_for(rj_indices)
-                    for ei in rj_indices:
-                        done_in_rollout.discard(ei)
-                        mid_rollout_reset_indices.discard(ei)
-                    rollout_active = sorted(set(rollout_active) | set(rj_indices))
+                # End-of-iteration accounting. valid_so_far tracks real
+                # stepped cells (= sum of N_sub across iterations); when it
+                # reaches target_valid we exit on the next chunk boundary.
+                valid_so_far += N_sub
+                t += 1
 
             # Bootstrap final values
             final_indices = rollout_active if rollout_active else active_envs
@@ -1129,24 +1180,26 @@ async def train(config: Config):
             torch.cuda.synchronize()
             inf_timing = agent.report_timing()
 
-            # Mask post-death filler from training. Once an env reports done
-            # mid-rollout it stops being stepped and every subsequent row is
-            # a _scat zero-fill (dones=False, actions=0, log_probs=0, obs=
-            # pre-death state). We need a LATCH: valid=False from the step
-            # after the first done onward. The death step itself is valid
-            # — it carries the real terminal transition. (A plain ~prev_dones
-            # would only mask the single step right after death; subsequent
-            # zero-fill rows would come back as valid=True with old_lp=0 and
-            # new_lp≈-2e4, driving K3 KL through the roof.) Reactivated rows
-            # after a mid-rollout reset are also masked — by design; the
-            # reactivation is for next-epoch readiness, not within-rollout
-            # training data.
-            done_so_far = np.maximum.accumulate(dones_arr, axis=0)
-            prev_done_latched = np.concatenate(
-                [np.zeros((1, done_so_far.shape[1]), dtype=bool), done_so_far[:-1]],
-                axis=0,
-            )
-            valid_arr = ~prev_done_latched  # (T, N_active)
+            # Mask filler rows from training. buf_stepped[t, n] was set True
+            # iff env n was in rollout_active when iteration t ran (i.e. it
+            # actually contributed a real sample at this step). This naturally
+            # covers all three filler cases:
+            #   - Pre-death idle (never): every initially-active env steps
+            #     from t=0 until its first done.
+            #   - Post-death zero-fill: dropped from rollout_active immediately
+            #     after the death step, so stepped=False there onward.
+            #   - Pre-reactivation gap: still dropped, so stepped=False.
+            # Post-reactivation rows have stepped=True — they carry real
+            # samples from the new episode. (The first chunk crossing the
+            # reactivation boundary inherits zero-filled hidden state at its
+            # chunk_start, so the GRU does forward the zero-fill rows before
+            # the real rows; their outputs are masked out by valid_flat but
+            # the hidden state at the real-row boundary is slightly polluted.
+            # With seq_len=16 this washes out within one chunk.) The death
+            # step itself stays valid — it was stepped and carries the real
+            # terminal transition; PPO's GAE uses dones_arr to bootstrap to 0
+            # at that step.
+            valid_arr = np.stack(buf_stepped)  # (T, N_active) bool
 
             t0 = time.perf_counter()
             metrics = agent.train_on_rollout(
@@ -1214,7 +1267,7 @@ async def train(config: Config):
                 train_phase_t=metrics.get("train_phase_t", {}),
                 reset_dts=vec_env.pop_reset_dts(),
                 active_env_steps=active_steps,
-                total_env_steps=int(config.rollout_len * config.n_envs),
+                total_env_steps=total_steps_epoch,
             )
             t_prev_epoch_end = t_now
             print(tracker.epoch_line(), flush=True)
