@@ -1250,7 +1250,7 @@ async def train(config: Config):
             values_atk_arr = np.stack(buf_values_atk)
             values_def_arr = np.stack(buf_values_def)
             actions_arr = {k: np.stack(v) for k, v in buf_actions.items()}
-            buf_hx_arr = np.stack(buf_hx)  # (T, N, hidden_dim)
+            buf_hx_arr = np.stack(buf_hx)  # (T, N, gru_dim)
 
             # Diagnostic: first combat event per env, step timing
             any_event = (damage_landed_arr > 0) | (hits_taken_arr > 0)  # (T, N_active)

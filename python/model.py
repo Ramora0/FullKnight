@@ -1,166 +1,348 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from torch.distributions import Categorical
 
 from env.observation import Observation, GS
 
 
-class HitboxEncoder(nn.Module):
-    """Multi-head attention pooling over hitboxes, queried by global state.
+# Readout-row indices: which row of the (B, 6, d) readout tensor each head
+# consumes. Centralized so the model and any external readers (debug dumps,
+# attention visualizers) stay in sync.
+class RO:
+    MOVEMENT = 0
+    DIRECTION = 1
+    ACTION = 2
+    JUMP = 3
+    CRITIC_ATK = 4
+    CRITIC_DEF = 5
+    N = 6
 
-    output_dim is split evenly across n_heads, so each head operates at
-    head_dim = output_dim // n_heads. Total params/flops for the attention
-    are unchanged vs the prior single-head version; the only added cost is
-    the reshape. Different heads can specialize on different hitbox roles
-    (target body vs attack collider vs projectile etc).
 
-    Optionally accepts a per-hitbox extra feature (e.g. concatenated kind
-    embedding) which is appended to each raw hitbox vector before phi.
+def _additive_mask(key_mask, dtype):
+    """Build (B, 1, 1, N) additive bias from a (B, N) {0,1} key mask.
+
+    Real keys get 0, padding gets a large negative; broadcastable over heads
+    and queries. We use -1e4 (not -inf): SDPA with -inf produces NaN if
+    every key in a row is padded (softmax over all-masked → 0/0). With -1e4
+    the softmax is uniform over padded rows, the value-tensor for those
+    rows is zero anyway (padding is zero-filled), so the output is zero —
+    same behavior as the old single-query encoder.
+    """
+    bias = (1.0 - key_mask).to(dtype) * -1e4
+    return bias.view(bias.shape[0], 1, 1, bias.shape[1])
+
+
+class CrossAttnBlock(nn.Module):
+    """Pre-LN cross-attention + FFN with residuals. SDPA inside.
+
+    Queries (B, Q, d) attend to keys/values (B, N, d). If `kv_mask` is None
+    we skip the additive bias and let SDPA pick the fastest kernel (flash
+    on Ada); pass a (B, N) {0,1} mask when keys are padded.
     """
 
-    def __init__(self, input_dim=5, hidden_dim=64, output_dim=64, query_dim=14, extra_dim=0, n_heads=1):
+    def __init__(self, d_model, n_heads, ffn_expansion=4):
         super().__init__()
-        assert output_dim % n_heads == 0, f"output_dim {output_dim} must be divisible by n_heads {n_heads}"
-        self.output_dim = output_dim
-        self.extra_dim = extra_dim
+        assert d_model % n_heads == 0
         self.n_heads = n_heads
-        self.head_dim = output_dim // n_heads
+        self.head_dim = d_model // n_heads
+        self.d_model = d_model
 
-        self.phi = nn.Sequential(
-            nn.Linear(input_dim + extra_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.ReLU(),
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_kv = nn.Linear(d_model, 2 * d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+        self.norm_ffn = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_expansion * d_model),
+            nn.GELU(),
+            nn.Linear(ffn_expansion * d_model, d_model),
         )
 
-        self.W_q = nn.Linear(query_dim, output_dim)
-        self.W_k = nn.Linear(output_dim, output_dim)
-        self.W_v = nn.Linear(output_dim, output_dim)
-        self.W_o = nn.Linear(output_dim, output_dim)
+    def forward(self, queries, kv, kv_mask=None):
+        B, Q, D = queries.shape
+        N = kv.shape[1]
+        H, Dh = self.n_heads, self.head_dim
 
-        self.scale = self.head_dim ** 0.5
+        q_in = self.norm_q(queries)
+        kv_in = self.norm_kv(kv)
 
-    def forward(self, hitboxes, mask, global_state, extra=None):
-        """
-        Args:
-            hitboxes: (B, N, input_dim) zero-padded hitboxes
-            mask: (B, N) 1 for real, 0 for padding
-            global_state: (B, query_dim)
-            extra: optional (B, N, extra_dim) per-hitbox features to concat before phi
-        Returns:
-            (B, output_dim)
-        """
+        q = self.W_q(q_in).view(B, Q, H, Dh).transpose(1, 2)
+        kv_proj = self.W_kv(kv_in).view(B, N, 2, H, Dh)
+        k = kv_proj[:, :, 0].transpose(1, 2).contiguous()
+        v = kv_proj[:, :, 1].transpose(1, 2).contiguous()
+
+        if kv_mask is None:
+            attn_out = F.scaled_dot_product_attention(q, k, v)
+        else:
+            bias = _additive_mask(kv_mask, q.dtype)
+            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, Q, D)
+
+        x = queries + self.W_o(attn_out)
+        x = x + self.ffn(self.norm_ffn(x))
+        return x
+
+
+class SelfAttnBlock(nn.Module):
+    """Pre-LN self-attention + FFN. Standard transformer encoder block."""
+
+    def __init__(self, d_model, n_heads, ffn_expansion=4):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.d_model = d_model
+
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.W_qkv = nn.Linear(d_model, 3 * d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+        self.norm_ffn = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_expansion * d_model),
+            nn.GELU(),
+            nn.Linear(ffn_expansion * d_model, d_model),
+        )
+
+    def forward(self, x):
+        B, S, D = x.shape
+        H, Dh = self.n_heads, self.head_dim
+
+        x_norm = self.norm_attn(x)
+        qkv = self.W_qkv(x_norm).view(B, S, 3, H, Dh)
+        q = qkv[:, :, 0].transpose(1, 2).contiguous()
+        k = qkv[:, :, 1].transpose(1, 2).contiguous()
+        v = qkv[:, :, 2].transpose(1, 2).contiguous()
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
+
+        x = x + self.W_o(attn_out)
+        x = x + self.ffn(self.norm_ffn(x))
+        return x
+
+
+class QFormer(nn.Module):
+    """A set of learned queries cross-attend to a variable-length input set,
+    producing a fixed-length sequence of refined query tokens. Used to
+    compress (variable, padded, masked) combat / terrain hitbox sets to a
+    small fixed-length sequence the trunk transformer can consume.
+
+    Conditioning: the global state embedding is added to each query before
+    the first cross-attn layer so queries are aware of the agent's current
+    situation. Each query learns to specialize on a different role.
+    """
+
+    def __init__(self, n_queries, d_model, n_heads, n_layers,
+                 input_dim, extra_dim=0, ffn_expansion=4):
+        super().__init__()
+        self.n_queries = n_queries
+        self.d_model = d_model
+
+        in_dim = input_dim + extra_dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        self.queries = nn.Parameter(torch.zeros(n_queries, d_model))
+        nn.init.normal_(self.queries, std=0.02)
+
+        self.global_cond = nn.Linear(d_model, d_model)
+
+        self.layers = nn.ModuleList([
+            CrossAttnBlock(d_model, n_heads, ffn_expansion) for _ in range(n_layers)
+        ])
+
+    def forward(self, hitboxes, mask, global_emb, extra=None):
         B = hitboxes.shape[0]
-
-        if hitboxes.shape[1] == 0:
-            return torch.zeros(B, self.output_dim, device=hitboxes.device)
-        # Note: when mask is all-zero for some row, attn_logits get filled with
-        # -1e9 → softmax is uniform → output is the W_v-biased mean of zero-
-        # padded phi outputs (a constant). Used to early-return zeros here, but
-        # mask.sum() syncs the device which breaks CUDA graph capture.
-
         if extra is not None:
             hitboxes = torch.cat([hitboxes, extra], dim=-1)
-        h = self.phi(hitboxes)  # (B, N, output_dim)
-        N = h.shape[1]
-        H, D = self.n_heads, self.head_dim
+        kv = self.input_proj(hitboxes)
 
-        q = self.W_q(global_state).view(B, H, 1, D)        # (B, H, 1, D)
-        k = self.W_k(h).view(B, N, H, D).transpose(1, 2)   # (B, H, N, D)
-        v = self.W_v(h).view(B, N, H, D).transpose(1, 2)   # (B, H, N, D)
+        q = self.queries.unsqueeze(0).expand(B, -1, -1).contiguous()
+        q = q + self.global_cond(global_emb).unsqueeze(1)
 
-        attn_logits = (q @ k.transpose(-2, -1)) / self.scale  # (B, H, 1, N)
-        attn_mask = mask.view(B, 1, 1, N)                     # (B, 1, 1, N)
-        attn_logits = attn_logits.masked_fill(attn_mask == 0, -1e9)
-
-        attn_weights = torch.softmax(attn_logits, dim=-1)  # (B, H, 1, N)
-        head_out = (attn_weights @ v).squeeze(2)           # (B, H, D)
-        out = self.W_o(head_out.reshape(B, self.output_dim))  # (B, output_dim)
-
-        return out
+        for layer in self.layers:
+            q = layer(q, kv, mask)
+        return q
 
 
 class FullKnightActorCritic(nn.Module):
+    """QFormer-compressed, transformer-trunk, GRU-recurrent actor-critic
+    with per-head cross-attention readout.
+
+    Per-timestep pipeline:
+
+      1. Encode global state to a d-dim token; embed kind/parent ids.
+      2. Combat QFormer (8 learned queries × 2 cross-attn layers) compresses
+         the variable-length combat hitbox set.
+      3. Terrain QFormer (4 queries × 1 layer) does the same for terrain.
+      4. Trunk transformer (2 self-attn layers) refines the
+         (8 combat + 4 terrain + 1 global) = 13-token sequence.
+      5. The GRU runs on the trunk's global-token output and emits a
+         dedicated memory token (LN + learned identity) that gets
+         APPENDED to the trunk sequence as a 14th slot. Keeping memory in
+         its own token lets each readout head choose how much to lean on
+         it — actors mostly ignoring it, critics leaning hard on it for
+         trajectory-aware return estimation.
+      6. Per-head readout: 6 learned queries (one per head — 4 actor +
+         2 critic) cross-attend to the 14 keys (13 trunk + 1 memory)
+         through one CrossAttnBlock. Each head reads its own row.
+      7. Actor heads are linear; critic heads are 3-layer MLPs because
+         value regression benefits from extra nonlinear depth.
+
+    bf16 autocast wraps the heavy transformer compute (QFormers + trunk +
+    readout); the GRU and Categorical math stay in fp32 (GRU's cuDNN bf16
+    path is fragile, distribution softmax/log wants fp32 precision).
+    """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
 
+        d = config.model_d
+        nh = config.model_n_heads
+        exp = config.model_ffn_expansion
+
+        # Global state → d-dim token.
         self.global_encoder = nn.Sequential(
-            nn.Linear(config.global_state_dim, config.global_hidden),
-            nn.ReLU(),
-            nn.Linear(config.global_hidden, config.global_output),
-            nn.ReLU(),
+            nn.Linear(config.global_state_dim, d),
+            nn.GELU(),
+            nn.Linear(d, d),
         )
 
-        self.combat_encoder = HitboxEncoder(
+        # Per-hitbox semantic identity (leaf + parent), concat'd into combat
+        # features before the combat QFormer's input projection.
+        self.kind_embed = nn.Embedding(
+            config.kind_vocab_size, config.kind_embed_dim, padding_idx=0,
+        )
+
+        self.combat_qformer = QFormer(
+            n_queries=config.n_combat_queries,
+            d_model=d, n_heads=nh,
+            n_layers=config.qformer_combat_layers,
             input_dim=config.combat_feature_dim,
-            hidden_dim=config.combat_hidden,
-            output_dim=config.combat_output,
-            query_dim=config.global_output,
-            extra_dim=2 * config.kind_embed_dim,  # leaf kind ‖ parent kind, concatenated
-            n_heads=config.attn_n_heads,
+            extra_dim=2 * config.kind_embed_dim,
+            ffn_expansion=exp,
         )
-        self.terrain_encoder = HitboxEncoder(
+        self.terrain_qformer = QFormer(
+            n_queries=config.n_terrain_queries,
+            d_model=d, n_heads=nh,
+            n_layers=config.qformer_terrain_layers,
             input_dim=config.terrain_feature_dim,
-            hidden_dim=config.terrain_hidden,
-            output_dim=config.terrain_output,
-            query_dim=config.global_output,
-            n_heads=config.attn_n_heads,
+            extra_dim=0,
+            ffn_expansion=exp,
         )
 
-        # Per-hitbox semantic identity. Index 0 == "unknown" (used by padding too).
-        self.kind_embed = nn.Embedding(config.kind_vocab_size, config.kind_embed_dim, padding_idx=0)
+        # Per-token positional + type embeddings for the trunk sequence.
+        # Type ids: 0=combat-query, 1=terrain-query, 2=global-token.
+        n_tokens = config.n_combat_queries + config.n_terrain_queries + 1
+        self.n_tokens = n_tokens
+        self.type_embed = nn.Embedding(3, d)
+        type_ids = torch.zeros(n_tokens, dtype=torch.long)
+        type_ids[config.n_combat_queries:config.n_combat_queries + config.n_terrain_queries] = 1
+        type_ids[-1] = 2
+        self.register_buffer("token_type_ids", type_ids)
+        # Index of the global token within the trunk sequence (always last).
+        self.global_token_idx = n_tokens - 1
 
-        trunk_in = config.combat_output + config.terrain_output + config.global_output
-        self.trunk = nn.Sequential(
-            nn.Linear(trunk_in, config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.ReLU(),
-        )
+        self.pos_embed = nn.Parameter(torch.zeros(n_tokens, d))
+        nn.init.normal_(self.pos_embed, std=0.02)
 
-        # GRU for temporal memory (bottleneck: hidden_dim -> gru_dim -> hidden_dim).
-        # Use nn.GRU (cuDNN-fused, processes whole sequence in one kernel) rather
-        # than nn.GRUCell so training over L-step chunks vectorizes.
+        # Learned identity for the GRU-produced memory token, which gets
+        # appended to the trunk sequence before the readout cross-attn.
+        # Same role as pos_embed[i] + type_embed[i] for trunk tokens — gives
+        # the memory slot a distinct signature the readout queries can
+        # recognize. Added AFTER gru_ln so the LN doesn't erase it.
+        self.memory_identity = nn.Parameter(torch.zeros(d))
+        nn.init.normal_(self.memory_identity, std=0.02)
+
+        # Trunk: self-attention over the 8+4+1 = 13 mixed tokens.
+        self.trunk = nn.ModuleList([
+            SelfAttnBlock(d, nh, exp) for _ in range(config.trunk_n_layers)
+        ])
+        self.trunk_norm = nn.LayerNorm(d)
+
+        # GRU for temporal memory on the global token. Kept in fp32.
         gru_dim = config.gru_dim
-        self.gru_proj_in = nn.Linear(config.hidden_dim, gru_dim)
+        self.gru_proj_in = nn.Linear(d, gru_dim)
         self.gru = nn.GRU(gru_dim, gru_dim, num_layers=1, batch_first=True)
-        self.gru_proj_out = nn.Linear(gru_dim, config.hidden_dim)
-        self.gru_ln = nn.LayerNorm(config.hidden_dim)
+        self.gru_proj_out = nn.Linear(gru_dim, d)
+        self.gru_ln = nn.LayerNorm(d)
 
-        # Actor heads
-        self.head_movement = nn.Linear(config.hidden_dim, config.movement_n)
-        self.head_direction = nn.Linear(config.hidden_dim, config.direction_n)
-        self.head_action = nn.Linear(config.hidden_dim, config.action_n)
-        self.head_jump = nn.Linear(config.hidden_dim, config.jump_n)
+        # Per-head readout: one learned query per head, cross-attending to
+        # the 14-key sequence (13 trunk tokens + 1 GRU memory token).
+        self.readout_queries = nn.Parameter(torch.zeros(RO.N, d))
+        nn.init.normal_(self.readout_queries, std=0.02)
+        self.readout_block = CrossAttnBlock(d, nh, exp)
 
-        # Decomposed critic: separate heads for attack and defense value
+        # Actor heads — linear off each query's row.
+        self.head_movement = nn.Linear(d, config.movement_n)
+        self.head_direction = nn.Linear(d, config.direction_n)
+        self.head_action = nn.Linear(d, config.action_n)
+        self.head_jump = nn.Linear(d, config.jump_n)
+
+        # Critic heads — 3-layer MLPs off each query's row. Value functions
+        # benefit from extra nonlinear depth (regression), the policy heads
+        # don't (the readout query + linear is enough).
         self.critic_attack = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim, 1),
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Linear(d, 1),
         )
         self.critic_defense = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim, 1),
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Linear(d, d),
+            nn.GELU(),
+            nn.Linear(d, 1),
         )
+
+        self._use_bf16 = bool(getattr(config, "use_bf16", True))
 
         self._init_weights()
 
+    # ---------------------------------------------------------------- init
     def _init_weights(self):
+        # Residual-output projections (W_o, ffn[-1]) get a small init so the
+        # transformer starts near identity through the stack.
+        n_blocks = (
+            self.config.qformer_combat_layers
+            + self.config.qformer_terrain_layers
+            + self.config.trunk_n_layers
+            + 1  # readout block
+        )
+        attn_residual_scale = 1.0 / (2 * max(n_blocks, 1)) ** 0.5
+
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if "head_" in name:
                     nn.init.orthogonal_(module.weight, gain=0.01)
-                elif name.endswith(".2") and "critic_" in name:
+                elif "critic_" in name and name.endswith(".4"):
+                    # Final 1-D output layer of the 3-layer critic MLP.
                     nn.init.orthogonal_(module.weight, gain=1.0)
+                elif name.endswith(".W_o") or (
+                    "ffn" in name and name.endswith(".2")
+                ):
+                    nn.init.orthogonal_(module.weight, gain=attn_residual_scale)
                 else:
                     nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1.0)
                 nn.init.constant_(module.bias, 0.0)
 
-        # GRU: small init so residual starts as near-passthrough
+        # GRU: small init so the residual into the global slot starts as
+        # near-passthrough (the readout sees ~unchanged trunk tokens at t=0).
         nn.init.orthogonal_(self.gru.weight_ih_l0, gain=0.1)
         nn.init.orthogonal_(self.gru.weight_hh_l0, gain=0.1)
         nn.init.constant_(self.gru.bias_ih_l0, 0.0)
@@ -168,14 +350,10 @@ class FullKnightActorCritic(nn.Module):
         nn.init.orthogonal_(self.gru_proj_out.weight, gain=0.1)
         nn.init.constant_(self.gru_proj_out.bias, 0.0)
 
-        # Bias action head toward attack_tap (idx 0) at init, and away from
-        # the four hold actions (1=nail_charge, 3=focus, 5=dream_nail,
-        # 6=super_dash). Each hold pick triggers a long C#-side commit
-        # (36 / 12 / 71 / 24 steps under the captureDeltaTime regime, see
-        # ProxyController.LockedStepsFor); without a bias, random init puts
-        # ~50% mass on holds → the agent spends most of early training
-        # frozen in useless commits. -2.0 brings combined hold mass to ~8%
-        # at init, roughly matching pre-lock-fix time-in-commit.
+        # Bias the action head toward attack_tap and away from the four
+        # hold actions (1=nail_charge, 3=focus, 5=dream_nail, 6=super_dash).
+        # See ProxyController.LockedStepsFor for why holds dominate
+        # wall-clock without this bias.
         hold_bias = float(getattr(self.config, "hold_action_init_bias", -2.0))
         with torch.no_grad():
             self.head_action.bias[0] = 1.0
@@ -183,37 +361,83 @@ class FullKnightActorCritic(nn.Module):
                 for idx in (1, 3, 5, 6):
                     self.head_action.bias[idx] = hold_bias
 
-    def _encode(self, obs: Observation, hx=None):
+    # ----------------------------------------------------------- internals
+    def _trunk(self, obs):
+        """QFormers + trunk self-attn. Returns (B, 13, d) sequence in the
+        ambient dtype (bf16 under autocast, fp32 otherwise)."""
         global_emb = self.global_encoder(obs.global_state)
-        # Factored identity: leaf-kind embedding ‖ parent-name embedding (concat).
-        # padding_idx=0 means absent parents (e.g. detached projectiles) get a zero parent slot.
+
         kind_emb = torch.cat(
-            [self.kind_embed(obs.combat_kind_ids), self.kind_embed(obs.combat_parent_ids)],
+            [self.kind_embed(obs.combat_kind_ids),
+             self.kind_embed(obs.combat_parent_ids)],
             dim=-1,
         )
-        combat_emb = self.combat_encoder(obs.combat_hb, obs.combat_mask, global_emb, extra=kind_emb)
-        terrain_emb = self.terrain_encoder(obs.terrain_hb, obs.terrain_mask, global_emb)
-        combined = torch.cat([combat_emb, terrain_emb, global_emb], dim=-1)
-        trunk_out = self.trunk(combined)  # (B, hidden)
 
-        # Bottleneck GRU step (seq_len=1) with residual connection.
-        # nn.GRU expects (B, L, D) input and (num_layers, B, D) hidden.
-        gru_in_flat = self.gru_proj_in(trunk_out)            # (B, gru_dim)
+        combat_q = self.combat_qformer(
+            obs.combat_hb, obs.combat_mask, global_emb, extra=kind_emb,
+        )
+        terrain_q = self.terrain_qformer(
+            obs.terrain_hb, obs.terrain_mask, global_emb,
+        )
+        global_tok = global_emb.unsqueeze(1)
+
+        seq = torch.cat([combat_q, terrain_q, global_tok], dim=1)        # (B, 13, d)
+        type_emb = self.type_embed(self.token_type_ids)                  # (13, d)
+        seq = seq + self.pos_embed.unsqueeze(0) + type_emb.unsqueeze(0)
+
+        for layer in self.trunk:
+            seq = layer(seq)
+        return self.trunk_norm(seq)
+
+    def _readout(self, trunk_seq):
+        """Run the per-head readout cross-attn. Returns (B, RO.N, d)."""
+        B = trunk_seq.shape[0]
+        q = self.readout_queries.unsqueeze(0).expand(B, -1, -1).contiguous()
+        return self.readout_block(q, trunk_seq, kv_mask=None)
+
+    def _gru_step(self, trunk_global, hx):
+        """Single-step GRU on the global token. Runs in fp32.
+
+        trunk_global: (B, d) fp32, hx: (B, gru_dim) fp32 (or None).
+        Returns memory_token (B, d) fp32 — the new memory token to append
+        to the trunk sequence — and hx_new (B, gru_dim).
+        """
+        gru_in = self.gru_proj_in(trunk_global).unsqueeze(1)             # (B, 1, gru_dim)
         if hx is None:
-            hx = torch.zeros(trunk_out.shape[0], self.gru.hidden_size,
-                             device=trunk_out.device)
-        gru_in = gru_in_flat.unsqueeze(1)                    # (B, 1, gru_dim)
-        hx_in = hx.unsqueeze(0).contiguous()                 # (1, B, gru_dim)
-        gru_seq, hx_layered = self.gru(gru_in, hx_in)
-        gru_hidden = gru_seq.squeeze(1)                      # (B, gru_dim)
-        hx_new = hx_layered.squeeze(0)                       # (B, gru_dim)
-        gru_out = self.gru_proj_out(gru_hidden)              # (B, hidden)
-        features = trunk_out + self.gru_ln(gru_out)
+            hx = torch.zeros(trunk_global.shape[0], self.gru.hidden_size,
+                             device=trunk_global.device, dtype=trunk_global.dtype)
+        gru_seq, hx_layered = self.gru(gru_in, hx.unsqueeze(0).contiguous())
+        gru_out = self.gru_proj_out(gru_seq.squeeze(1))                  # (B, d)
+        # LN first (normalizes scale), then add identity bias so the
+        # learned constant survives normalization.
+        memory_token = self.gru_ln(gru_out) + self.memory_identity
+        return memory_token, hx_layered.squeeze(0)
 
-        return features, hx_new
+    def _encode(self, obs: Observation, hx=None):
+        """Single timestep. Returns (readout (B, RO.N, d), hx_new (B, gru_dim))."""
+        if self._use_bf16 and obs.global_state.is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                trunk_seq_bf = self._trunk(obs)
+            trunk_seq = trunk_seq_bf.float()
+        else:
+            trunk_seq = self._trunk(obs)
+
+        trunk_global = trunk_seq[:, self.global_token_idx, :]            # (B, d) fp32
+        memory_token, hx_new = self._gru_step(trunk_global, hx)
+
+        # Append memory as the 14th token; readout cross-attends to all of it.
+        readout_seq = torch.cat([trunk_seq, memory_token.unsqueeze(1)], dim=1)
+
+        if self._use_bf16 and readout_seq.is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                readout_bf = self._readout(readout_seq)
+            readout = readout_bf.float()
+        else:
+            readout = self._readout(readout_seq)
+
+        return readout, hx_new
 
     def _extract_validity(self, global_state):
-        """Extract the 9 validity flags from global_state via named GS indices."""
         return (
             global_state[..., GS.CAN_JUMP],
             global_state[..., GS.CAN_DOUBLE_JUMP],
@@ -227,13 +451,10 @@ class FullKnightActorCritic(nn.Module):
         )
 
     def _mask_logits(self, logits_action, logits_jump, global_state):
-        """Apply action validity masking to logits."""
         (can_jump, can_double_jump, can_wall_jump, can_dash,
          can_attack, can_cast, can_nail_charge, can_dream_nail, can_super_dash) = \
             self._extract_validity(global_state)
 
-        # Action head: [attack_tap, nail_charge, spell_tap, focus, dash,
-        #               dream_nail, super_dash, none]
         logits_action[..., 0] = logits_action[..., 0] + (can_attack - 1) * 1e4
         logits_action[..., 1] = logits_action[..., 1] + (can_nail_charge - 1) * 1e4
         logits_action[..., 2] = logits_action[..., 2] + (can_cast - 1) * 1e4
@@ -242,44 +463,27 @@ class FullKnightActorCritic(nn.Module):
         logits_action[..., 5] = logits_action[..., 5] + (can_dream_nail - 1) * 1e4
         logits_action[..., 6] = logits_action[..., 6] + (can_super_dash - 1) * 1e4
 
-        # Jump head: [yes, no]
         can_any_jump = torch.clamp(can_jump + can_double_jump + can_wall_jump, 0, 1)
         logits_jump[..., 0] = logits_jump[..., 0] + (can_any_jump - 1) * 1e4
 
         return logits_action, logits_jump
 
+    # ----------------------------------------------------------- public API
     def get_value(self, obs: Observation, hx=None):
-        h, hx_new = self._encode(obs, hx)
-        return self.critic_attack(h).squeeze(-1), self.critic_defense(h).squeeze(-1), hx_new
+        readout, hx_new = self._encode(obs, hx)
+        v_atk = self.critic_attack(readout[:, RO.CRITIC_ATK, :]).squeeze(-1)
+        v_def = self.critic_defense(readout[:, RO.CRITIC_DEF, :]).squeeze(-1)
+        return v_atk, v_def, hx_new
 
     def get_action_and_value(self, obs: Observation, hx=None, actions=None):
-        """
-        If actions is None: sample new actions.
-        If actions is provided: compute log_probs and entropy for given actions.
+        readout, hx_new = self._encode(obs, hx)
 
-        actions: dict with keys 'movement', 'direction', 'action', 'jump',
-                 each (B,) LongTensor.
-        Returns: actions_dict, log_prob (B,), entropy (B,), value_atk (B,),
-                 value_def (B,), hx_new (B, hidden_dim),
-                 log_prob_action (B,), entropy_action (B,).
-        log_prob_action / entropy_action are the action-head's contributions
-        alone — the caller subtracts them from the total on hard-commit steps
-        (where action[2] was overridden by the env).
-        """
-        h, hx_new = self._encode(obs, hx)
-
-        logits_m = self.head_movement(h)
-        logits_d = self.head_direction(h)
-        logits_a = self.head_action(h).clone()
-        logits_j = self.head_jump(h).clone()
-
-        # Apply validity masking
+        logits_m = self.head_movement(readout[:, RO.MOVEMENT, :])
+        logits_d = self.head_direction(readout[:, RO.DIRECTION, :])
+        logits_a = self.head_action(readout[:, RO.ACTION, :]).clone()
+        logits_j = self.head_jump(readout[:, RO.JUMP, :]).clone()
         logits_a, logits_j = self._mask_logits(logits_a, logits_j, obs.global_state)
 
-        # validate_args=False: skip Distribution.__init__'s `valid.all()` check,
-        # which is a GPU->CPU sync (4 of them per forward) and breaks CUDA graph
-        # capture. Logits come from Linear layers; malformed logits are an
-        # upstream bug, not something to validate per-step.
         dist_m = Categorical(logits=logits_m, validate_args=False)
         dist_d = Categorical(logits=logits_d, validate_args=False)
         dist_a = Categorical(logits=logits_a, validate_args=False)
@@ -305,8 +509,8 @@ class FullKnightActorCritic(nn.Module):
         ent_a = dist_a.entropy()
         entropy = dist_m.entropy() + dist_d.entropy() + ent_a + dist_j.entropy()
 
-        value_atk = self.critic_attack(h).squeeze(-1)
-        value_def = self.critic_defense(h).squeeze(-1)
+        value_atk = self.critic_attack(readout[:, RO.CRITIC_ATK, :]).squeeze(-1)
+        value_def = self.critic_defense(readout[:, RO.CRITIC_DEF, :]).squeeze(-1)
 
         actions_dict = {
             "movement": a_m,
@@ -317,56 +521,62 @@ class FullKnightActorCritic(nn.Module):
         return actions_dict, log_prob, entropy, value_atk, value_def, hx_new, lp_a, ent_a
 
     def forward_sequence(self, obs: Observation, hx, actions):
-        """Truncated BPTT over a chunk of L timesteps.
-
-        Vectorized: encoders/trunk/heads/critic all process (B*L) in one shot,
-        and the GRU uses cuDNN's fused sequence kernel. Only the GRU itself
-        retains a temporal dependency.
-
-        Args:
-            obs:     Observation with leading dims (B, L, ...).
-            hx:      (B, hidden_dim) initial hidden state.
-            actions: dict of (B, L) LongTensors keyed by movement/direction/action/jump.
-
-        Returns: log_probs (B,L), entropies (B,L), values_atk (B,L), values_def (B,L),
-                 gru_info dict
+        """Truncated BPTT over a chunk of L timesteps. Same return tuple as
+        the prior architecture so PPO / the training graph runner do not
+        need to change. Trunk + readout vectorize over (B*L); only the GRU
+        has a temporal dependency (handled by cuDNN's fused L-step kernel).
         """
         B, L = obs.global_state.shape[:2]
 
-        # --- Phase 1: encoders + trunk vectorized over (B*L) ---
-        flat_combat_hb = obs.combat_hb.reshape(B * L, *obs.combat_hb.shape[2:])
-        flat_combat_mask = obs.combat_mask.reshape(B * L, obs.combat_mask.shape[-1])
-        flat_combat_kind_ids = obs.combat_kind_ids.reshape(B * L, obs.combat_kind_ids.shape[-1])
-        flat_combat_parent_ids = obs.combat_parent_ids.reshape(B * L, obs.combat_parent_ids.shape[-1])
-        flat_terrain_hb = obs.terrain_hb.reshape(B * L, *obs.terrain_hb.shape[2:])
-        flat_terrain_mask = obs.terrain_mask.reshape(B * L, obs.terrain_mask.shape[-1])
-        flat_global = obs.global_state.reshape(B * L, obs.global_state.shape[-1])
-
-        flat_global_emb = self.global_encoder(flat_global)
-        flat_kind_emb = torch.cat(
-            [self.kind_embed(flat_combat_kind_ids), self.kind_embed(flat_combat_parent_ids)],
-            dim=-1,
+        # ---- Phase 1: flatten (B, L, ...) → (B*L, ...) and run trunk ----
+        flat_obs = Observation(
+            combat_hb=obs.combat_hb.reshape(B * L, *obs.combat_hb.shape[2:]),
+            combat_mask=obs.combat_mask.reshape(B * L, obs.combat_mask.shape[-1]),
+            combat_kind_ids=obs.combat_kind_ids.reshape(B * L, obs.combat_kind_ids.shape[-1]),
+            combat_parent_ids=obs.combat_parent_ids.reshape(B * L, obs.combat_parent_ids.shape[-1]),
+            terrain_hb=obs.terrain_hb.reshape(B * L, *obs.terrain_hb.shape[2:]),
+            terrain_mask=obs.terrain_mask.reshape(B * L, obs.terrain_mask.shape[-1]),
+            global_state=obs.global_state.reshape(B * L, obs.global_state.shape[-1]),
         )
-        flat_combat_emb = self.combat_encoder(flat_combat_hb, flat_combat_mask, flat_global_emb, extra=flat_kind_emb)
-        flat_terrain_emb = self.terrain_encoder(flat_terrain_hb, flat_terrain_mask, flat_global_emb)
-        flat_combined = torch.cat([flat_combat_emb, flat_terrain_emb, flat_global_emb], dim=-1)
-        flat_trunk = self.trunk(flat_combined)                       # (B*L, hidden)
-        trunk_seq = flat_trunk.view(B, L, -1)                        # (B, L, hidden)
 
-        # --- Phase 2: bottleneck GRU over the full sequence in one cuDNN call ---
-        gru_in_seq = self.gru_proj_in(trunk_seq)                     # (B, L, gru_dim)
-        hx_in = hx.unsqueeze(0).contiguous()                         # (1, B, gru_dim)
-        gru_hidden_seq, _ = self.gru(gru_in_seq, hx_in)              # (B, L, gru_dim)
-        gru_seq = self.gru_proj_out(gru_hidden_seq)                  # (B, L, hidden)
-        features_seq = trunk_seq + self.gru_ln(gru_seq)              # residual
+        if self._use_bf16 and flat_obs.global_state.is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                flat_trunk_bf = self._trunk(flat_obs)
+            flat_trunk = flat_trunk_bf.float()
+        else:
+            flat_trunk = self._trunk(flat_obs)                            # (B*L, S, d)
 
-        # --- Phase 3: heads + critic vectorized over (B*L) ---
-        flat_features = features_seq.reshape(B * L, -1)
+        S = flat_trunk.shape[1]
+        d = flat_trunk.shape[2]
+        trunk_seq = flat_trunk.view(B, L, S, d)
 
-        logits_m = self.head_movement(flat_features)
-        logits_d = self.head_direction(flat_features)
-        logits_a = self.head_action(flat_features).clone()
-        logits_j = self.head_jump(flat_features).clone()
+        # ---- Phase 2: GRU over the L-step global-token sequence ----
+        trunk_globals = trunk_seq[:, :, self.global_token_idx, :]        # (B, L, d)
+        gru_in_seq = self.gru_proj_in(trunk_globals)                     # (B, L, gru_dim)
+        gru_hidden_seq, _ = self.gru(gru_in_seq, hx.unsqueeze(0).contiguous())
+        gru_out_seq = self.gru_proj_out(gru_hidden_seq)                  # (B, L, d)
+        # LN + learned identity → memory token per step.
+        memory_seq = self.gru_ln(gru_out_seq) + self.memory_identity     # (B, L, d)
+
+        # Append memory as the (S+1)th token at each step.
+        readout_seq_BL = torch.cat([trunk_seq, memory_seq.unsqueeze(2)], dim=2)
+        flat_readout_in = readout_seq_BL.reshape(B * L, S + 1, d)
+
+        # ---- Phase 3: readout cross-attn (B*L, RO.N, d) ----
+        if self._use_bf16 and flat_readout_in.is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                flat_readout_bf = self._readout(flat_readout_in)
+            flat_readout = flat_readout_bf.float()
+        else:
+            flat_readout = self._readout(flat_readout_in)                # (B*L, RO.N, d)
+
+        flat_global = flat_obs.global_state
+
+        # ---- Phase 4: heads + critic per readout row ----
+        logits_m = self.head_movement(flat_readout[:, RO.MOVEMENT, :])
+        logits_d = self.head_direction(flat_readout[:, RO.DIRECTION, :])
+        logits_a = self.head_action(flat_readout[:, RO.ACTION, :]).clone()
+        logits_j = self.head_jump(flat_readout[:, RO.JUMP, :]).clone()
         logits_a, logits_j = self._mask_logits(logits_a, logits_j, flat_global)
 
         dist_m = Categorical(logits=logits_m, validate_args=False)
@@ -391,8 +601,8 @@ class FullKnightActorCritic(nn.Module):
             dist_m.entropy() + dist_d.entropy()
             + ent_a_flat + dist_j.entropy()
         )
-        v_atk_flat = self.critic_attack(flat_features).squeeze(-1)
-        v_def_flat = self.critic_defense(flat_features).squeeze(-1)
+        v_atk_flat = self.critic_attack(flat_readout[:, RO.CRITIC_ATK, :]).squeeze(-1)
+        v_def_flat = self.critic_defense(flat_readout[:, RO.CRITIC_DEF, :]).squeeze(-1)
 
         log_probs = log_prob_flat.view(B, L)
         entropies = entropy_flat.view(B, L)
@@ -401,9 +611,8 @@ class FullKnightActorCritic(nn.Module):
         log_probs_action = lp_a_flat.view(B, L)
         entropies_action = ent_a_flat.view(B, L)
 
-        # Return as tensor (not .item()) so this function is CUDA-graph-captureable.
-        # Caller .item()s after replay if it needs a Python float.
-        gru_info = {'gru_norm': gru_seq.detach().norm(dim=-1).mean()}
+        # Diagnostic: norm of the GRU residual into the global slot.
+        gru_info = {'gru_norm': gru_out_seq.detach().norm(dim=-1).mean()}
 
         return (log_probs, entropies, values_atk, values_def, gru_info,
                 log_probs_action, entropies_action)
