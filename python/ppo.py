@@ -75,7 +75,7 @@ class PPO:
         )
 
         self.policy = FullKnightActorCritic(config).to(self.device)
-        self.hx = None  # GRU hidden state, shape (N, hidden_dim) during rollout
+        self.hx = None  # GRU hidden state, shape (N, gru_dim) during rollout
 
         # Only normalize continuous features (indices 0:n_cont), not binary validity flags
         self.obs_normalizer = RunningNormalizer(config.global_state_dim - config.n_binary_flags)
@@ -428,7 +428,7 @@ class PPO:
         damage_landed_arr, hits_taken_arr, hp_healed_arr: (T, N)
         values_atk_arr, values_def_arr: (T+1, N)
         D_per_env: (N,) per-env curriculum scaling factor (one D per boss assignment)
-        buf_hx: (T, N, hidden_dim) GRU hidden states at each timestep
+        buf_hx: (T, N, gru_dim) GRU hidden states at each timestep
         dones_arr: (T, N) boolean array, True if episode ended at that step
         valid_arr: (T, N) boolean array, True for steps that should contribute
                    to the loss. Post-death filler steps (frozen all-zero obs

@@ -55,17 +55,42 @@ class Config:
     global_state_dim: int = 22   # vel(2), hp, soul, knight_bounds(2), 7 ability flags, 9 validity flags
     n_binary_flags: int = 16     # 7 ability unlock + 9 action validity (not normalized)
 
-    # Encoder dims
-    global_hidden: int = 64
-    global_output: int = 64
-    combat_hidden: int = 64
-    combat_output: int = 64
-    terrain_hidden: int = 64
-    terrain_output: int = 64
-    hidden_dim: int = 256
+    # Model architecture (QFormer hitbox compressor + transformer trunk).
+    # d_model is the working width carried through QFormers, trunk, and
+    # heads. n_heads splits d_model into head_dim = d_model // n_heads
+    # chunks; head_dim=64 is the sweet spot for Ada flash-attention. FFN
+    # expansion sets the hidden width of the per-block MLP (d → exp*d → d).
+    model_d: int = 768
+    model_n_heads: int = 12         # head_dim = 64 at d=768
+    model_ffn_expansion: int = 4    # FFN hidden = exp * d
+    # QFormer learned-query counts. The combat QFormer cross-attends to all
+    # combat hitboxes from `n_combat_queries` learned tokens; each token
+    # learns a different role (target body / attack collider / projectile /
+    # threat / ...). Terrain gets fewer queries because the signal is
+    # mostly "what is close" rather than role-specific.
+    n_combat_queries: int = 8
+    n_terrain_queries: int = 4
+    # Per-side depth. Combat gets more layers because identifying the right
+    # combat token (boss vs projectile vs trail) is the hard part.
+    qformer_combat_layers: int = 2
+    qformer_terrain_layers: int = 1
+    # Trunk self-attention layers over the concatenated QFormer tokens +
+    # global token. After `trunk_n_layers` of refinement, the global token
+    # output goes into the GRU; its hidden state is then appended as a
+    # 14th memory token before the per-head readout cross-attn.
+    trunk_n_layers: int = 2
+    # bf16 autocast around the heavy transformer compute (encoders, QFormer,
+    # trunk, readout). GRU and Categorical math stay in fp32. Big speedup on
+    # Ada tensor cores (4080 Super, etc); disable to debug or for non-CUDA.
+    use_bf16: bool = True
+
+    # Hold-action init bias for the action head: adds this logit offset to
+    # the four hold actions (1=nail_charge, 3=focus, 5=dream_nail, 6=super_dash)
+    # at init so they're not picked ~50% of the time on random init.
+    hold_action_init_bias: float = -2.0
 
     # GRU (temporal memory)
-    gru_dim: int = 64           # bottleneck dimension for GRU (hidden_dim -> gru_dim -> hidden_dim)
+    gru_dim: int = 256          # bottleneck dimension for GRU (d_model -> gru_dim -> d_model)
     seq_len: int = 16           # truncated BPTT chunk length
     chunks_per_batch: int = 8   # chunks per minibatch (effective batch = chunks_per_batch * seq_len)
 
