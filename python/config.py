@@ -95,6 +95,14 @@ class Config:
     # the penalty for having taken that damage. Creates dodge > heal > tank ordering.
     heal_coef: float = 0.65
 
+    # Per-boss return-variance EMA for value-loss normalization (PopArt-lite).
+    # Base decay applied at the "fair share" of samples per boss (= total_valid /
+    # n_active_bosses); for a boss with n samples this rollout, the effective
+    # decay is β ** (n / fair_share) so heavier-represented bosses move the EMA
+    # more. First time a boss is observed, EMA is seeded from this rollout's
+    # variance with no smoothing.
+    value_var_ema: float = 0.9
+
     # Fake-reset (boss-rotation throttling). With this enabled, the C# damage
     # hooks intercept lethal hits with probability fake_reset_prob, clamp them
     # to leave 1 HP, then restore both knight and boss HPs to max. The

@@ -414,7 +414,8 @@ class PPO:
                          log_probs_action_arr,
                          damage_landed_arr, hits_taken_arr, hp_healed_arr,
                          values_atk_arr, values_def_arr, D_per_env, buf_hx,
-                         dones_arr=None, valid_arr=None, committed_arr=None):
+                         dones_arr=None, valid_arr=None, committed_arr=None,
+                         boss_per_env=None, value_var_state=None):
         """Train on a collected rollout with chunked truncated BPTT.
 
         obs_buf: list of length T, each element a per-step Observation with
@@ -440,6 +441,19 @@ class PPO:
                        masked to zero on committed steps; movement/direction/
                        jump heads remain free and contribute normally.
                        None = no commits this rollout.
+        boss_per_env: list of length N giving the boss name for each env.
+                      When provided, enables per-boss advantage normalization
+                      (per-rollout mean/std per boss) and per-boss value-loss
+                      variance normalization (EMA-tracked across rollouts via
+                      value_var_state). When None, falls back to rollout-wide
+                      stats — single-boss equivalent behavior.
+        value_var_state: dict {boss: {"atk_var_ema": float|None,
+                                      "def_var_ema": float|None}}.
+                         Mutated in place after this rollout's variance is
+                         folded in. Required when boss_per_env is provided.
+                         EMA decay is β ** (boss_samples / fair_share) so
+                         heavier-represented bosses move the EMA more; a boss
+                         with no valid samples this rollout is left untouched.
         """
         T, N = damage_landed_arr.shape
         cfg = self.config
@@ -581,35 +595,130 @@ class PPO:
         tm_chunks = chunk_obs(flat_tm)
         gs_chunks = chunk_obs(flat_gs)
 
-        # Normalize advantages over valid samples only (filler-step advantages
-        # are degenerate small values that would shift the mean toward 0).
-        # Capture pre-normalization std as a diagnostic — tells you whether
-        # clip_eps is sized right for the current curriculum-scaled adv regime.
-        flat_adv = adv_chunks.reshape(-1)
-        flat_valid_np = valid_chunks.reshape(-1)
-        valid_count = float(flat_valid_np.sum())
-        adv_std_raw = 0.0
-        if valid_count > 1:
-            adv_mean = float((flat_adv * flat_valid_np).sum() / valid_count)
-            adv_var = float(((flat_adv - adv_mean) ** 2 * flat_valid_np).sum() / valid_count)
-            adv_std_raw = float(np.sqrt(adv_var))
-            flat_adv = (flat_adv - adv_mean) / (adv_std_raw + 1e-8)
-        adv_chunks = flat_adv.reshape(total_chunks, L)
+        # --- Per-boss advantage normalization + per-boss value-loss variance.
+        # When boss_per_env is provided we normalize each sample by its own
+        # boss's stats (per-rollout for advantage, EMA-tracked for value var)
+        # so mixing bosses with different reward scales doesn't dilute either
+        # signal. Falls back to rollout-wide stats when boss_per_env is None.
+        # Chunk layout from chunk_tn: chunk_idx = chunk_block * N + env_i, so
+        # env-per-chunk is chunk_idx % N. All L steps in a chunk share an env
+        # (and therefore a boss).
+        env_per_chunk = np.arange(total_chunks) % N
+        if boss_per_env is not None:
+            assert len(boss_per_env) == N, (
+                f"boss_per_env length {len(boss_per_env)} != N={N}")
+            boss_per_chunk = np.array([boss_per_env[e] for e in env_per_chunk])
+            unique_bosses = list(dict.fromkeys(boss_per_env))  # preserves order
+        else:
+            boss_per_chunk = np.full(total_chunks, "__all__", dtype=object)
+            unique_bosses = ["__all__"]
 
-        # Per-rollout return variance for scale-invariant value loss. atk and def
-        # returns differ by ~10x in magnitude; without normalization, atk MSE
-        # dominates the gradient and the (now-removed) max_value_loss clamp had
-        # to truncate the bulk of it. Computed once per rollout from valid
-        # samples; used as a fixed scalar across all minibatches so the loss is
-        # stable within the rollout. Floored with a small epsilon to stay sane
-        # if returns happen to be near-constant.
+        # Per-boss advantage normalization (per-rollout, no EMA — PPO trust
+        # region wants current-batch scaling). Per-sample mean/std lookup is
+        # built per-chunk and broadcast over L.
+        adv_mean_per_chunk = np.zeros(total_chunks, dtype=np.float32)
+        adv_std_per_chunk = np.ones(total_chunks, dtype=np.float32)
+        # Per-rollout per-boss adv std for diagnostics; also feeds adv_std_raw
+        # as the sample-weighted mean across bosses (keeps the metric meaningful
+        # when the dashboard already plots a single scalar).
+        adv_std_by_boss = {}
+        sample_weighted_std_num = 0.0
+        sample_weighted_std_den = 0.0
+        for boss in unique_bosses:
+            chunk_mask = (boss_per_chunk == boss)
+            if not chunk_mask.any():
+                continue
+            boss_adv = adv_chunks[chunk_mask].reshape(-1)
+            boss_valid = valid_chunks[chunk_mask].reshape(-1)
+            n_valid = float(boss_valid.sum())
+            if n_valid > 1:
+                m = float((boss_adv * boss_valid).sum() / n_valid)
+                v = float(((boss_adv - m) ** 2 * boss_valid).sum() / n_valid)
+                s = float(np.sqrt(v))
+                adv_mean_per_chunk[chunk_mask] = m
+                adv_std_per_chunk[chunk_mask] = s
+                adv_std_by_boss[boss] = s
+                sample_weighted_std_num += s * n_valid
+                sample_weighted_std_den += n_valid
+        adv_std_raw = (sample_weighted_std_num / sample_weighted_std_den
+                       if sample_weighted_std_den > 0 else 0.0)
+        adv_chunks = (
+            (adv_chunks - adv_mean_per_chunk[:, None])
+            / (adv_std_per_chunk[:, None] + 1e-8)
+        )
+
+        # Per-boss return-variance EMA for value-loss normalization (PopArt-lite).
+        # Compute this rollout's per-boss variance over valid samples, fold into
+        # the EMA at rate β ** (boss_samples / fair_share). Bosses with no valid
+        # samples this rollout keep their existing EMA. Fair share is total_valid
+        # / n_active_bosses so the decay is calibrated to balanced rollouts.
+        beta_base = float(cfg.value_var_ema)
+        if boss_per_env is not None:
+            boss_per_env_arr = np.array(boss_per_env)
+        else:
+            boss_per_env_arr = np.full(N, "__all__", dtype=object)
+
+        atk_var_per_env = np.zeros(N, dtype=np.float32)
+        def_var_per_env = np.zeros(N, dtype=np.float32)
+        atk_var_by_boss = {}
+        def_var_by_boss = {}
+        total_valid_samples = int(valid_bool.sum()) if valid_bool.any() else 0
+        n_active_bosses = max(1, sum(
+            1 for b in unique_bosses
+            if (boss_per_env_arr == b).any()
+            and valid_bool[:, boss_per_env_arr == b].any()
+        ))
+        fair_share = max(1.0, total_valid_samples / n_active_bosses)
+        for boss in unique_bosses:
+            env_mask = (boss_per_env_arr == boss)
+            if not env_mask.any():
+                continue
+            sub_valid = valid_bool[:, env_mask]
+            if not sub_valid.any():
+                # Boss had no valid samples this rollout — leave EMA untouched,
+                # but seed per-env denominators from existing EMA (or fallback).
+                if value_var_state is not None and boss in value_var_state:
+                    prev = value_var_state[boss]
+                    if prev.get("atk_var_ema") is not None:
+                        atk_var_per_env[env_mask] = float(prev["atk_var_ema"])
+                    if prev.get("def_var_ema") is not None:
+                        def_var_per_env[env_mask] = float(prev["def_var_ema"])
+                continue
+            atk_v = float(all_atk_returns[:, env_mask][sub_valid].var())
+            def_v = float(all_def_returns[:, env_mask][sub_valid].var())
+            atk_var_by_boss[boss] = atk_v
+            def_var_by_boss[boss] = def_v
+            n_samples = float(sub_valid.sum())
+            if value_var_state is not None and boss in value_var_state:
+                slot = value_var_state[boss]
+                if slot.get("atk_var_ema") is None or slot.get("def_var_ema") is None:
+                    # First observation — seed without smoothing.
+                    slot["atk_var_ema"] = atk_v
+                    slot["def_var_ema"] = def_v
+                else:
+                    beta_eff = beta_base ** (n_samples / fair_share)
+                    slot["atk_var_ema"] = float(
+                        beta_eff * slot["atk_var_ema"] + (1.0 - beta_eff) * atk_v)
+                    slot["def_var_ema"] = float(
+                        beta_eff * slot["def_var_ema"] + (1.0 - beta_eff) * def_v)
+                atk_var_per_env[env_mask] = float(slot["atk_var_ema"])
+                def_var_per_env[env_mask] = float(slot["def_var_ema"])
+            else:
+                # No EMA state — use this rollout's per-boss variance directly.
+                atk_var_per_env[env_mask] = atk_v
+                def_var_per_env[env_mask] = def_v
+
+        # Aggregate scalars retained for the metrics dict (dashboard continuity).
         if valid_bool.any():
             atk_var = float(all_atk_returns[valid_bool].var())
             def_var = float(all_def_returns[valid_bool].var())
         else:
             atk_var = def_var = 0.0
-        atk_var_eff = atk_var + 1e-3
-        def_var_eff = def_var + 1e-3
+
+        # Per-sample variance denominators, broadcast through chunk layout.
+        # Floor with 1e-3 like the old atk_var_eff/def_var_eff.
+        atk_var_per_chunk = np.maximum(atk_var_per_env[env_per_chunk], 0.0) + 1e-3
+        def_var_per_chunk = np.maximum(def_var_per_env[env_per_chunk], 0.0) + 1e-3
 
         train_phase_t["normalize"] = _time.perf_counter() - _t_phase
         _t_phase = _time.perf_counter()
@@ -634,6 +743,8 @@ class PPO:
         hx_t = torch.from_numpy(hx_chunks).float().to(self.device)
         valid_t = torch.from_numpy(valid_chunks).float().to(self.device)
         committed_t = torch.from_numpy(committed_chunks).float().to(self.device)
+        atk_var_t = torch.from_numpy(atk_var_per_chunk).float().to(self.device)
+        def_var_t = torch.from_numpy(def_var_per_chunk).float().to(self.device)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         train_phase_t["h2d"] = _time.perf_counter() - _t_phase
@@ -719,6 +830,11 @@ class PPO:
                 valid_flat = valid_t[idx].reshape(-1)
                 committed_flat = committed_t[idx].reshape(-1)
                 valid_sum = valid_flat.sum().clamp(min=1.0)
+                # Per-sample value-loss variance denominators. All L steps in
+                # a chunk share a boss → atk_var_t/def_var_t are (total_chunks,)
+                # and broadcast over L.
+                atk_var_flat = atk_var_t[idx].unsqueeze(-1).expand(-1, v_atk.shape[-1]).reshape(-1)
+                def_var_flat = def_var_t[idx].unsqueeze(-1).expand(-1, v_def.shape[-1]).reshape(-1)
 
                 # Hard-commit masking: on committed steps, the action head's
                 # log_prob and entropy contributions are subtracted out so the
@@ -735,13 +851,14 @@ class PPO:
                 surrogate = (surrogate_per * valid_flat).sum() / valid_sum
 
                 # Raw squared error for logging (dashboard continuity); the
-                # actual loss divides by per-head return variance so atk and
-                # def contribute equal magnitudes regardless of return scale.
+                # actual loss divides per-sample by that sample's boss-specific
+                # EMA return variance so atk/def — and per-boss return scales —
+                # all contribute comparable magnitudes to the gradient.
                 atk_vloss = (v_atk_flat - atk_ret_flat).pow(2)
                 def_vloss = (v_def_flat - def_ret_flat).pow(2)
                 value_loss = (
-                    (atk_vloss * valid_flat).sum() / (valid_sum * atk_var_eff)
-                    + (def_vloss * valid_flat).sum() / (valid_sum * def_var_eff)
+                    (atk_vloss * valid_flat / atk_var_flat).sum() / valid_sum
+                    + (def_vloss * valid_flat / def_var_flat).sum() / valid_sum
                 )
 
                 entropy_loss = -(entropy_eff * valid_flat).sum() / valid_sum
@@ -834,6 +951,10 @@ class PPO:
                     "D": float(s["D"]),
                     "landed_window": list(s["landed_window"]),
                     "taken_window": list(s["taken_window"]),
+                    "atk_var_ema": (None if s.get("atk_var_ema") is None
+                                    else float(s["atk_var_ema"])),
+                    "def_var_ema": (None if s.get("def_var_ema") is None
+                                    else float(s["def_var_ema"])),
                 }
                 for b, s in boss_state.items()
             }
@@ -907,6 +1028,11 @@ class PPO:
                     boss_state[b]["landed_window"].extend(s["landed_window"])
                     boss_state[b]["taken_window"].clear()
                     boss_state[b]["taken_window"].extend(s["taken_window"])
+                    # var EMA fields may be missing on pre-PopArt checkpoints; leave None.
+                    if s.get("atk_var_ema") is not None:
+                        boss_state[b]["atk_var_ema"] = float(s["atk_var_ema"])
+                    if s.get("def_var_ema") is not None:
+                        boss_state[b]["def_var_ema"] = float(s["def_var_ema"])
                     restored.append(f"{b}={s['D']:.2f}")
                 else:
                     dropped.append(b)

@@ -502,6 +502,10 @@ async def train(config: Config):
             "D": config.D_initial,
             "landed_window": deque(maxlen=D_window_eff),
             "taken_window":  deque(maxlen=D_window_eff),
+            # PopArt-lite per-boss return variance for value-loss normalization.
+            # Lazy-init from the first rollout that has samples for this boss.
+            "atk_var_ema": None,
+            "def_var_ema": None,
         } for b in bosses}
         rng = np.random.default_rng(config.seed or None)
         env_boss = [bosses[int(rng.integers(len(bosses)))] for _ in range(config.n_envs)]
@@ -1207,6 +1211,7 @@ async def train(config: Config):
                 damage_landed_arr, hits_taken_arr, hp_healed_arr,
                 values_atk_arr, values_def_arr, D_per_env, buf_hx_arr,
                 dones_arr, valid_arr, committed_arr,
+                boss_per_env=active_boss, value_var_state=boss_state,
             )
             torch.cuda.synchronize()
             t_train = time.perf_counter() - t0
