@@ -198,6 +198,13 @@ class Config:
     graph_combat_buckets: str = "8,16,32,64"   # comma-separated
     graph_terrain_buckets: str = "96"          # one bucket is plenty if terrain is camera-clipped
 
+    # CUDA Graphs for the PPO training inner loop — captures
+    # forward_sequence + loss + backward + clip_grad_norm as one graph per
+    # (combat_bucket, terrain_bucket). optimizer.step() runs eagerly so LR
+    # annealing keeps working and we stay on the standard (non-capturable)
+    # Adam code path. Reuses the rollout's graph_*_buckets; same caps apply.
+    use_train_cuda_graphs: bool = True
+
     # Debug
     visualize: bool = False
     # Persist env 0's boss FSM transition graph + state-change history to

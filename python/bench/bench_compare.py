@@ -89,9 +89,28 @@ def load_new_model_class():
 
 
 def make_old_config():
+    """Build a Config that satisfies the old model's __init__.
+
+    The old model expects per-encoder dim attrs (`global_hidden`, `combat_hidden`,
+    `combat_output`, etc.) and a small `gru_dim=64` bottleneck that the new
+    Config no longer defines. Values match `main:python/config.py` defaults so
+    we benchmark the old model at its real shipped capacity.
+    """
     cfg = Config()
-    cfg.__dict__["attn_n_heads"] = 4
-    cfg.__dict__["hold_action_init_bias"] = -2.0
+    old_defaults = {
+        "global_hidden": 64,
+        "global_output": 64,
+        "combat_hidden": 64,
+        "combat_output": 64,
+        "terrain_hidden": 64,
+        "terrain_output": 64,
+        "hidden_dim": 512,
+        "attn_n_heads": 4,
+        "gru_dim": 64,
+        "hold_action_init_bias": -2.0,
+    }
+    for k, v in old_defaults.items():
+        cfg.__dict__[k] = v
     return cfg
 
 
@@ -326,6 +345,13 @@ def run_model(label, model_cls, cfg):
 
     for path, use_graph, use_bf16 in cases:
         dtype = torch.bfloat16 if use_bf16 else None
+        # The new model's _encode / forward_sequence enter their own internal
+        # torch.autocast when self._use_bf16 is True. Toggle it here so the
+        # "bf16=0" axis really runs fp32 internally (the outer autocast_ctx
+        # alone is not enough — without this we'd be measuring redundant
+        # outer-wrap on/off rather than fp32 vs bf16).
+        if hasattr(model, "_use_bf16"):
+            model._use_bf16 = use_bf16
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
