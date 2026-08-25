@@ -19,6 +19,8 @@ class VecEnv:
         self._ws_connections = [None] * self.n_envs
         self._server = None
         self.vocab = KindVocab(max_size=config.kind_vocab_size)
+        # Separate vocab for animation clip names — see config.anim_vocab_size.
+        self.anim_vocab = KindVocab(max_size=config.anim_vocab_size, label="anim")
         # Latest level assigned per env. Annotates slow-op prints and lets
         # callers grab the boss name from dt-tagged results without having
         # to thread env_boss through step_all.
@@ -137,11 +139,13 @@ class VecEnv:
         step_wall_times = np.array([dt for dt, _ in ordered], dtype=np.float32)
         results = [r for _, r in ordered]
         (combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists,
-         damage_landed, hits_taken, hp_healed, step_game_times, step_real_times,
+         combat_anim_lists, damage_landed, hits_taken, hp_healed,
+         step_game_times, step_real_times,
          done_flags, committed_flags) = zip(*results)
 
         obs = self._batch_observations(list(zip(
-            combat_lists, terrain_lists, gs_list, combat_kind_lists, combat_parent_lists)))
+            combat_lists, terrain_lists, gs_list, combat_kind_lists,
+            combat_parent_lists, combat_anim_lists)))
         damage_landed = np.array(damage_landed, dtype=np.float32)
         hits_taken = np.array(hits_taken, dtype=np.float32)
         hp_healed = np.array(hp_healed, dtype=np.float32)
@@ -207,7 +211,8 @@ class VecEnv:
     def reap_completed_resets(self, only=None):
         """Collect any reset tasks that have finished. Returns a list of
         (env_i, raw_obs_tuple) where raw_obs_tuple is the per-env reset
-        return value (combat_hb, terrain_hb, gs, combat_kinds, combat_parents).
+        return value (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
+        combat_anims).
 
         Completed tasks are removed from self._reset_tasks. Exceptions are
         re-raised loudly — a silently-failed reset should crash the run
@@ -267,10 +272,13 @@ class VecEnv:
     def _batch_observations(self, obs_list):
         """Pad hitbox lists and stack into tensors.
 
-        obs_list: list of (combat_hb, terrain_hb, global_state, combat_kinds, combat_parents) tuples.
-        Returns (combat_hb_batch, combat_mask, combat_kind_ids, combat_parent_ids,
-                 terrain_hb_batch, terrain_mask, gs_batch).
-        combat_kind_ids/parent_ids: int32 (B, max_combat); padding rows are 0 ("unknown").
+        obs_list: list of (combat_hb, terrain_hb, global_state, combat_kinds,
+        combat_parents, combat_anims) tuples.
+        Returns a batched Observation.
+        combat_kind_ids/parent_ids/anim_ids: int32 (B, max_combat); padding rows
+        are 0 ("unknown"). Kind and parent share one vocab (a body's leaf id and
+        an attack's parent id are meant to collapse to the same row); anim ids
+        come from a separate vocab and a separate embedding table.
         """
         combat_lists = [obs[0] for obs in obs_list]
         # View-box gate: drop offscreen terrain at observation construction time
@@ -282,6 +290,7 @@ class VecEnv:
         gs_list = [obs[2] for obs in obs_list]
         kind_lists = [obs[3] if len(obs) > 3 else [] for obs in obs_list]
         parent_lists = [obs[4] if len(obs) > 4 else [] for obs in obs_list]
+        anim_lists = [obs[5] if len(obs) > 5 else [] for obs in obs_list]
 
         B = len(obs_list)
 
@@ -293,6 +302,7 @@ class VecEnv:
         combat_mask = np.zeros((B, max_combat), dtype=np.float32)
         combat_kind_ids = np.zeros((B, max_combat), dtype=np.int32)
         combat_parent_ids = np.zeros((B, max_combat), dtype=np.int32)
+        combat_anim_ids = np.zeros((B, max_combat), dtype=np.int32)
         for i, hb in enumerate(combat_lists):
             n = len(hb)
             if n > 0:
@@ -304,6 +314,9 @@ class VecEnv:
                 ps = parent_lists[i]
                 if ps:
                     combat_parent_ids[i, :n] = self.vocab.encode_list(ps[:n])
+                as_ = anim_lists[i]
+                if as_:
+                    combat_anim_ids[i, :n] = self.anim_vocab.encode_list(as_[:n])
 
         # Pad terrain hitboxes
         max_terrain = max((len(t) for t in terrain_lists), default=0)
@@ -324,6 +337,7 @@ class VecEnv:
             combat_mask=combat_mask,
             combat_kind_ids=combat_kind_ids,
             combat_parent_ids=combat_parent_ids,
+            combat_anim_ids=combat_anim_ids,
             terrain_hb=terrain_batch,
             terrain_mask=terrain_mask,
             global_state=gs_batch,

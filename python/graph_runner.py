@@ -12,8 +12,8 @@ caller fills those buffers (CPU memcpy, microseconds) and replays.
 
 Padding semantics: combat/terrain dims are ceiling-padded to the next
 bucket and zero-filled. Mask columns for pad slots are 0 so masked
-attention ignores them. kind_ids/parent_ids 0 == kind_embed.padding_idx
-which already maps to a zero embedding.
+attention ignores them. kind_ids/parent_ids/anim_ids 0 ==
+kind_embed/anim_embed padding_idx, which already maps to a zero embedding.
 
 Why this works with continuous training:
   - graph captures *kernel launches with addresses*, not values
@@ -67,6 +67,7 @@ class BucketedGraphRunner:
             "combat_mask": self._pin((B, n_combat)),
             "combat_kind_ids": self._pin((B, n_combat), torch.int64),
             "combat_parent_ids": self._pin((B, n_combat), torch.int64),
+            "combat_anim_ids": self._pin((B, n_combat), torch.int64),
             "terrain_hb": self._pin((B, n_terrain, cfg.terrain_feature_dim)),
             "terrain_mask": self._pin((B, n_terrain)),
             "global_state": self._pin((B, cfg.global_state_dim)),
@@ -80,6 +81,7 @@ class BucketedGraphRunner:
                 combat_mask=d_in["combat_mask"],
                 combat_kind_ids=d_in["combat_kind_ids"],
                 combat_parent_ids=d_in["combat_parent_ids"],
+                combat_anim_ids=d_in["combat_anim_ids"],
                 terrain_hb=d_in["terrain_hb"],
                 terrain_mask=d_in["terrain_mask"],
                 global_state=d_in["global_state"],
@@ -174,6 +176,7 @@ class BucketedGraphRunner:
         h_in["combat_mask"].numpy()[:, :n_combat_in] = np_obs.combat_mask
         h_in["combat_kind_ids"].numpy()[:, :n_combat_in] = np_obs.combat_kind_ids
         h_in["combat_parent_ids"].numpy()[:, :n_combat_in] = np_obs.combat_parent_ids
+        h_in["combat_anim_ids"].numpy()[:, :n_combat_in] = np_obs.combat_anim_ids
         h_in["terrain_hb"].numpy()[:, :n_terrain_in] = np_obs.terrain_hb
         h_in["terrain_mask"].numpy()[:, :n_terrain_in] = np_obs.terrain_mask
         h_in["global_state"].numpy()[:] = np_obs.global_state
@@ -183,6 +186,7 @@ class BucketedGraphRunner:
             h_in["combat_mask"].numpy()[:, n_combat_in:] = 0
             h_in["combat_kind_ids"].numpy()[:, n_combat_in:] = 0
             h_in["combat_parent_ids"].numpy()[:, n_combat_in:] = 0
+            h_in["combat_anim_ids"].numpy()[:, n_combat_in:] = 0
         if n_terrain_in < t:
             h_in["terrain_hb"].numpy()[:, n_terrain_in:] = 0
             h_in["terrain_mask"].numpy()[:, n_terrain_in:] = 0

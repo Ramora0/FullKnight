@@ -39,6 +39,7 @@ def merge_obs_padded(dst, src, indices):
         combat_mask=merge_padded(dst.combat_mask, src.combat_mask, indices),
         combat_kind_ids=merge_padded(dst.combat_kind_ids, src.combat_kind_ids, indices),
         combat_parent_ids=merge_padded(dst.combat_parent_ids, src.combat_parent_ids, indices),
+        combat_anim_ids=merge_padded(dst.combat_anim_ids, src.combat_anim_ids, indices),
         terrain_hb=merge_padded(dst.terrain_hb, src.terrain_hb, indices),
         terrain_mask=merge_padded(dst.terrain_mask, src.terrain_mask, indices),
     )
@@ -55,6 +56,7 @@ def slice_obs(obs, indices):
         combat_mask=obs.combat_mask[idx],
         combat_kind_ids=obs.combat_kind_ids[idx],
         combat_parent_ids=obs.combat_parent_ids[idx],
+        combat_anim_ids=obs.combat_anim_ids[idx],
         terrain_hb=obs.terrain_hb[idx],
         terrain_mask=obs.terrain_mask[idx],
         global_state=obs.global_state[idx],
@@ -478,6 +480,7 @@ async def train(config: Config):
         await vec_env.start_server()
         if vis is not None:
             vis.vocab = vec_env.vocab
+            vis.anim_vocab = vec_env.anim_vocab
 
         bosses = config.boss_levels_list
         assert len(bosses) > 0, "config.boss_levels must list at least one scene"
@@ -522,7 +525,8 @@ async def train(config: Config):
         start_env_steps = 0
         if config.resume:
             start_env_steps = agent.load_checkpoint(
-                config.resume, vocab=vec_env.vocab, boss_state=boss_state
+                config.resume, vocab=vec_env.vocab, boss_state=boss_state,
+                anim_vocab=vec_env.anim_vocab,
             )
             print(f"Resumed from: {config.resume}")
         print(f"Using device: {agent.device}")
@@ -845,6 +849,7 @@ async def train(config: Config):
                     combat_mask=obs.combat_mask.copy(),
                     combat_kind_ids=obs.combat_kind_ids.copy(),
                     combat_parent_ids=obs.combat_parent_ids.copy(),
+                    combat_anim_ids=obs.combat_anim_ids.copy(),
                     terrain_hb=obs.terrain_hb.copy(),
                     terrain_mask=obs.terrain_mask.copy(),
                     global_state=obs.global_state.copy(),
@@ -1444,6 +1449,7 @@ async def train(config: Config):
                 agent.save_checkpoint(
                     path, vocab=vec_env.vocab, boss_state=boss_state,
                     env_steps=env_steps_collected,
+                    anim_vocab=vec_env.anim_vocab,
                 )
                 print(f"  Saved checkpoint: {path}")
                 last_save_step = env_steps_collected
@@ -1483,6 +1489,7 @@ async def train(config: Config):
         agent.save_checkpoint(
             f"{config.save_path}_final.pth", vocab=vec_env.vocab,
             boss_state=boss_state, env_steps=env_steps_collected,
+            anim_vocab=vec_env.anim_vocab,
         )
         wandb.finish()
 

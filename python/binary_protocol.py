@@ -15,7 +15,7 @@ MSG_PAUSE  = 4
 MSG_RESUME = 5
 MSG_CLOSE  = 6
 
-COMBAT_FEAT  = 13  # must match config.combat_feature_dim
+COMBAT_FEAT  = 14  # must match config.combat_feature_dim
 TERRAIN_FEAT = 8   # must match config.terrain_feature_dim
 GLOBAL_DIM   = 33  # must match config.global_state_dim and StateExtractor.GlobalStateDim
 
@@ -209,8 +209,8 @@ def pop_last_diag():
 def unpack_step(data):
     """Unpack a step response.
     Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-             damage_landed, hits_taken, hp_healed, game_time, real_time, done,
-             committed).
+             combat_anims, damage_landed, hits_taken, hp_healed, game_time,
+             real_time, done, committed).
     `committed`: True iff action[2] was overridden by the C#-side hard-commit
     state machine this step. Python masks the action-head policy gradient on
     these steps. Defaults to False if absent (older C# DLL).
@@ -226,6 +226,7 @@ def unpack_step(data):
     offset += 1
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
     combat_parents, offset = unpack_kinds(data, offset, n_combat)
+    combat_anims, offset = unpack_kinds(data, offset, n_combat)
     _last_terrain_debug, offset = unpack_terrain_debug(data, offset, n_terrain)
     global _last_fsm_snapshots
     # Diag trailer (14 bytes). Defensive: older C# mods don't send it.
@@ -248,12 +249,13 @@ def unpack_step(data):
     # send it — returns empty list. Drained via pop_last_fsm_snapshots().
     _last_fsm_snapshots, offset = _unpack_fsm_snapshots(data, offset)
     return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-            damage_landed, hits_taken, hp_healed, game_time, real_time, done,
-            committed)
+            combat_anims, damage_landed, hits_taken, hp_healed, game_time,
+            real_time, done, committed)
 
 def unpack_reset(data):
     """Unpack a reset response.
-    Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents).
+    Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
+             combat_anims).
     Phase trailer (if present) is stashed in _last_reset_phases — read it
     via pop_last_reset_phases(). FSM snapshots (if present) are stashed in
     _last_fsm_snapshots — read via pop_last_fsm_snapshots()."""
@@ -262,6 +264,7 @@ def unpack_reset(data):
     n_terrain = terrain_hb.shape[0]
     combat_kinds, offset = unpack_kinds(data, offset, n_combat)
     combat_parents, offset = unpack_kinds(data, offset, n_combat)
+    combat_anims, offset = unpack_kinds(data, offset, n_combat)
     _last_terrain_debug, offset = unpack_terrain_debug(data, offset, n_terrain)
     # Reset phase trailer (43 bytes). Defensive: older C# mods don't send it.
     if offset + _RESET_PHASE_TRAILER_SIZE <= len(data):
@@ -280,4 +283,4 @@ def unpack_reset(data):
     # FSM-snapshot trailer (variable length). Defensive: older C# mods don't
     # send it — returns empty list.
     _last_fsm_snapshots, offset = _unpack_fsm_snapshots(data, offset)
-    return combat_hb, terrain_hb, gs, combat_kinds, combat_parents
+    return combat_hb, terrain_hb, gs, combat_kinds, combat_parents, combat_anims

@@ -49,6 +49,12 @@ namespace FullKnight.Game
 		public readonly Dictionary<Collider2D, (Vector2 rel, long tick)> prevRelCache = new();
 		public long MotionTick = 0;
 
+		// Nearest tk2dSpriteAnimator for a combat collider (self, then ancestors,
+		// then children). Cached like the other per-collider lookups. A cached
+		// null is a real answer — "this collider has no animator" — so we don't
+		// re-walk the hierarchy every step for projectiles that never have one.
+		public readonly Dictionary<Collider2D, tk2dSpriteAnimator> animCache = new();
+
 		/// <summary>Drop cached motion history. Called on episode boundaries that
 		/// keep the reader alive (fake resets), so the first step of the new
 		/// episode doesn't report displacement measured across the boundary.</summary>
@@ -86,6 +92,9 @@ namespace FullKnight.Game
 			var deadMotion = new List<Collider2D>();
 			foreach (var k in prevRelCache.Keys) if (k == null) deadMotion.Add(k);
 			foreach (var k in deadMotion) prevRelCache.Remove(k);
+			var deadAnim = new List<Collider2D>();
+			foreach (var k in animCache.Keys) if (k == null) deadAnim.Add(k);
+			foreach (var k in deadAnim) animCache.Remove(k);
 			// Drop max-hp entries for HMs that have been destroyed.
 			var deadHms = new List<HealthManager>();
 			foreach (var k in hmMaxHpCache.Keys) if (k == null) deadHms.Add(k);
@@ -169,6 +178,58 @@ namespace FullKnight.Game
 			// Force population.
 			GetParentKind(col);
 			return hmCache.TryGetValue(col, out cached) ? cached : null;
+		}
+
+		/// <summary>Nearest tk2dSpriteAnimator for a collider: self, then up to 8
+		/// ancestors, then children as a fallback. Result (including null) is
+		/// cached.</summary>
+		public tk2dSpriteAnimator GetAnimator(Collider2D col)
+		{
+			if (col == null) return null;
+			if (animCache.TryGetValue(col, out var cached)) return cached;
+
+			tk2dSpriteAnimator found = null;
+			try
+			{
+				Transform t = col.transform;
+				int depth = 0;
+				while (t != null && depth < 8 && found == null)
+				{
+					found = t.GetComponent<tk2dSpriteAnimator>();
+					t = t.parent;
+					depth++;
+				}
+				if (found == null) found = col.GetComponentInChildren<tk2dSpriteAnimator>();
+			}
+			catch { found = null; }
+
+			animCache[col] = found;
+			return found;
+		}
+
+		/// <summary>Current animation clip name and normalized progress through it.
+		/// Emits ("", 0) when no animator is reachable or the animator has no clip.
+		///
+		/// Progress is CurrentFrame / frames.Length rather than elapsed clip time:
+		/// tk2d's CurrentFrame is already wrap-aware, so looping, ping-pong and
+		/// once-through clips all report sensibly without branching on wrapMode.
+		/// Frame granularity is plenty — it's the same resolution a player reads
+		/// the telegraph at.</summary>
+		public void GetAnimState(Collider2D col, out string clip, out float progress)
+		{
+			clip = "";
+			progress = 0f;
+			var anim = GetAnimator(col);
+			if (anim == null) return;
+			try
+			{
+				var c = anim.CurrentClip;
+				if (c == null) return;
+				clip = c.name ?? "";
+				int n = c.frames != null ? c.frames.Length : 0;
+				if (n > 0) progress = Mathf.Clamp01(anim.CurrentFrame / (float)n);
+			}
+			catch { }
 		}
 
 		/// <summary>Return the observed max HP for an HM: max of (cached, current).
@@ -349,6 +410,10 @@ namespace FullKnight.Game
 			public List<float[]> CombatHitboxes;
 			public List<string> CombatKinds;
 			public List<string> CombatParents;
+			// Parallel: current animation clip name per combat hitbox ("" if the
+			// collider has no reachable animator). Unlike CombatKinds this varies
+			// step to step — it's the attack telegraph channel.
+			public List<string> CombatAnims;
 			public List<float[]> TerrainHitboxes;
 			// Parallel to TerrainHitboxes; one pipe-delimited debug string per segment.
 			// Format: "name|path|colType|layer|enabled|active|trigger|usedByComposite|bx,by,bw,bh[|probe=val...]|seg_idx=N"
@@ -636,10 +701,10 @@ namespace FullKnight.Game
 
 		/// <summary>
 		/// Extract hitbox features split by type.
-		/// Combat (Enemy + Attack): 13 floats per hitbox —
+		/// Combat (Enemy + Attack): 14 floats per hitbox —
 		///   [rel_x, rel_y, width, height, vel_x, vel_y,
 		///    is_trigger, gives_damage, takes_damage, is_target, is_invincible,
-		///    hp_raw, hp_max_raw]
+		///    anim_progress, hp_raw, hp_max_raw]
 		///   Column order matters: the Python normalizer z-scores a leading
 		///   prefix of continuous columns (combat_normalized_dims), passes the
 		///   binary flags through raw, and log1p-compresses the hp tail. Keep
@@ -650,6 +715,10 @@ namespace FullKnight.Game
 		///   takes_damage = a HealthManager is reachable from this collider.
 		///   is_target    = that HealthManager is in the supplied bossHms set.
 		///   is_invincible = that HealthManager is currently untouchable.
+		///   anim_progress = [0,1] position within the current animation clip,
+		///                   paired with the clip name in CombatAnims. Bounded,
+		///                   so it sits with the flags rather than the z-scored
+		///                   prefix.
 		///   hp_raw       = current HP of the reached HealthManager (0 if none).
 		///   hp_max_raw   = observed max HP (cached on first sight, bumped on refills).
 		/// Both hp_raw and hp_max_raw are emitted RAW; the Python side log1p-compresses
@@ -698,6 +767,7 @@ namespace FullKnight.Game
 			var combat = new List<float[]>();
 			var combatKinds = new List<string>();
 			var combatParents = new List<string>();
+			var combatAnims = new List<string>();
 			var terrain = new List<float[]>();
 			var terrainDebug = new List<string>();
 			float knightW = 0f, knightH = 0f;
@@ -756,13 +826,24 @@ namespace FullKnight.Game
 								(new Vector2(relX, relY), reader.MotionTick);
 						}
 
+						// Current animation + how far through it. This is the
+						// telegraph channel: a boss's windup clip starts frames
+						// before its attack collider ever spawns, so this is the
+						// only input that lets the policy anticipate rather than
+						// react. Static per-collider identity (kind/parent) can't
+						// carry it — those are cached once and never change.
+						string animClip = "";
+						float animProgress = 0f;
+						if (reader != null) reader.GetAnimState(col, out animClip, out animProgress);
+
 						combat.Add(new float[] {
 							relX, relY, w, h, velX, velY,
 							isTrigger, givesDamage, takesDamage, isTarget, isInvincible,
-							hpRaw, hpMaxRaw
+							animProgress, hpRaw, hpMaxRaw
 						});
 						combatKinds.Add(reader != null ? reader.GetKind(col) : "unknown");
 						combatParents.Add(parent);
+						combatAnims.Add(animClip);
 					}
 					else if (kvp.Key == HitboxType.Terrain)
 					{
@@ -795,6 +876,7 @@ namespace FullKnight.Game
 				CombatHitboxes = combat,
 				CombatKinds = combatKinds,
 				CombatParents = combatParents,
+				CombatAnims = combatAnims,
 				TerrainHitboxes = terrain,
 				TerrainDebug = terrainDebug,
 				KnightWidth = knightW,

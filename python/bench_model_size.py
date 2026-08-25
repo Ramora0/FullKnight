@@ -44,6 +44,7 @@ def make_inputs(cfg, B):
     obs = Observation(
         combat_hb=combat_hb, combat_mask=combat_mask,
         combat_kind_ids=combat_kind, combat_parent_ids=combat_parent,
+        combat_kind_ids=combat_kind, combat_anim_ids=combat_parent,
         terrain_hb=terrain_hb, terrain_mask=terrain_mask, global_state=gs,
     )
     return obs, hx

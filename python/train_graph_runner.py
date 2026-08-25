@@ -71,6 +71,7 @@ class BucketedTrainGraphRunner:
             "combat_mask":       z((CPB, L, n_combat)),
             "combat_kind_ids":   z((CPB, L, n_combat), i64),
             "combat_parent_ids": z((CPB, L, n_combat), i64),
+            "combat_anim_ids": z((CPB, L, n_combat), i64),
             "terrain_hb":        z((CPB, L, n_terrain, cfg.terrain_feature_dim)),
             "terrain_mask":      z((CPB, L, n_terrain)),
             "global_state":      z((CPB, L, cfg.global_state_dim)),
@@ -116,6 +117,7 @@ class BucketedTrainGraphRunner:
                 combat_mask=d_in["combat_mask"],
                 combat_kind_ids=d_in["combat_kind_ids"],
                 combat_parent_ids=d_in["combat_parent_ids"],
+                combat_anim_ids=d_in["combat_anim_ids"],
                 terrain_hb=d_in["terrain_hb"],
                 terrain_mask=d_in["terrain_mask"],
                 global_state=d_in["global_state"],
@@ -258,6 +260,7 @@ class BucketedTrainGraphRunner:
         d_in["combat_mask"].zero_()
         d_in["combat_kind_ids"].zero_()
         d_in["combat_parent_ids"].zero_()
+        d_in["combat_anim_ids"].zero_()
         d_in["terrain_hb"].zero_()
         d_in["terrain_mask"].zero_()
 
@@ -265,6 +268,7 @@ class BucketedTrainGraphRunner:
         d_in["combat_mask"][:, :, :n_combat].copy_(obs_mb.combat_mask)
         d_in["combat_kind_ids"][:, :, :n_combat].copy_(obs_mb.combat_kind_ids)
         d_in["combat_parent_ids"][:, :, :n_combat].copy_(obs_mb.combat_parent_ids)
+        d_in["combat_anim_ids"][:, :, :n_combat].copy_(obs_mb.combat_anim_ids)
         d_in["terrain_hb"][:, :, :n_terrain].copy_(obs_mb.terrain_hb)
         d_in["terrain_mask"][:, :, :n_terrain].copy_(obs_mb.terrain_mask)
         d_in["global_state"].copy_(obs_mb.global_state)

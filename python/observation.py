@@ -75,8 +75,10 @@ class CB:
     TAKES_DAMAGE = 8
     IS_TARGET = 9
     IS_INVINCIBLE = 10  # HealthManager currently untouchable (iframes / stagger)
-    HP_RAW = 11      # current HP, raw on the wire; log1p-compressed before the model
-    HP_MAX_RAW = 12  # observed max HP (cached on first sight, refill-aware), same treatment
+    ANIM_PROGRESS = 11  # [0,1] position within the current animation clip; pairs
+                        # with combat_anim_ids. Bounded, so it passes through raw.
+    HP_RAW = 12      # current HP, raw on the wire; log1p-compressed before the model
+    HP_MAX_RAW = 13  # observed max HP (cached on first sight, refill-aware), same treatment
 
 
 class TR:
@@ -112,13 +114,14 @@ class Observation:
       Per-rollout step (after stack): (T, B, ...)
       Per-training chunk: (B, L, ...)
     """
-    combat_hb: Any         # (..., max_combat, 10)
+    combat_hb: Any         # (..., max_combat, 14)
     combat_mask: Any       # (..., max_combat)
-    combat_kind_ids: Any   # (..., max_combat) int
-    combat_parent_ids: Any # (..., max_combat) int
+    combat_kind_ids: Any   # (..., max_combat) int — entity type (static)
+    combat_parent_ids: Any # (..., max_combat) int — owning HealthManager (static)
+    combat_anim_ids: Any   # (..., max_combat) int — current animation clip (per-step)
     terrain_hb: Any        # (..., max_terrain, 8)
     terrain_mask: Any      # (..., max_terrain)
-    global_state: Any      # (..., 22)
+    global_state: Any      # (..., 33)
 
     def replace(self, **kwargs) -> "Observation":
         """Functional update — returns a new Observation with the given fields replaced."""
@@ -148,6 +151,7 @@ class Observation:
         cm = np.zeros((T, N, max_combat), dtype=np.float32)
         ckid = np.zeros((T, N, max_combat), dtype=np.int64)
         cpid = np.zeros((T, N, max_combat), dtype=np.int64)
+        caid = np.zeros((T, N, max_combat), dtype=np.int64)
         thb = np.zeros((T, N, max_terrain, t_feat), dtype=np.float32)
         tm = np.zeros((T, N, max_terrain), dtype=np.float32)
         gs = np.zeros((T, N, g_dim), dtype=np.float32)
@@ -158,6 +162,7 @@ class Observation:
             cm[t, :, :nc] = o.combat_mask
             ckid[t, :, :nc] = o.combat_kind_ids
             cpid[t, :, :nc] = o.combat_parent_ids
+            caid[t, :, :nc] = o.combat_anim_ids
             nt = o.terrain_hb.shape[1]
             thb[t, :, :nt] = o.terrain_hb
             tm[t, :, :nt] = o.terrain_mask
@@ -168,6 +173,7 @@ class Observation:
             combat_mask=cm,
             combat_kind_ids=ckid,
             combat_parent_ids=cpid,
+            combat_anim_ids=caid,
             terrain_hb=thb,
             terrain_mask=tm,
             global_state=gs,
@@ -189,8 +195,9 @@ def mirror_observation(obs: "Observation") -> "Observation":
 
     - global_state: vel_x flips; hp/soul/sizes/ability+validity flags and the
       commit block (direction-agnostic) pass through.
-    - combat: rel_x and vel_x flip; size/flags/hp pass through. Masks/kind/parent
-      ids unchanged.
+    - combat: rel_x and vel_x flip; size/flags/anim_progress/hp pass through.
+      Masks and kind/parent/anim ids unchanged (an animation clip is the same
+      clip when mirrored — HK bosses use one clip set and flip the sprite).
     - terrain: mx, npx flip (knight-relative). hdy flips iff hdx > 0 to keep
       the canonical hdx ≥ 0 invariant after mirroring (geometrically the same
       segment, just represented from the opposite endpoint). Padded rows

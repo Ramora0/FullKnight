@@ -37,7 +37,8 @@ class Visualizer:
     COLOR_PEACEFUL = ( 60, 180,  60)
     COLOR_ATTACK   = (235, 215,  20)
 
-    def __init__(self, vocab=None, terrain_max_dist=None, view_w=None, view_h=None):
+    def __init__(self, vocab=None, terrain_max_dist=None, view_w=None,
+                 view_h=None, anim_vocab=None):
         pygame.display.init()
         pygame.font.init()
         pygame.display.set_caption("FullKnight Observation Viewer")
@@ -45,6 +46,7 @@ class Visualizer:
         self.font = pygame.font.SysFont("consolas", 11)
         self.title_font = pygame.font.SysFont("consolas", 14, bold=True)
         self.vocab = vocab
+        self.anim_vocab = anim_vocab
         # Optional terrain-gating preview: segments outside the gate are still
         # drawn but dimmed, so the user can eyeball how much is filtered before
         # baking the gate into the C# observer.
@@ -168,6 +170,7 @@ class Visualizer:
         c_mask = obs.combat_mask[0]
         c_kid = obs.combat_kind_ids[0]
         c_pid = obs.combat_parent_ids[0]
+        c_aid = obs.combat_anim_ids[0]
         labels = []
         for i in range(len(c_mask)):
             if c_mask[i] < 0.5:
@@ -196,6 +199,18 @@ class Visualizer:
                 label = f"{kid}<{pid}>" if pid > 0 else f"{kid}"
             if row[CB.TAKES_DAMAGE] > 0.5:
                 label += f" hp={int(row[CB.HP_RAW])}/{int(row[CB.HP_MAX_RAW])}"
+            if row[CB.IS_INVINCIBLE] > 0.5:
+                label += " INV"
+            # Animation clip + phase — the telegraph channel. Shown as
+            # "clip:NN%" so a windup is visible ticking up before its attack
+            # collider ever appears.
+            aid = int(c_aid[i])
+            if aid > 0:
+                if self.anim_vocab is not None and 0 <= aid < len(self.anim_vocab):
+                    aname = self.anim_vocab._i2s[aid]
+                else:
+                    aname = str(aid)
+                label += f" {aname}:{row[CB.ANIM_PROGRESS] * 100:.0f}%"
             labels.append((rect.topleft, label, color))
 
         # Knight at origin

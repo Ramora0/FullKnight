@@ -179,7 +179,7 @@ class FullKnightActorCritic(nn.Module):
 
     Per-timestep pipeline:
 
-      1. Encode global state to a d-dim token; embed kind/parent ids.
+      1. Encode global state to a d-dim token; embed kind/parent/anim ids.
       2. Combat QFormer (8 learned queries × 2 cross-attn layers) compresses
          the variable-length combat hitbox set.
       3. Terrain QFormer (4 queries × 1 layer) does the same for terrain.
@@ -222,13 +222,19 @@ class FullKnightActorCritic(nn.Module):
         self.kind_embed = nn.Embedding(
             config.kind_vocab_size, config.kind_embed_dim, padding_idx=0,
         )
+        # Current animation clip per hitbox. Separate table from kind_embed:
+        # clip names live in their own vocab, and unlike kind/parent this id
+        # changes step to step — it's what carries the attack telegraph.
+        self.anim_embed = nn.Embedding(
+            config.anim_vocab_size, config.anim_embed_dim, padding_idx=0,
+        )
 
         self.combat_qformer = QFormer(
             n_queries=config.n_combat_queries,
             d_model=d, n_heads=nh,
             n_layers=config.qformer_combat_layers,
             input_dim=config.combat_feature_dim,
-            extra_dim=2 * config.kind_embed_dim,
+            extra_dim=2 * config.kind_embed_dim + config.anim_embed_dim,
             ffn_expansion=exp,
         )
         self.terrain_qformer = QFormer(
@@ -367,9 +373,14 @@ class FullKnightActorCritic(nn.Module):
         ambient dtype (bf16 under autocast, fp32 otherwise)."""
         global_emb = self.global_encoder(obs.global_state)
 
+        # Per-hitbox identity: what it is (leaf kind), whose it is (parent), and
+        # what it is currently doing (animation clip). The first two are static
+        # per collider; the third changes every step and is what the anim_progress
+        # column in combat_hb is the phase of.
         kind_emb = torch.cat(
             [self.kind_embed(obs.combat_kind_ids),
-             self.kind_embed(obs.combat_parent_ids)],
+             self.kind_embed(obs.combat_parent_ids),
+             self.anim_embed(obs.combat_anim_ids)],
             dim=-1,
         )
 
@@ -534,6 +545,7 @@ class FullKnightActorCritic(nn.Module):
             combat_mask=obs.combat_mask.reshape(B * L, obs.combat_mask.shape[-1]),
             combat_kind_ids=obs.combat_kind_ids.reshape(B * L, obs.combat_kind_ids.shape[-1]),
             combat_parent_ids=obs.combat_parent_ids.reshape(B * L, obs.combat_parent_ids.shape[-1]),
+            combat_anim_ids=obs.combat_anim_ids.reshape(B * L, obs.combat_anim_ids.shape[-1]),
             terrain_hb=obs.terrain_hb.reshape(B * L, *obs.terrain_hb.shape[2:]),
             terrain_mask=obs.terrain_mask.reshape(B * L, obs.terrain_mask.shape[-1]),
             global_state=obs.global_state.reshape(B * L, obs.global_state.shape[-1]),

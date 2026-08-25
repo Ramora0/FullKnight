@@ -48,7 +48,8 @@ class HKEnv:
 
     async def reset(self, eval_mode=False, level=None):
         """Reset environment.
-        Returns (combat_hb, terrain_hb, global_state, combat_kinds, combat_parents)."""
+        Returns (combat_hb, terrain_hb, global_state, combat_kinds,
+        combat_parents, combat_anims)."""
         t0 = time.perf_counter()
         await self.ws.send(pack_reset(
             level if level is not None else self.config.level,
@@ -71,8 +72,8 @@ class HKEnv:
     async def step(self, action_vec):
         """Take a step. action_vec = [movement, direction, action, jump].
         Returns (combat_hb, terrain_hb, global_state, combat_kinds, combat_parents,
-                 damage_landed, hits_taken, hp_healed, step_game_time, step_real_time, done,
-                 committed).
+                 combat_anims, damage_landed, hits_taken, hp_healed,
+                 step_game_time, step_real_time, done, committed).
         """
         t0 = time.perf_counter()
         await self.ws.send(pack_action(action_vec))
@@ -83,15 +84,15 @@ class HKEnv:
             print(f"    [step-wire] action={action_vec} send={(t1-t0)*1000:.0f}ms"
                   f" recv={(t2-t1)*1000:.0f}ms total={(t2-t0)*1000:.0f}ms",
                   flush=True)
-        (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
+        (combat_hb, terrain_hb, gs, combat_kinds, combat_parents, combat_anims,
          damage_landed, hits_taken, hp_healed, game_time, real_time, done,
          committed) = unpack_step(data)
         self.last_terrain_debug = pop_last_terrain_debug()
         self.last_diag = pop_last_diag()
         self.last_fsm = pop_last_fsm_snapshots()
         return (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
-                damage_landed, hits_taken, hp_healed, game_time, real_time, done,
-                committed)
+                combat_anims, damage_landed, hits_taken, hp_healed, game_time,
+                real_time, done, committed)
 
     async def step_eval(self, action_vec):
         """Like step() but also returns done flag. For eval mode."""

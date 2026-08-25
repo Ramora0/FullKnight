@@ -245,6 +245,7 @@ namespace FullKnight.Environment
 				data.combat_hitboxes = fakeObs.CombatHitboxes;
 				data.combat_kinds = fakeObs.CombatKinds;
 				data.combat_parents = fakeObs.CombatParents;
+				data.combat_anims = fakeObs.CombatAnims;
 				data.terrain_hitboxes = fakeObs.TerrainHitboxes;
 				data.terrain_debug = fakeObs.TerrainDebug;
 				data.global_state = fakeGs;
@@ -354,6 +355,7 @@ namespace FullKnight.Environment
 			data.combat_hitboxes = obs.CombatHitboxes;
 			data.combat_kinds = obs.CombatKinds;
 			data.combat_parents = obs.CombatParents;
+			data.combat_anims = obs.CombatAnims;
 			data.terrain_hitboxes = obs.TerrainHitboxes;
 			data.terrain_debug = obs.TerrainDebug;
 			data.global_state = gs;
@@ -525,6 +527,7 @@ namespace FullKnight.Environment
 			data.combat_hitboxes = obs.CombatHitboxes;
 			data.combat_kinds = obs.CombatKinds;
 			data.combat_parents = obs.CombatParents;
+			data.combat_anims = obs.CombatAnims;
 			data.terrain_hitboxes = obs.TerrainHitboxes;
 			data.terrain_debug = obs.TerrainDebug;
 			data.global_state = gs;

@@ -42,11 +42,12 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
 
     agent = None
     vocab = KindVocab(max_size=config.kind_vocab_size)
+    anim_vocab = KindVocab(max_size=config.anim_vocab_size, label="anim")
     if no_agent:
         print(f"No-agent mode: sending noop actions, skipping PPO entirely.")
     else:
         agent = PPO(config)
-        agent.load_checkpoint(checkpoint_path, vocab=vocab)
+        agent.load_checkpoint(checkpoint_path, vocab=vocab, anim_vocab=anim_vocab)
         agent.policy.eval()
         print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Level: {level} | Time scale: {config.time_scale}x | frames_per_wait: {config.frames_per_wait} | Deterministic: {deterministic}")
@@ -62,6 +63,7 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
         vis_h = config.view_h if config.view_h > 0 else None
         vis = Visualizer(
             vocab=vocab,
+            anim_vocab=anim_vocab,
             terrain_max_dist=terrain_max_dist,
             view_w=vis_w, view_h=vis_h,
         )
@@ -125,21 +127,24 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
             if no_agent:
                 action_vec = [2, 2, 7, 1]  # idle: no move/dir/action/jump
             else:
-                action_vec, hx = get_action(agent, raw_obs, config, deterministic, hx, vocab)
+                action_vec, hx = get_action(agent, raw_obs, config, deterministic,
+                                            hx, vocab, anim_vocab)
 
             if vis is not None:
-                combat_hb_list, terrain_hb_list, gs_raw, c_kinds, c_parents = raw_obs
+                (combat_hb_list, terrain_hb_list, gs_raw, c_kinds, c_parents,
+                 c_anims) = raw_obs
                 kind_ids = vocab.encode_list(c_kinds)
                 parent_ids = vocab.encode_list(c_parents)
+                anim_ids = anim_vocab.encode_list(c_anims)
                 vis.update(
                     batch_obs(
                         combat_hb_list, terrain_hb_list, gs_raw,
-                        kind_ids, parent_ids, config,
+                        kind_ids, parent_ids, anim_ids, config,
                     ),
                     terrain_debug=env.last_terrain_debug,
                 )
 
-            (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
+            (combat_hb, terrain_hb, gs, combat_kinds, combat_parents, combat_anims,
              damage, hits, _, _, _, done, _) = await env.step_eval(action_vec)
 
             total_damage += damage
@@ -171,7 +176,8 @@ async def eval_play(checkpoint_path, deterministic=False, time_scale=None,
                     await asyncio.sleep(15)
                 break
 
-            raw_obs = (combat_hb, terrain_hb, gs, combat_kinds, combat_parents)
+            raw_obs = (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
+                       combat_anims)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
@@ -352,9 +358,10 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
 
     agent = None
     vocab = KindVocab(max_size=config.kind_vocab_size)
+    anim_vocab = KindVocab(max_size=config.anim_vocab_size, label="anim")
     if not no_agent:
         agent = PPO(config)
-        agent.load_checkpoint(checkpoint_path, vocab=vocab)
+        agent.load_checkpoint(checkpoint_path, vocab=vocab, anim_vocab=anim_vocab)
         agent.policy.eval()
         print(f"[{label}] Loaded checkpoint: {checkpoint_path}")
     print(f"[{label}] n_envs={n_envs} | n_steps={n_steps} | level={level} | "
@@ -373,7 +380,8 @@ async def extended_eval(checkpoint_path, n_envs, n_steps, time_scale=None,
         print(f"[{label}] hk_path not found ({launch_path}) — launch HK manually.")
 
     vec_env = VecEnv(config)
-    vec_env.vocab = vocab  # share vocab loaded from checkpoint
+    vec_env.vocab = vocab  # share vocabs loaded from checkpoint
+    vec_env.anim_vocab = anim_vocab
     await vec_env.start_server()
 
     obs = await vec_env.reset_all(levels=[level] * n_envs)
@@ -716,7 +724,8 @@ async def compare_graphics(checkpoint_path, n_envs, n_steps, time_scale=None,
                       "GRAPHICAL", results["graphical"])
 
 
-def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_parent_ids_arr, config) -> Observation:
+def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr,
+              combat_parent_ids_arr, combat_anim_ids_arr, config) -> Observation:
     """Pack single-env raw obs into a batched (B=1) Observation."""
     # View-box gate matches what training applies in vec_env._batch_observations.
     terrain_hb_arr = filter_terrain_in_view(
@@ -729,11 +738,13 @@ def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_par
     cm = np.zeros((1, n_combat), dtype=np.float32)
     ckid = np.zeros((1, n_combat), dtype=np.int64)
     cpid = np.zeros((1, n_combat), dtype=np.int64)
+    caid = np.zeros((1, n_combat), dtype=np.int64)
     if len(combat_hb_arr) > 0:
         chb[0, :len(combat_hb_arr)] = combat_hb_arr
         cm[0, :len(combat_hb_arr)] = 1.0
         ckid[0, :len(combat_hb_arr)] = combat_kind_ids_arr
         cpid[0, :len(combat_hb_arr)] = combat_parent_ids_arr
+        caid[0, :len(combat_hb_arr)] = combat_anim_ids_arr
 
     thb = np.zeros((1, n_terrain, config.terrain_feature_dim), dtype=np.float32)
     tm = np.zeros((1, n_terrain), dtype=np.float32)
@@ -746,6 +757,7 @@ def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_par
         combat_mask=cm,
         combat_kind_ids=ckid,
         combat_parent_ids=cpid,
+        combat_anim_ids=caid,
         terrain_hb=thb,
         terrain_mask=tm,
         global_state=gs.reshape(1, -1),
@@ -753,14 +765,17 @@ def batch_obs(combat_hb_arr, terrain_hb_arr, gs, combat_kind_ids_arr, combat_par
 
 
 @torch.no_grad()
-def get_action(agent, raw_obs, config, deterministic, hx, vocab):
+def get_action(agent, raw_obs, config, deterministic, hx, vocab, anim_vocab):
     """Get action from the policy with online normalizer updates (matching training).
     Returns (action_vec, hx_new). raw_obs is the per-env wire tuple."""
-    combat_hb_list, terrain_hb_list, gs, combat_kinds, combat_parents = raw_obs
+    (combat_hb_list, terrain_hb_list, gs, combat_kinds, combat_parents,
+     combat_anims) = raw_obs
     kind_ids = vocab.encode_list(combat_kinds)
     parent_ids = vocab.encode_list(combat_parents)
+    anim_ids = anim_vocab.encode_list(combat_anims)
     np_obs = batch_obs(
-        combat_hb_list, terrain_hb_list, gs, kind_ids, parent_ids, config)
+        combat_hb_list, terrain_hb_list, gs, kind_ids, parent_ids, anim_ids,
+        config)
 
     # Normalize global state (continuous features only, flags pass through).
     # Update running stats first, matching training's collect_action.
@@ -784,6 +799,7 @@ def get_action(agent, raw_obs, config, deterministic, hx, vocab):
         combat_mask=torch.from_numpy(np_obs.combat_mask).float().to(device),
         combat_kind_ids=torch.from_numpy(np_obs.combat_kind_ids).long().to(device),
         combat_parent_ids=torch.from_numpy(np_obs.combat_parent_ids).long().to(device),
+        combat_anim_ids=torch.from_numpy(np_obs.combat_anim_ids).long().to(device),
         terrain_hb=torch.from_numpy(np_obs.terrain_hb).float().to(device),
         terrain_mask=torch.from_numpy(np_obs.terrain_mask).float().to(device),
         global_state=torch.from_numpy(np_obs.global_state).float().to(device),

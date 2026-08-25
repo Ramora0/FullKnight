@@ -33,7 +33,8 @@ class Config:
 
     # Observation dims
     # Combat: [rel_x, rel_y, w, h, vel_x, vel_y, is_trigger, gives_damage,
-    #         takes_damage, is_target, is_invincible, hp_raw, hp_max_raw]
+    #         takes_damage, is_target, is_invincible, anim_progress,
+    #         hp_raw, hp_max_raw]
     # Only the continuous cols (rel_x, rel_y, w, h, vel_x, vel_y) get running-normalized.
     # Binary flags (is_trigger, gives_damage, takes_damage, is_target, is_invincible)
     # pass through raw so sparse flags like is_target don't get amplified by a tiny
@@ -44,7 +45,7 @@ class Config:
     # vel_x/vel_y are knight-relative per-step displacement measured C#-side —
     # row order on the wire is unstable and rows carry no instance identity, so
     # motion cannot be recovered downstream.
-    combat_feature_dim: int = 13
+    combat_feature_dim: int = 14
     combat_normalized_dims: int = 6  # first N combat columns get z-scored; binary flags pass raw; hp cols get log1p
     terrain_feature_dim: int = 8 # [mx, my, hdx, hdy, npx, npy, dist, is_trigger]
     terrain_normalized_dims: int = 7  # is_trigger passes through raw
@@ -101,6 +102,15 @@ class Config:
     # Kind-id embedding (per-hitbox semantic identity, fed into combat encoder)
     kind_vocab_size: int = 512  # cap on distinct kind strings; overflow → "unknown" (loud warning)
     kind_embed_dim: int = 16    # embedding dim concatenated into each combat hitbox feature
+    # Animation-clip embedding. Separate vocab from kinds so clip names ("Slash
+    # Antic", "Idle") don't compete with entity names for the kind cap, and a
+    # boss called "Slash" can't collide with a clip called "Slash".
+    # Clip names are pooled globally rather than namespaced per enemy: "Antic"
+    # and "Idle" mean similar things everywhere, and the kind/parent embeddings
+    # travelling alongside supply the per-enemy specialization. Same factoring
+    # rationale as leaf-kind vs parent-kind.
+    anim_vocab_size: int = 512
+    anim_embed_dim: int = 16
 
     # Action dims
     movement_n: int = 3   # left, right, none

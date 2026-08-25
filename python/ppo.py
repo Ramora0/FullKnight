@@ -322,6 +322,7 @@ class PPO:
         cm_t = torch.from_numpy(obs.combat_mask).float()
         ckid_t = torch.from_numpy(obs.combat_kind_ids).long()
         cpid_t = torch.from_numpy(obs.combat_parent_ids).long()
+        caid_t = torch.from_numpy(obs.combat_anim_ids).long()
         thb_t = torch.from_numpy(thb_norm).float()
         tm_t = torch.from_numpy(obs.terrain_mask).float()
         gs_t = torch.from_numpy(gs_norm).float()
@@ -335,6 +336,7 @@ class PPO:
             combat_mask=cm_t.to(self.device),
             combat_kind_ids=ckid_t.to(self.device),
             combat_parent_ids=cpid_t.to(self.device),
+            combat_anim_ids=caid_t.to(self.device),
             terrain_hb=thb_t.to(self.device),
             terrain_mask=tm_t.to(self.device),
             global_state=gs_t.to(self.device),
@@ -388,6 +390,7 @@ class PPO:
             combat_mask=np.zeros((n_envs, n_combat_in), dtype=np.float32),
             combat_kind_ids=np.zeros((n_envs, n_combat_in), dtype=np.int64),
             combat_parent_ids=np.zeros((n_envs, n_combat_in), dtype=np.int64),
+            combat_anim_ids=np.zeros((n_envs, n_combat_in), dtype=np.int64),
             terrain_hb=np.zeros((n_envs, n_terrain_in, cfg.terrain_feature_dim), dtype=np.float32),
             terrain_mask=np.zeros((n_envs, n_terrain_in), dtype=np.float32),
             global_state=np.zeros((n_envs, cfg.global_state_dim), dtype=np.float32),
@@ -396,6 +399,7 @@ class PPO:
         full_obs.combat_mask[active] = obs.combat_mask
         full_obs.combat_kind_ids[active] = obs.combat_kind_ids
         full_obs.combat_parent_ids[active] = obs.combat_parent_ids
+        full_obs.combat_anim_ids[active] = obs.combat_anim_ids
         full_obs.terrain_hb[active] = thb_norm
         full_obs.terrain_mask[active] = obs.terrain_mask
         full_obs.global_state[active] = gs_norm
@@ -601,6 +605,7 @@ class PPO:
 
         flat_ckid = stacked.combat_kind_ids
         flat_cpid = stacked.combat_parent_ids
+        flat_caid = stacked.combat_anim_ids
         flat_cm = stacked.combat_mask
         flat_tm = stacked.terrain_mask
 
@@ -615,6 +620,7 @@ class PPO:
         cm_chunks = chunk_obs(flat_cm)
         ckid_chunks = chunk_obs(flat_ckid)
         cpid_chunks = chunk_obs(flat_cpid)
+        caid_chunks = chunk_obs(flat_caid)
         thb_chunks = chunk_obs(flat_thb)
         tm_chunks = chunk_obs(flat_tm)
         gs_chunks = chunk_obs(flat_gs)
@@ -754,6 +760,7 @@ class PPO:
             combat_mask=torch.from_numpy(cm_chunks).to(self.device),
             combat_kind_ids=torch.from_numpy(ckid_chunks).long().to(self.device),
             combat_parent_ids=torch.from_numpy(cpid_chunks).long().to(self.device),
+            combat_anim_ids=torch.from_numpy(caid_chunks).long().to(self.device),
             terrain_hb=torch.from_numpy(thb_chunks).to(self.device),
             terrain_mask=torch.from_numpy(tm_chunks).to(self.device),
             global_state=torch.from_numpy(gs_chunks).to(self.device),
@@ -822,6 +829,7 @@ class PPO:
                     combat_mask=obs_t.combat_mask[idx],
                     combat_kind_ids=obs_t.combat_kind_ids[idx],
                     combat_parent_ids=obs_t.combat_parent_ids[idx],
+                    combat_anim_ids=obs_t.combat_anim_ids[idx],
                     terrain_hb=obs_t.terrain_hb[idx],
                     terrain_mask=obs_t.terrain_mask[idx],
                     global_state=obs_t.global_state[idx],
@@ -1029,7 +1037,8 @@ class PPO:
         for pg in self.optimizer.param_groups:
             pg["lr"] = lr
 
-    def save_checkpoint(self, path, vocab=None, boss_state=None, env_steps=None):
+    def save_checkpoint(self, path, vocab=None, boss_state=None, env_steps=None,
+                        anim_vocab=None):
         # Serialize per-boss curriculum state: D plus the raw rolling windows
         # so resume can continue the EMA without a warm-up gap.
         ckpt_boss = None
@@ -1055,13 +1064,14 @@ class PPO:
                 "terrain_normalizer": self.terrain_normalizer.state_dict(),
                 "hx": self.hx,
                 "kind_vocab": vocab.state_dict() if vocab is not None else None,
+                "anim_vocab": anim_vocab.state_dict() if anim_vocab is not None else None,
                 "boss_state": ckpt_boss,
                 "env_steps": env_steps,
             },
             path,
         )
 
-    def load_checkpoint(self, path, vocab=None, boss_state=None):
+    def load_checkpoint(self, path, vocab=None, boss_state=None, anim_vocab=None):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         state = ckpt["model"]
         # Remap old nn.GRUCell parameter names → new nn.GRU names so checkpoints
@@ -1101,6 +1111,9 @@ class PPO:
         if vocab is not None and ckpt.get("kind_vocab") is not None:
             vocab.load_state_dict(ckpt["kind_vocab"])
             print(f"  Loaded kind vocab: {len(vocab)} entries")
+        if anim_vocab is not None and ckpt.get("anim_vocab") is not None:
+            anim_vocab.load_state_dict(ckpt["anim_vocab"])
+            print(f"  Loaded anim vocab: {len(anim_vocab)} entries")
         start_env_steps = 0
         ckpt_env_steps = ckpt.get("env_steps")
         if ckpt_env_steps is not None:

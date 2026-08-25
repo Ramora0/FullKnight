@@ -44,6 +44,7 @@ namespace FullKnight.Net
 				var gs = d.global_state ?? Array.Empty<float>();
 				var kinds = d.combat_kinds ?? new List<string>();
 				var parents = d.combat_parents ?? new List<string>();
+				var anims = d.combat_anims ?? new List<string>();
 
 				w.Write((ushort)combat.Count);
 				w.Write((ushort)terrain.Count);
@@ -87,6 +88,18 @@ namespace FullKnight.Net
 				{
 					string p = i < parents.Count ? (parents[i] ?? "") : "";
 					var bytes = System.Text.Encoding.UTF8.GetBytes(p);
+					int len = bytes.Length > 255 ? 255 : bytes.Length;
+					w.Write((byte)len);
+					w.Write(bytes, 0, len);
+				}
+
+				// Combat animation clip names: same format, one per combat hitbox.
+				// Empty string means "no animator reachable from this collider".
+				// Unlike kinds/parents these change step to step.
+				for (int i = 0; i < combat.Count; i++)
+				{
+					string a = i < anims.Count ? (anims[i] ?? "") : "";
+					var bytes = System.Text.Encoding.UTF8.GetBytes(a);
 					int len = bytes.Length > 255 ? 255 : bytes.Length;
 					w.Write((byte)len);
 					w.Write(bytes, 0, len);
