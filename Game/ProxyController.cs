@@ -33,12 +33,18 @@ namespace FullKnight.Game
 		public CommitState CState = CommitState.Idle;
 		public int LockedAction = -1;     // 0..7: which hold is locked
 		public int LockedStepsLeft = 0;   // steps remaining in Locked phase
+		// Total locked steps for the hold currently in flight. Only used as the
+		// denominator for the charge-progress term in the observation, so the
+		// policy can see how far through a commit it is rather than only that
+		// one is running.
+		public int LockedStepsTotal = 0;
 
 		public void ResetCommit()
 		{
 			CState = CommitState.Idle;
 			LockedAction = -1;
 			LockedStepsLeft = 0;
+			LockedStepsTotal = 0;
 		}
 
 		// Static accessor so non-TrainingEnv callers (SceneHooks) can reach
@@ -318,6 +324,7 @@ namespace FullKnight.Game
 				shim.CState = InputDeviceShim.CommitState.Idle;
 				shim.LockedAction = -1;
 				shim.LockedStepsLeft = 0;
+				shim.LockedStepsTotal = 0;
 			}
 			else if (shim.CState == InputDeviceShim.CommitState.Locked)
 			{
@@ -338,6 +345,7 @@ namespace FullKnight.Game
 				// it freely, KeyAttack/etc gets set true now). Subsequent
 				// (totalLocked - 1) steps stay locked, then one release step.
 				shim.LockedStepsLeft = totalLocked - 1;
+				shim.LockedStepsTotal = totalLocked;
 				shim.CState = (shim.LockedStepsLeft > 0)
 					? InputDeviceShim.CommitState.Locked
 					: InputDeviceShim.CommitState.Releasing;

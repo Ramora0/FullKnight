@@ -16,7 +16,12 @@ import torch
 # ---------------------------------------------------------------------------
 
 class GS:
-    """Global state column indices (22 floats)."""
+    """Global state column indices (33 floats).
+
+    Only indices 0..5 are continuous; everything from HAS_DASH onward is a
+    binary flag or a bounded [0, 1] scalar and bypasses the running normalizer
+    (see config.n_binary_flags). New bounded columns append at the end.
+    """
     VEL_X = 0
     VEL_Y = 1
     HP = 2
@@ -41,20 +46,37 @@ class GS:
     CAN_NAIL_CHARGE = 19
     CAN_DREAM_NAIL = 20
     CAN_SUPER_DASH = 21
+    # Hard-commit proprioception (11): indices 22..32. The C# commit state
+    # machine overrides action[2] for the length of a hold (up to ~71 steps for
+    # dream_nail at frames_per_wait=5) while movement/direction/jump stay free;
+    # these tell the policy a charge is in flight, which one, and how far along.
+    COMMIT_LOCKED = 22     # in the locked phase of a hold
+    COMMIT_RELEASING = 23  # this step forces action[2]=none, firing the hold
+    COMMIT_PROGRESS = 24   # [0, 1] fraction of the locked phase elapsed
+    COMMIT_ACTION_0 = 25   # one-hot over the 8 action slots, all zero when idle
+    COMMIT_ACTION_7 = 32
 
 
 class CB:
-    """Combat hitbox feature column indices (10 floats)."""
+    """Combat hitbox feature column indices (13 floats).
+
+    Grouped continuous-first: columns [0, config.combat_normalized_dims) are
+    z-scored by the running normalizer, the binary flags pass through raw, and
+    the hp tail is log1p-compressed. Preserve that grouping when adding columns.
+    """
     REL_X = 0
     REL_Y = 1
     W = 2
     H = 3
-    IS_TRIGGER = 4
-    GIVES_DAMAGE = 5
-    TAKES_DAMAGE = 6
-    IS_TARGET = 7
-    HP_RAW = 8       # current HP, raw on the wire; log1p-compressed before the model
-    HP_MAX_RAW = 9   # observed max HP (cached on first sight, refill-aware), same treatment
+    VEL_X = 4        # knight-relative displacement since the previous step
+    VEL_Y = 5        # (0 on first sight or after the collider was inactive)
+    IS_TRIGGER = 6
+    GIVES_DAMAGE = 7
+    TAKES_DAMAGE = 8
+    IS_TARGET = 9
+    IS_INVINCIBLE = 10  # HealthManager currently untouchable (iframes / stagger)
+    HP_RAW = 11      # current HP, raw on the wire; log1p-compressed before the model
+    HP_MAX_RAW = 12  # observed max HP (cached on first sight, refill-aware), same treatment
 
 
 class TR:
@@ -165,18 +187,24 @@ class Observation:
 def mirror_observation(obs: "Observation") -> "Observation":
     """World x-axis flip on a torch-tensor Observation.
 
-    - global_state: vel_x flips; hp/soul/sizes/ability+validity flags pass through.
-    - combat: rel_x flips; size/flags/hp pass through. Masks/kind/parent ids unchanged.
+    - global_state: vel_x flips; hp/soul/sizes/ability+validity flags and the
+      commit block (direction-agnostic) pass through.
+    - combat: rel_x and vel_x flip; size/flags/hp pass through. Masks/kind/parent
+      ids unchanged.
     - terrain: mx, npx flip (knight-relative). hdy flips iff hdx > 0 to keep
       the canonical hdx ≥ 0 invariant after mirroring (geometrically the same
       segment, just represented from the opposite endpoint). Padded rows
       (hdx == 0, hdy == 0) stay zero.
+
+    Any new column carrying an x-component or a handedness MUST be flipped here
+    — a miss is silent and corrupts half the augmented data.
     """
     gs = obs.global_state.clone()
     gs[..., GS.VEL_X] = -gs[..., GS.VEL_X]
 
     chb = obs.combat_hb.clone()
     chb[..., CB.REL_X] = -chb[..., CB.REL_X]
+    chb[..., CB.VEL_X] = -chb[..., CB.VEL_X]
 
     thb = obs.terrain_hb.clone()
     thb[..., TR.MX] = -thb[..., TR.MX]

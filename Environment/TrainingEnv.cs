@@ -235,8 +235,13 @@ namespace FullKnight.Environment
 				LogResetPhase("load_boss_scene", "FAKE-LoadBossScene");
 				LogResetPhase("recreate_reader", "FAKE-RecreateReader");
 				LogResetPhase("init_boss_refs", "FAKE-InitBossRefs");
+				// Fake resets keep the reader alive, so drop motion history —
+				// otherwise the first step of the new episode reports a
+				// displacement measured across the episode boundary.
+				_hitboxObserver.ClearMotion();
 				var fakeObs = _hitboxObserver.GetSplitFeatures(_bossHMs, emitTerrainDebug: _evalMode);
-				var fakeGs = StateExtractor.GetGlobalState(fakeObs.KnightWidth, fakeObs.KnightHeight);
+				var fakeGs = StateExtractor.GetGlobalState(
+					fakeObs.KnightWidth, fakeObs.KnightHeight, _inputShim);
 				data.combat_hitboxes = fakeObs.CombatHitboxes;
 				data.combat_kinds = fakeObs.CombatKinds;
 				data.combat_parents = fakeObs.CombatParents;
@@ -343,7 +348,8 @@ namespace FullKnight.Environment
 			_timeManager = new Game.TimeScale(1f);
 
 			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs, emitTerrainDebug: _evalMode);
-			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
+			var gs = StateExtractor.GetGlobalState(
+				obs.KnightWidth, obs.KnightHeight, _inputShim);
 
 			data.combat_hitboxes = obs.CombatHitboxes;
 			data.combat_kinds = obs.CombatKinds;
@@ -378,7 +384,7 @@ namespace FullKnight.Environment
 				data.info = _episodeResult;
 				data.combat_hitboxes = new List<float[]>();
 				data.terrain_hitboxes = new List<float[]>();
-				data.global_state = new float[22];
+				data.global_state = new float[StateExtractor.GlobalStateDim];
 				data.fsm_snapshots = new List<string>();
 				data.damage_landed = 0;
 				data.hits_taken = 0;
@@ -505,7 +511,7 @@ namespace FullKnight.Environment
 				data.info = _episodeResult;
 				data.combat_hitboxes = new List<float[]>();
 				data.terrain_hitboxes = new List<float[]>();
-				data.global_state = new float[22];
+				data.global_state = new float[StateExtractor.GlobalStateDim];
 				data.fsm_snapshots = new List<string>();
 				SendMessage(new Message { type = "step", data = data });
 				yield break;
@@ -513,7 +519,8 @@ namespace FullKnight.Environment
 
 			// Build observation
 			var obs = _hitboxObserver.GetSplitFeatures(_bossHMs, emitTerrainDebug: _evalMode);
-			var gs = StateExtractor.GetGlobalState(obs.KnightWidth, obs.KnightHeight);
+			var gs = StateExtractor.GetGlobalState(
+				obs.KnightWidth, obs.KnightHeight, _inputShim);
 
 			data.combat_hitboxes = obs.CombatHitboxes;
 			data.combat_kinds = obs.CombatKinds;
@@ -856,9 +863,15 @@ namespace FullKnight.Environment
 		// TakeDamageHook here counted iframe-blocked contacts and inflated
 		// hits_taken ~16×, wrecking the reward signal. Return value replaces
 		// the applied damage; pass `damage` through unchanged.
+		//
+		// Accumulates HP lost, not hit count. hp_healed is measured in raw HP
+		// (PlayerData.health delta), so counting hits here put the two halves of
+		// the reward on different scales: against a boss dealing 2 masks a hit,
+		// -1 for the hit against +2*heal_coef for healing it back made getting
+		// hit and healing net positive. Both sides are now HP.
 		private int OnKnightDamaged(int damageType, int damage)
 		{
-			if (!_syntheticKill) _hitsTakenInStep++;
+			if (!_syntheticKill && damage > 0) _hitsTakenInStep += damage;
 			return damage;
 		}
 

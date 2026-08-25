@@ -32,16 +32,20 @@ class Config:
     hk_data_dir: str = "hollow_knight_Data"
 
     # Observation dims
-    # Combat: [rel_x, rel_y, w, h, is_trigger, gives_damage, takes_damage, is_target,
-    #         hp_raw, hp_max_raw]
-    # Only the continuous spatial cols (rel_x, rel_y, w, h) get running-normalized.
-    # Binary flags (is_trigger, gives_damage, takes_damage, is_target) pass through raw
-    # so sparse flags like is_target don't get amplified by a tiny running variance.
+    # Combat: [rel_x, rel_y, w, h, vel_x, vel_y, is_trigger, gives_damage,
+    #         takes_damage, is_target, is_invincible, hp_raw, hp_max_raw]
+    # Only the continuous cols (rel_x, rel_y, w, h, vel_x, vel_y) get running-normalized.
+    # Binary flags (is_trigger, gives_damage, takes_damage, is_target, is_invincible)
+    # pass through raw so sparse flags like is_target don't get amplified by a tiny
+    # running variance.
     # hp_raw / hp_max_raw also bypass the running normalizer; PPO log1p-compresses
     # them so they enter the network as ~[0, 8] while keeping high resolution near
     # death (log1p(0)→0, log1p(21)→3.09, log1p(42)→3.76, log1p(2000)→7.6).
-    combat_feature_dim: int = 10
-    combat_normalized_dims: int = 4  # first N combat columns get z-scored; binary flags pass raw; hp cols get log1p
+    # vel_x/vel_y are knight-relative per-step displacement measured C#-side —
+    # row order on the wire is unstable and rows carry no instance identity, so
+    # motion cannot be recovered downstream.
+    combat_feature_dim: int = 13
+    combat_normalized_dims: int = 6  # first N combat columns get z-scored; binary flags pass raw; hp cols get log1p
     terrain_feature_dim: int = 8 # [mx, my, hdx, hdy, npx, npy, dist, is_trigger]
     terrain_normalized_dims: int = 7  # is_trigger passes through raw
     # Terrain visibility gate — knight-relative axis-aligned box (world units)
@@ -52,8 +56,8 @@ class Config:
     # on-screen". Set either to 0 to disable.
     view_w: float = 30.0
     view_h: float = 17.0
-    global_state_dim: int = 22   # vel(2), hp, soul, knight_bounds(2), 7 ability flags, 9 validity flags
-    n_binary_flags: int = 16     # 7 ability unlock + 9 action validity (not normalized)
+    global_state_dim: int = 33   # vel(2), hp, soul, knight_bounds(2), 7 ability flags, 9 validity flags, 11 commit
+    n_binary_flags: int = 27     # 7 ability unlock + 9 action validity + 11 hard-commit (not normalized)
 
     # Model architecture (QFormer hitbox compressor + transformer trunk).
     # d_model is the working width carried through QFormers, trunk, and
@@ -116,9 +120,13 @@ class Config:
     D_window: int = 10        # rolling window size at 8192-step epochs (auto-widened for smaller rollouts)
 
     # Heal reward: coefficient for HP restored. Unscaled by D (like defense).
-    # Pegged relative to defense penalty — 0.65 means healing undoes ~65% of
-    # the penalty for having taken that damage. Creates dodge > heal > tank ordering.
-    heal_coef: float = 0.65
+    # hits_taken is now accumulated HP lost (not hit count), so both sides of
+    # the defense term are in raw HP and 1.0 means healing exactly cancels the
+    # damage that was taken. Net defense reward is therefore the episode's net
+    # HP change, independent of whether a boss hits for 1 mask or 2.
+    # Healing is not free even at 1.0: focus costs soul earned by landing hits
+    # and roots the knight for the charge, so dodging still dominates.
+    heal_coef: float = 1.0
 
     # Per-boss return-variance EMA for value-loss normalization (PopArt-lite).
     # Base decay applied at the "fair share" of samples per boss (= total_valid /

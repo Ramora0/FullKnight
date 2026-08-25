@@ -37,6 +37,27 @@ namespace FullKnight.Game
 		// Lives on the reader so it dies with the scene, same as the other caches.
 		public readonly Dictionary<HealthManager, int> hmMaxHpCache = new();
 
+		// Previous knight-relative center per combat collider, stamped with the
+		// observation tick it was written on. Differencing across consecutive
+		// ticks yields per-step relative displacement (closing rate).
+		// This has to happen here rather than downstream: combat rows are
+		// emitted from HashSet iteration, so row order is unstable between
+		// steps and no per-row instance identity crosses the wire — nothing on
+		// the Python side can match a row to the same collider one step later.
+		// The tick stamp guards pooled colliders that deactivate and come back:
+		// a gap emits 0 instead of a displacement spanning many steps.
+		public readonly Dictionary<Collider2D, (Vector2 rel, long tick)> prevRelCache = new();
+		public long MotionTick = 0;
+
+		/// <summary>Drop cached motion history. Called on episode boundaries that
+		/// keep the reader alive (fake resets), so the first step of the new
+		/// episode doesn't report displacement measured across the boundary.</summary>
+		public void ClearMotion()
+		{
+			prevRelCache.Clear();
+			MotionTick = 0;
+		}
+
 		private void Start()
 		{
 			foreach (Collider2D collider2D in Resources.FindObjectsOfTypeAll<Collider2D>())
@@ -60,6 +81,11 @@ namespace FullKnight.Game
 			var dead = new List<Collider2D>();
 			foreach (var k in kindCache.Keys) if (k == null) dead.Add(k);
 			foreach (var k in dead) { kindCache.Remove(k); parentCache.Remove(k); hmCache.Remove(k); }
+			// prevRelCache is keyed independently of kindCache (a collider can be
+			// motion-tracked before it is ever classified), so it needs its own sweep.
+			var deadMotion = new List<Collider2D>();
+			foreach (var k in prevRelCache.Keys) if (k == null) deadMotion.Add(k);
+			foreach (var k in deadMotion) prevRelCache.Remove(k);
 			// Drop max-hp entries for HMs that have been destroyed.
 			var deadHms = new List<HealthManager>();
 			foreach (var k in hmMaxHpCache.Keys) if (k == null) deadHms.Add(k);
@@ -288,6 +314,9 @@ namespace FullKnight.Game
 		public void Load() => _hook.Load();
 		public void Unload() => _hook.Unload();
 		public void RecreateReader() => _hook.RecreateReader();
+		/// <summary>Drop per-collider motion history. Needed on episode boundaries
+		/// that reuse the reader (fake resets); real resets recreate it anyway.</summary>
+		public void ClearMotion() => _hook.GetReader()?.ClearMotion();
 		public SortedDictionary<HitboxType, HashSet<Collider2D>> GetHitboxes() => _hook.GetHitboxes();
 
 		public struct CacheSizes
@@ -607,12 +636,20 @@ namespace FullKnight.Game
 
 		/// <summary>
 		/// Extract hitbox features split by type.
-		/// Combat (Enemy + Attack): 10 floats per hitbox —
-		///   [rel_x, rel_y, width, height, is_trigger,
-		///    gives_damage, takes_damage, is_target, hp_raw, hp_max_raw]
+		/// Combat (Enemy + Attack): 13 floats per hitbox —
+		///   [rel_x, rel_y, width, height, vel_x, vel_y,
+		///    is_trigger, gives_damage, takes_damage, is_target, is_invincible,
+		///    hp_raw, hp_max_raw]
+		///   Column order matters: the Python normalizer z-scores a leading
+		///   prefix of continuous columns (combat_normalized_dims), passes the
+		///   binary flags through raw, and log1p-compresses the hp tail. Keep
+		///   continuous / binary / hp grouped in that order.
+		///   vel_x, vel_y  = knight-relative displacement since the previous
+		///                   observation (0 on first sight or after a gap).
 		///   gives_damage = collider hurts the knight on contact (Enemy bucket).
 		///   takes_damage = a HealthManager is reachable from this collider.
 		///   is_target    = that HealthManager is in the supplied bossHms set.
+		///   is_invincible = that HealthManager is currently untouchable.
 		///   hp_raw       = current HP of the reached HealthManager (0 if none).
 		///   hp_max_raw   = observed max HP (cached on first sight, bumped on refills).
 		/// Both hp_raw and hp_max_raw are emitted RAW; the Python side log1p-compresses
@@ -632,6 +669,9 @@ namespace FullKnight.Game
 		{
 			var hitboxes = _hook.GetHitboxes();
 			var reader = _hook.GetReader();
+			// Advance the motion clock once per observation. Combat rows below
+			// difference against the previous tick's cached relative position.
+			if (reader != null) reader.MotionTick++;
 			// Prune destroyed colliders to prevent set growth over long episodes
 			foreach (var kvp in hitboxes)
 				kvp.Value.RemoveWhere(c => c == null);
@@ -693,10 +733,33 @@ namespace FullKnight.Game
 						float isTarget = (hm != null && bossHms != null && bossHms.Contains(hm)) ? 1f : 0f;
 						float hpRaw = hm != null ? (float)hm.hp : 0f;
 						float hpMaxRaw = hm != null && reader != null ? (float)reader.ObserveMaxHp(hm) : 0f;
+						// Whether this target is currently untouchable (post-hit
+						// iframes / stagger). Without it a boss mid-stagger is
+						// observationally identical to a hittable one, so swings
+						// that could not have connected look like swings that
+						// missed, injecting noise into the attack reward exactly
+						// when the agent has just landed a hit.
+						float isInvincible = (hm != null && hm.IsInvincible) ? 1f : 0f;
+
+						// Per-step knight-relative displacement; 0 on first sight
+						// or after an inactive gap. See prevRelCache.
+						float velX = 0f, velY = 0f;
+						if (reader != null)
+						{
+							if (reader.prevRelCache.TryGetValue(col, out var prev)
+								&& prev.tick == reader.MotionTick - 1)
+							{
+								velX = relX - prev.rel.x;
+								velY = relY - prev.rel.y;
+							}
+							reader.prevRelCache[col] =
+								(new Vector2(relX, relY), reader.MotionTick);
+						}
 
 						combat.Add(new float[] {
-							relX, relY, w, h, isTrigger,
-							givesDamage, takesDamage, isTarget, hpRaw, hpMaxRaw
+							relX, relY, w, h, velX, velY,
+							isTrigger, givesDamage, takesDamage, isTarget, isInvincible,
+							hpRaw, hpMaxRaw
 						});
 						combatKinds.Add(reader != null ? reader.GetKind(col) : "unknown");
 						combatParents.Add(parent);

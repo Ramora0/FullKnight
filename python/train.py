@@ -7,6 +7,7 @@ import torch
 import wandb
 
 from config import Config
+from observation import CB
 from vec_env import VecEnv
 from ppo import PPO
 from instance_manager import InstanceManager
@@ -1231,15 +1232,14 @@ async def train(config: Config):
             # HitboxObserver emits nothing combat until the FSM flips them
             # on. We detect "boss awake" per env as the first step with an
             # enemy-flagged combat hitbox (combat feature col GIVES_DAMAGE
-            # — set only for HitboxType.Enemy at HitboxObserver.cs:691, so
-            # the knight's own attack swing doesn't falsely declare the
-            # boss awake). The mask drives sim/combat vs sim/intro inside
+            # — set only for HitboxType.Enemy in HitboxObserver, so the
+            # knight's own attack swing doesn't falsely declare the boss
+            # awake). The mask drives sim/combat vs sim/intro inside
             # TimingTracker.
-            IDX_GIVES_DAMAGE = 5
             if real_time_arr.shape[0] > 0:
                 has_hb_arr = np.stack([
                     ((o.combat_mask > 0) &
-                     (o.combat_hb[..., IDX_GIVES_DAMAGE] > 0.5)).any(axis=-1)
+                     (o.combat_hb[..., CB.GIVES_DAMAGE] > 0.5)).any(axis=-1)
                     for o in buf_obs
                 ])
                 T_hb = has_hb_arr.shape[0]
