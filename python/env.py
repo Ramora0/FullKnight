@@ -60,6 +60,8 @@ class HKEnv:
             level if level is not None else self.config.level,
             self.config.frames_per_wait,
             self.config.time_scale, eval_mode=eval_mode,
+            fsm_debug=bool(getattr(self.config, "save_fsm_graph", False)
+                           or getattr(self.config, "visualize", False)),
         ))
         t1 = time.perf_counter()
         data = await self.ws.recv()

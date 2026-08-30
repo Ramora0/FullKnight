@@ -204,6 +204,12 @@ namespace FullKnight.Net
 					msg.data.eval = r.ReadByte() != 0;
 					ushort len = r.ReadUInt16();
 					msg.data.level = System.Text.Encoding.UTF8.GetString(r.ReadBytes(len));
+					// Trailing fsm_debug byte. Defensive: a Python client that
+					// predates the flag ends the message here, and the old
+					// behaviour was always-on, so absent => true.
+					msg.data.fsm_debug = ms.Position < ms.Length
+						? r.ReadByte() != 0
+						: true;
 					break;
 				case MSG_ACTION:
 					msg.data.action_vec = new int[4];

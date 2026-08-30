@@ -227,9 +227,24 @@ class Config:
     visualize: bool = False
     # Persist env 0's boss FSM transition graph + state-change history to
     # state_graphs/latest.json each epoch so graph_viewer.py can render it
-    # offline. Observation-only — never enters the model input. Set False
-    # to skip the per-epoch JSON write entirely (no parsing, no I/O).
-    save_fsm_graph: bool = True
+    # offline. Observation-only — never enters the model input.
+    #
+    # OFF by default because it is not free: it is the whole FsmObserver
+    # path, and that path costs real throughput on both sides of the wire.
+    # C#: a GetComponentsInChildren<PlayMakerFSM>(true) walk of the boss
+    # subtree plus a GetComponents call per active combat collider, every
+    # step, each allocating. Python: ~2.1 ms per rollout step at n_envs=16
+    # (measured — 1.8 ms in fsm_tracker.update, 0.24 ms decoding the wire
+    # trailer), which is ~70% of the per-step Python body and lands as
+    # serial dead time while every instance sits frozen at timeScale 0.
+    # The trailer is also ~24% of the step payload.
+    #
+    # FsmDumper now ships the authored PlayMaker graph verbatim once per
+    # scene (python/fsm_dumps/<scene>.json), so the transitions, branch
+    # weights and telegraph durations FsmTracker reconstructs statistically
+    # are already available exactly and for free. Turn this back on only to
+    # watch runtime state live (graph_viewer / visualizer).
+    save_fsm_graph: bool = False
     # When True, fsm_tracker logs every state transition it ingests. Verbose;
     # leave False unless debugging the tracker itself.
     debug_transitions: bool = False

@@ -101,6 +101,15 @@ namespace FullKnight.Environment
 		private Game.TimeScale _timeManager;
 		// Heartbeat counter for FsmDiag logging in SnapshotFsms.
 		private int _fsmDiagTicks;
+		// Gate for the whole FsmObserver path, set from the reset message.
+		// See SnapshotFsms — off means no per-step PlayMaker component walk
+		// and no snapshot trailer on the wire. Debug/visualizer data only;
+		// nothing here ever reaches the model. Defaults on so a mod running
+		// against an older Python client behaves as it always did.
+		private bool _fsmDebug = true;
+		// Shared empty result for the gated-off path — never mutated, so one
+		// instance is safe and it keeps SnapshotFsms allocation-free.
+		private static readonly List<string> _noFsm = new List<string>();
 
 		// Per-frame game-time pin (seconds). Calibration target: trained regime
 		// had gtime_baseline = 0.0424s/step at frames_per_wait=5. With
@@ -213,6 +222,7 @@ namespace FullKnight.Environment
 			_level = requestedLevel;
 			_frameSkipCount = data.frames_per_wait ?? _frameSkipCount;
 			_evalMode = data.eval ?? false;
+			_fsmDebug = data.fsm_debug ?? true;
 			_hitsTakenInStep = 0;
 			_damageLandedInStep = 0;
 			_hpHealedInStep = 0;
@@ -588,6 +598,17 @@ namespace FullKnight.Environment
 
 		private List<string> SnapshotFsms()
 		{
+			// Gated off during normal training. What follows is a
+			// GetComponentsInChildren<PlayMakerFSM>(true) walk of every boss
+			// subtree plus a GetComponents call per active combat collider,
+			// every single step, each allocating an array, followed by a
+			// string build per surviving FSM. All of it feeds the Python
+			// visualizer and FsmTracker; none of it feeds the model. Since
+			// FsmDumper now ships the authored graph verbatim once per scene,
+			// the statistics FsmTracker reconstructs from this stream are
+			// already available exactly, so the default is off.
+			if (!_fsmDebug) return _noFsm;
+
 			HashSet<Collider2D> enemies = null;
 			HashSet<Collider2D> attacks = null;
 			try

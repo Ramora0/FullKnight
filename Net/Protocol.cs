@@ -67,6 +67,14 @@ namespace FullKnight.Net
 		// Mode (Python -> C#, sent during reset)
 		public bool? eval;
 
+		// Debug gate (Python -> C#, sent during reset). When false the mod
+		// skips FsmObserver entirely: no GetComponentsInChildren<PlayMakerFSM>
+		// walk per step, no per-FSM string build, no snapshot trailer on the
+		// wire. Purely a visualizer/FsmTracker feed — it never reaches the
+		// model. Null (an older Python client that doesn't send the byte)
+		// means "on", preserving the previous always-on behaviour.
+		public bool? fsm_debug;
+
 		// Action (Python -> C#)
 		public int[] action_vec;
 

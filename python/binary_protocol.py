@@ -24,12 +24,24 @@ GLOBAL_DIM   = 33  # must match config.global_state_dim and StateExtractor.Globa
 def pack_init():
     return struct.pack('B', MSG_INIT)
 
-def pack_reset(level, frames_per_wait, time_scale, eval_mode=False):
+def pack_reset(level, frames_per_wait, time_scale, eval_mode=False,
+               fsm_debug=False):
+    """Pack a reset request.
+
+    `fsm_debug` gates the C# FsmObserver path. When False, the mod skips
+    SnapshotFsms() entirely — no GetComponentsInChildren<PlayMakerFSM> walk
+    per step, no per-FSM string build, no snapshot trailer on the wire, and
+    nothing for Python to decode. Pure debug/visualizer data: it never
+    reaches the model. Sent as a trailing byte (after the level string) so a
+    mod build that predates the flag still parses the message correctly and
+    simply keeps its old always-on behaviour.
+    """
     level_bytes = level.encode('utf-8')
-    return struct.pack(f'<BiiB H{len(level_bytes)}s',
+    return struct.pack(f'<BiiB H{len(level_bytes)}s B',
                        MSG_RESET, frames_per_wait, time_scale,
                        1 if eval_mode else 0,
-                       len(level_bytes), level_bytes)
+                       len(level_bytes), level_bytes,
+                       1 if fsm_debug else 0)
 
 def pack_action(action_vec):
     return struct.pack('<Biiii', MSG_ACTION, *action_vec)

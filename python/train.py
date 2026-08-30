@@ -884,14 +884,22 @@ async def train(config: Config):
                 if vis is not None:
                     vis.update(obs)
 
-                # Feed every env's FSM snapshot into the shared tracker.
-                # Per-env episode state is namespaced by env_id inside
-                # FsmTracker; the transition graph / junctions /
+                # Feed each stepped env's FSM snapshot into the shared
+                # tracker. Per-env episode state is namespaced by env_id
+                # inside FsmTracker; the transition graph / junctions /
                 # fingerprints accumulate across all envs for N× faster
                 # network discovery. Pure side-effect: never touches
                 # obs / actions / rewards / model.
+                #
+                # Only rollout_active envs are fed. Iterating all of
+                # vec_env.envs re-ingested the *stale* last_fsm of every
+                # dead-or-resetting slot on every iteration, which both cost
+                # time and told the tracker a state had been held for N more
+                # steps than it really was (inflating _changed_age and
+                # suppressing the absence counter that resets _prev_states).
                 if fsm_tracker is not None:
-                    for env_i, env in enumerate(vec_env.envs):
+                    for env_i in rollout_active:
+                        env = vec_env.envs[env_i]
                         if env is None:
                             continue
                         fsm_tracker.update(env.last_fsm, env_id=env_i)
