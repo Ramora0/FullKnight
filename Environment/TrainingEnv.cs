@@ -36,6 +36,10 @@ namespace FullKnight.Environment
 		// should actually try to kill (vs. minions / projectiles), and by the
 		// damage hook to credit reward and apply training-mode immortality.
 		private readonly HashSet<HealthManager> _bossHMs = new();
+		// Scenes whose PlayMaker graph has already been dumped this process.
+		// The authored FSM is identical every load, so one dump per scene is
+		// ground truth for the whole run; fake resets never re-dump.
+		private readonly HashSet<string> _dumpedScenes = new();
 		// Max HP at reset for each boss in _bossHMs. Stored per-hm because multi-
 		// boss fights (Oro/Mato, God Tamer) have asymmetric HP pools and damage
 		// must be normalized against each boss's own maxHP.
@@ -334,6 +338,12 @@ namespace FullKnight.Environment
 			}
 			bool bossAwake = HasActiveCombatHitboxes();
 			LogResetPhase("init_boss_refs", "InitBossRefs+BossWake");
+
+			// Ground-truth behaviour extraction. Runs once per scene, on the
+			// real-reset path only, immediately after _bossHMs is populated
+			// and before the fight starts. Everything Python's FsmTracker
+			// infers from watching transitions is read directly here.
+			data.fsm_dump = MaybeDumpFsms();
 			Log($"[BounceCheck] reset#{_resetCount} level={_level} "
 				+ $"bossAwake={bossAwake} wakeFrames={wakeFrames}");
 			_knightMaxHP = PlayerData.instance.maxHealth;
@@ -546,6 +556,36 @@ namespace FullKnight.Environment
 		// for cross-referencing the agent's action against attack windows).
 		// Routed to the Python visualizer / fsm_tracker only — never consumed
 		// by training.
+		/// <summary>Serialize the full PlayMaker graph for this scene, once.
+		/// Returns null when already dumped (or on failure) so the wire block is
+		/// omitted rather than re-sent every reset.</summary>
+		private string MaybeDumpFsms()
+		{
+			if (string.IsNullOrEmpty(_level) || !_dumpedScenes.Add(_level)) return null;
+			try
+			{
+				HashSet<Collider2D> enemies = null;
+				HashSet<Collider2D> attacks = null;
+				var hb = _hitboxObserver.GetHitboxes();
+				if (hb != null)
+				{
+					if (hb.ContainsKey(HitboxType.Enemy)) enemies = hb[HitboxType.Enemy];
+					if (hb.ContainsKey(HitboxType.Attack)) attacks = hb[HitboxType.Attack];
+				}
+				var dump = Game.FsmDumper.DumpScene(_level, _bossHMs, enemies, attacks);
+				string json = Newtonsoft.Json.JsonConvert.SerializeObject(dump);
+				int nFsm = 0;
+				try { nFsm = ((System.Collections.ICollection)dump["fsms"]).Count; } catch { }
+				Log($"[FsmDump] {_level}: {nFsm} FSMs, {json.Length} bytes");
+				return json;
+			}
+			catch (System.Exception e)
+			{
+				Log($"[FsmDump] {_level} FAILED: {e.GetType().Name}: {e.Message}");
+				return null;
+			}
+		}
+
 		private List<string> SnapshotFsms()
 		{
 			HashSet<Collider2D> enemies = null;

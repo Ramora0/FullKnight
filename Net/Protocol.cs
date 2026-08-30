@@ -34,6 +34,9 @@ namespace FullKnight.Net
 		// currently-active Attack-class collider — the knight's nail/spells).
 		// Populated by FsmObserver; routed to the Python visualizer / fsm_tracker.
 		public List<string> fsm_snapshots;
+		// One-shot per scene: full serialized PlayMaker graph (FsmDumper).
+		// null on every reset after the first for a given scene.
+		public string fsm_dump;
 		public float[] global_state;
 
 		// Reward / done

@@ -206,6 +206,20 @@ def pop_last_diag():
     return dict(_last_diag)
 
 
+# Side channel: full PlayMaker graph dump, sent once per scene on reset.
+# Large (hundreds of KB) and rare, so it rides a side channel like the other
+# trailers rather than widening every return tuple.
+_last_fsm_dump = ""
+
+
+def pop_last_fsm_dump():
+    """Drain the most recent FSM-graph dump ("" if none)."""
+    global _last_fsm_dump
+    out = _last_fsm_dump
+    _last_fsm_dump = ""
+    return out
+
+
 def unpack_step(data):
     """Unpack a step response.
     Returns (combat_hb, terrain_hb, gs, combat_kinds, combat_parents,
@@ -283,4 +297,15 @@ def unpack_reset(data):
     # FSM-snapshot trailer (variable length). Defensive: older C# mods don't
     # send it — returns empty list.
     _last_fsm_snapshots, offset = _unpack_fsm_snapshots(data, offset)
+    # FSM-graph dump trailer: u32 byte length then UTF-8 JSON. Defensive —
+    # absent on older C# mods, and length 0 on every reset after the first
+    # load of a given scene.
+    global _last_fsm_dump
+    _last_fsm_dump = ""
+    if offset + 4 <= len(data):
+        (dump_len,) = struct.unpack_from('<I', data, offset)
+        offset += 4
+        if 0 < dump_len <= len(data) - offset:
+            _last_fsm_dump = data[offset:offset + dump_len].decode('utf-8', 'replace')
+            offset += dump_len
     return combat_hb, terrain_hb, gs, combat_kinds, combat_parents, combat_anims

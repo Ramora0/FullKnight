@@ -168,6 +168,20 @@ namespace FullKnight.Net
 					w.Write((ushort)len);
 					w.Write(bytes, 0, len);
 				}
+
+				// FSM-graph dump. Reset-only, and only the first time a given
+				// scene is loaded in this process — the authored graph never
+				// changes, so re-sending it every episode would be pure cost.
+				// u32 length (these run into hundreds of KB), 0 = absent.
+				// Appended last so every earlier block keeps its offset.
+				if (message.type == "reset")
+				{
+					var dumpBytes = string.IsNullOrEmpty(d.fsm_dump)
+						? System.Array.Empty<byte>()
+						: System.Text.Encoding.UTF8.GetBytes(d.fsm_dump);
+					w.Write((uint)dumpBytes.Length);
+					if (dumpBytes.Length > 0) w.Write(dumpBytes, 0, dumpBytes.Length);
+				}
 			}
 
 			return ms.ToArray();
